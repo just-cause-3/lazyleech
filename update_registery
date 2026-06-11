@@ -1,0 +1,15 @@
+1. Rebuild locally
+From your project folder:
+
+bash
+docker build -t lazyleech-lazyleech:latest .
+This creates a fresh image from your latest code.
+
+2. Tag for ACR
+bash
+docker tag lazyleech-lazyleech:latest denhjikareg.azurecr.io/lazyleech-lazyleech:latest
+Tagging is required so Docker knows which registry to push to.
+
+3. Push to ACR
+bash
+docker push denhjikareg.azurecr.io/lazyleech-lazyleech:latest

@@ -1,0 +1,212 @@
+# ===========================================
+# Python
+# ===========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ===========================================
+# Environment & Secrets
+# ===========================================
+.env
+.env.local
+.env.*.local
+*.env
+
+# Keep example file
+!.env.example
+
+# ===========================================
+# Telegram Bot Data
+# ===========================================
+# User sessions and data
+*.session
+*.session-journal
+session_name.session*
+
+# User directories (thumbnails, watermarks, downloads)
+[0-9]*/
+!README.md
+
+# ===========================================
+# Downloads & Data
+# ===========================================
+downloads/
+data/
+ytdl/downloads/
+torrents/
+temp/
+tmp/
+
+# ===========================================
+# Logs
+# ===========================================
+*.log
+logs/
+aria2.log
+lazyleech.log
+
+# ===========================================
+# IDE & Editors
+# ===========================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+
+# ===========================================
+# Operating System Files
+# ===========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ===========================================
+# Git
+# ===========================================
+*.orig
+*.backup
+
+# ===========================================
+# Docker
+# ===========================================
+.docker/
+
+# ===========================================
+# Testing & Coverage
+# ===========================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+
+# ===========================================
+# Jupyter Notebooks
+# ===========================================
+.ipynb_checkpoints/
+*.ipynb
+
+# ===========================================
+# Package Files
+# ===========================================
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+*.bz2
+*.xz
+
+# ===========================================
+# Temporary Files
+# ===========================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# ===========================================
+# Database (if used locally)
+# ===========================================
+*.db
+*.sqlite
+*.sqlite3
+mongodb_data/
+
+# ===========================================
+# Misc
+# ===========================================
+# Config files with sensitive data
+config.ini
+config.json
+secrets.json
+credentials.json
+
+# Compiled files
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.pyc
+
+# Aria2 files
+aria2.session
+dht.dat
+dht6.dat

@@ -1,0 +1,67 @@
+version: "3.8"
+
+services:
+  lazyleech:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lazyleech-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC
+    volumes:
+      # Persist downloads
+      - ./downloads:/app/downloads
+      # Persist user thumbnails and watermarks
+      - ./data:/app/data
+      # Persist logs
+      - ./logs:/app/logs
+      # Persist ytdl cache
+      - ./ytdl:/app/ytdl
+      # Persist session file (prevents msg_id errors)
+      - ./session:/app/session
+    # Port mapping (Aria2 RPC port)
+    ports:
+      - "6800:6800"
+    # Privileged mode for time sync
+    privileged: true
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: MongoDB for RSS auto-download feature
+  mongodb:
+    image: mongo:6.0
+    container_name: lazyleech-mongodb
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=lazyleech
+      - MONGO_INITDB_ROOT_PASSWORD=lazyleech_password
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    profiles:
+      - rss
+
+volumes:
+  mongodb_data:
+
+# Network configuration
+networks:
+  default:
+    name: lazyleech_network
