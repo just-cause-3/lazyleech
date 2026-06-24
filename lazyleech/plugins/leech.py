@@ -408,7 +408,7 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
     await initiate_directdl(client, message, link, filename, flags)
 
 
-bunkr_semaphore = asyncio.Semaphore(3)
+bunkr_semaphore = asyncio.Semaphore(1)
 
 
 @Client.on_message(filters.command("listqueue") & filters.chat(ALL_CHATS))
@@ -495,6 +495,9 @@ async def process_bunkr_download(client, message, file_url, file_name, filename,
             )
         except Exception as e:
             await message.reply_text(f"Failed to resolve {file_name}: {str(e)}")
+        finally:
+            # Cooldown before releasing semaphore — avoids Bunkr 429 rate-limiting
+            await asyncio.sleep(5)
 
 
 async def initiate_directdl(client, message, link, filename, flags, headers=None):

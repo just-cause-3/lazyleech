@@ -89,6 +89,11 @@ async def _fetch_page(
             headers = _random_headers()
             timeout = aiohttp.ClientTimeout(total=PAGE_FETCH_TIMEOUT)
             async with session.get(url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 429:
+                    wait = 10 + random.uniform(1, 5)
+                    logger.warning("Rate-limited (429) on %s, waiting %.1fs", url, wait)
+                    await asyncio.sleep(wait)
+                    continue
                 if resp.status == 403 and not tried_fallback:
                     tried_fallback = True
                     url = _replace_domain_with_fallback(url)
@@ -204,6 +209,11 @@ async def _get_download_response(
                 json={"id": file_id},
                 timeout=timeout,
             ) as resp:
+                if resp.status == 429:
+                    wait = 10 + random.uniform(1, 5)
+                    logger.warning("Rate-limited (429) on download API, waiting %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
                 resp.raise_for_status()
                 data = await resp.json()
 
@@ -276,6 +286,11 @@ async def _get_signed_url(
                 params={"path": media_path},
                 timeout=timeout,
             ) as resp:
+                if resp.status == 429:
+                    wait = 10 + random.uniform(1, 5)
+                    logger.warning("Rate-limited (429) on signing API, waiting %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
                 resp.raise_for_status()
                 data = await resp.json()
 
