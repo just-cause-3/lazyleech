@@ -197,12 +197,19 @@ async def aria2_add_directdl(
         "retry-wait": "3",
     }
 
+    # Always include User-Agent; append any extra headers (e.g. Referer for Bunkr)
+    default_ua = (
+        "User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) "
+        "Gecko/20100101 Firefox/136.0"
+    )
     if headers:
-        options["header"] = headers
+        if isinstance(headers, list):
+            header_list = [default_ua] + headers
+        else:
+            header_list = [default_ua, headers]
+        options["header"] = header_list
     else:
-        options["header"] = (
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0"
-        )
+        options["header"] = default_ua
 
     if filename:
         options["out"] = filename
