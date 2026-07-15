@@ -30,6 +30,22 @@
         },
         "BOT_TOKEN":{
             "description":"Get this from https://t.me/botfather and enable Inline Mode"
+        },
+        "EVERYONE_CHATS":{
+            "description":"Space-separated chat IDs where everyone (not just admins) can use the bot",
+            "required":false
+        },
+        "MEGADEBRID_TOKEN":{
+            "description":"Mega-Debrid API token (premium account). Optional if you set MEGADEBRID_LOGIN/PASSWORD instead",
+            "required":false
+        },
+        "MEGADEBRID_LOGIN":{
+            "description":"Mega-Debrid account username. Lets the bot fetch/refresh its own token (recommended over MEGADEBRID_TOKEN)",
+            "required":false
+        },
+        "MEGADEBRID_PASSWORD":{
+            "description":"Mega-Debrid account password. Used with MEGADEBRID_LOGIN to fetch/refresh the API token",
+            "required":false
         }
     }
 }

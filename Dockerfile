@@ -53,9 +53,14 @@ RUN chmod +x docker-entrypoint.sh
 # Expose port (for potential future use)
 EXPOSE 6800
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://127.0.0.1:6800/jsonrpc || exit 1
+# Health check - aria2 speaks JSON-RPC, so POST a getVersion call. A bare GET
+# returns HTTP 400; a POST returns HTTP 200 (even when an rpc-secret is set, an
+# auth error still comes back as HTTP 200 with a JSON error body), which is all
+# we need to confirm the aria2 daemon is up and listening.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS -X POST http://127.0.0.1:6800/jsonrpc \
+        -d '{"jsonrpc":"2.0","id":"health","method":"aria2.getVersion","params":[]}' \
+        || exit 1
 
 # Entrypoint
 ENTRYPOINT ["./docker-entrypoint.sh"]

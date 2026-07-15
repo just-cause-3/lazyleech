@@ -79,10 +79,10 @@ async def run_code(client, message):
     wrapped_stdout.buffer.seek(0)
     wrapped_stderr.buffer.seek(0)
     r = []
-    outtxt = wrapped_stderr.read() + wrapped_stderr.buffer.read().decode()
+    outtxt = wrapped_stdout.read() + wrapped_stdout.buffer.read().decode()
     if outtxt.strip().strip('\n').strip():
         r.append(outtxt)
-    errtxt = wrapped_stdout.read() + wrapped_stdout.buffer.read().decode()
+    errtxt = wrapped_stderr.read() + wrapped_stderr.buffer.read().decode()
     if errtxt.strip().strip('\n').strip():
         r.append(errtxt)
     r.extend(returned)

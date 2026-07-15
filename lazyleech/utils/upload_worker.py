@@ -57,7 +57,11 @@ from .misc import (
     split_files,
     watermark_photo,
 )
-from .status import remove_upload_status, update_upload_status
+from .status import (
+    remove_upload_status,
+    update_upload_status,
+    update_upload_status_state,
+)
 
 upload_queue = asyncio.Queue()
 upload_statuses = dict()
@@ -122,6 +126,9 @@ async def cleanup_upload(task, message_identifier, torrent_info, reply, user_id)
         logging.exception("Background upload task failed")
 
     worker_identifier = (reply.chat.id, reply.id)
+    # Drop any cancellation flag for this finished worker so stop_uploads
+    # doesn't accumulate stale identifiers over the process lifetime.
+    stop_uploads.discard(worker_identifier)
     async with upload_tamper_lock:
         for key in list(upload_waits.keys()):
             _, iworker_identifier = upload_waits[key]
@@ -322,9 +329,9 @@ async def _upload_file(
                 sr = 3
                 if len(sds) == 2:
                     sr = int(sds[1])
-                if ("p" or "P") in sds[0]:
+                if "p" in sds[0] or "P" in sds[0]:
                     ps = ("0" * (sr - len(str(count)))) + (str(count)) + " "
-                if ("s" or "S") in sds[0]:
+                if "s" in sds[0] or "S" in sds[0]:
                     ss = " " + ("0" * (sr - len(str(count)))) + (str(count))
             newFile = re.sub(r"{.*}$", "", newFile)
             nf = newFile.split(".")
@@ -483,6 +490,7 @@ async def _upload_file(
         return sent_files
     finally:
         remove_upload_status(upload_identifier)
+        stop_uploads.discard(upload_identifier)
         if split_task:
             split_task.cancel()
         async with upload_tamper_lock:
@@ -508,15 +516,10 @@ async def progress_callback(
                 upload_identifier, current, total, filename, upload_identifier[0]
             )
 
-    except Exception as e:
-        logging.error(f"Error in progress callback: {e}")
+    # stop_transmission() raises StopTransmission to abort the upload; it must
+    # propagate to pyrogram (and up to the caller, which sets resp = None) or the
+    # transfer never stops and the callback keeps firing/erroring on every chunk.
     except StopTransmission:
         raise
-    except Exception as ex:
-        preserved_logs.append((message, None, ex))
-        logging.exception("%s", message)
-        await message.reply_text(traceback.format_exc(), parse_mode=None)
-        for admin_chat in ADMIN_CHATS:
-            await client.send_message(
-                admin_chat, traceback.format_exc(), parse_mode=None
-            )
+    except Exception as e:
+        logging.error(f"Error in progress callback: {e}")

@@ -32,6 +32,7 @@ from .. import (
     MAGNET_TIMEOUT,
     PROGRESS_UPDATE_DELAY,
     ForceDocumentFlag,
+    SelectFilesFlag,
     SendAsZipFlag,
     help_dict,
     session,
@@ -41,9 +42,11 @@ from ..utils.aria2 import (
     aria2_add_directdl,
     aria2_add_magnet,
     aria2_add_torrent,
+    aria2_change_option,
     aria2_remove,
     aria2_tell_active,
     aria2_tell_status,
+    aria2_unpause,
     is_gid_owner,
 )
 from ..utils.bunkr import extract_album_urls, is_bunkr_url, resolve_bunkr_file
@@ -56,8 +59,10 @@ from ..utils.misc import (
 )
 from ..utils.status import send_status_message
 from ..utils.upload_worker import (
+    progress_callback_data,
     stop_uploads,
     upload_queue,
+    upload_statuses,
     upload_waits,
 )
 
@@ -802,8 +807,6 @@ async def cancelall_leech(client, message):
             pass
 
     # Cancel all active Telegram Uploads
-    from ..utils.upload_worker import upload_statuses, stop_uploads
-
     for identifier, tasks in list(upload_statuses.items()):
         stop_uploads.add(identifier)
         for task, _ in tasks:
@@ -865,8 +868,6 @@ async def cancel_leech(client, message):
             if unauthorized and len(tasks) == 1:
                 await message.reply_text("You did not start this leech.")
             else:
-                from ..utils.upload_worker import stop_uploads
-
                 stop_uploads.add(reply_identifier)
             return
 
@@ -940,7 +941,9 @@ async def cancel_leech(client, message):
             ex.error_code == 1
             and ex.error_message == f"Active Download not found for GID#{gid}"
         ):
-            await aria2_remove(session, gid)
+            await message.reply_text(
+                f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
+            )
 
 
 @Client.on_callback_query(

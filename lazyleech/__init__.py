@@ -1,11 +1,15 @@
 import asyncio
 import logging
 import os
+import sys
 from io import BytesIO, StringIO
 
 import aiohttp
+from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.enums import ParseMode
+
+load_dotenv()
 
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
@@ -32,7 +36,7 @@ LICHER_PARSE_EPISODE = os.environ.get("LICHER_PARSE_EPISODE")
 LICHER_PARSE_EPISODE = LICHER_PARSE_EPISODE and LICHER_PARSE_EPISODE != "0"
 
 PROGRESS_UPDATE_DELAY = int(os.environ.get("PROGRESS_UPDATE_DELAY", 5))
-MAGNET_TIMEOUT = int(os.environ.get("LEECH_TIMEOUT", 60))
+MAGNET_TIMEOUT = int(os.environ.get("MAGNET_TIMEOUT", 60))
 LEECH_TIMEOUT = int(os.environ.get("LEECH_TIMEOUT", 300))
 ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "")
 IGNORE_PADDING_FILE = os.environ.get("IGNORE_PADDING_FILE", "1")
@@ -69,14 +73,27 @@ class LazySession:
 
     def __getattr__(self, name):
         if self._session is None:
-            # Create session in a thread-safe way
+            # Ensure there is an event loop bound to this thread before creating
+            # the session. aiohttp binds to the running loop implicitly; the
+            # deprecated/removed `loop=` kwarg must not be passed on aiohttp >= 4.
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
             except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            self._session = aiohttp.ClientSession(loop=loop)
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            self._session = aiohttp.ClientSession(connector=_make_connector())
         return getattr(self._session, name)
+
+
+def _make_connector():
+    # aiohttp[speedups] installs aiodns, so aiohttp defaults to the c-ares
+    # AsyncResolver. On Windows c-ares often fails to discover the system DNS
+    # servers ("Could not contact DNS servers"), so fall back to the OS
+    # getaddrinfo-based ThreadedResolver there. Linux/Docker keep c-ares.
+    if sys.platform == "win32":
+        from aiohttp.resolver import ThreadedResolver
+
+        return aiohttp.TCPConnector(resolver=ThreadedResolver())
+    return None
 
 
 session = LazySession()

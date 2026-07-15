@@ -4,10 +4,11 @@
 # """
 
 import asyncio
+import sys
 from typing import Dict, Optional
 
 import ujson
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
 # """
 # Success: status == 200
@@ -18,7 +19,14 @@ from aiohttp import ClientSession, ClientTimeout
 class AioHttp:
     @staticmethod
     def get_session() -> ClientSession:
-        return ClientSession(json_serialize=ujson.dumps)
+        # On Windows the default c-ares resolver (from aiohttp[speedups]) often
+        # can't reach the system DNS servers; use the OS getaddrinfo resolver.
+        connector = None
+        if sys.platform == "win32":
+            from aiohttp.resolver import ThreadedResolver
+
+            connector = TCPConnector(resolver=ThreadedResolver())
+        return ClientSession(json_serialize=ujson.dumps, connector=connector)
 
     @staticmethod
     async def _manage_session(

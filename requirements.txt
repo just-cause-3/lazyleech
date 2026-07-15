@@ -1,5 +1,6 @@
 aiohttp
 aiohttp[speedups]>=3.7.3
+python-dotenv
 feedparser
 pyrogram>=2.0.0
 tgcrypto

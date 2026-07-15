@@ -101,7 +101,11 @@ async def generate_gid(session, user_id):
 
 
 def is_gid_owner(user_id, gid):
-    return gid.split(str(user_id), 1)[-1][0] in HEX_CHARACTERS
+    prefix = str(user_id)
+    if not gid.startswith(prefix):
+        return False
+    rest = gid[len(prefix):]
+    return bool(rest) and rest[0] in HEX_CHARACTERS
 
 
 async def aria2_add_torrent(session, user_id, link, timeout=0, pause=False):
