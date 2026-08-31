@@ -17,6 +17,7 @@
 import asyncio
 import html
 import os
+import re
 import tempfile
 import time
 from urllib.parse import unquote as urldecode
@@ -43,13 +44,30 @@ from ..utils.aria2 import (
     aria2_add_magnet,
     aria2_add_torrent,
     aria2_change_option,
+    aria2_force_pause_all,
+    aria2_pause,
     aria2_remove,
     aria2_tell_active,
     aria2_tell_status,
+    aria2_tell_waiting,
     aria2_unpause,
     is_gid_owner,
 )
 from ..utils.bunkr import extract_album_urls, is_bunkr_url, resolve_bunkr_file
+from ..utils.bunkr_sessions import (
+    FILE_CANCELLED,
+    FILE_DOWNLOADED,
+    FILE_DOWNLOADING,
+    FILE_FAILED,
+    FILE_PENDING,
+    FILE_RESOLVING,
+    SESSION_CANCELLED,
+    SESSION_COMPLETED,
+    SESSION_FAILED,
+    SESSION_PAUSED,
+    SESSION_RUNNING,
+    bunkr_session_store,
+)
 from ..utils.misc import (
     allow_admin_cancel,
     calculate_eta,
@@ -66,8 +84,24 @@ from ..utils.upload_worker import (
     upload_waits,
 )
 
-global_bunkr_queue = []
 bunkr_tasks = set()
+bunkr_session_tasks = {}
+
+
+def _bunkr_mode_from_flags(flags):
+    if SendAsZipFlag in flags:
+        return "zip"
+    if ForceDocumentFlag in flags:
+        return "document"
+    return "normal"
+
+
+def _bunkr_flags_from_mode(mode):
+    if mode == "zip":
+        return (SendAsZipFlag,)
+    if mode == "document":
+        return (ForceDocumentFlag,)
+    return ()
 
 
 @Client.on_message(
@@ -338,7 +372,7 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
 
     if is_bunkr_url(link):
         reply = reply_msg or await message.reply_text(
-            "Fetching bunkr album metadata..."
+            "Fetching Bunkr metadata..."
         )
         try:
             if "/a/" in link:
@@ -369,43 +403,45 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
                     else:
                         await reply.edit_text("No video files found in the album.")
                     return
-
-                if not reply_msg:
-                    await reply.edit_text(
-                        f"Found {len(files)} video files in album, adding to queue..."
-                    )
-                for file_url, file_name in files:
-                    global_bunkr_queue.append(file_name or file_url)
-                    task = asyncio.create_task(
-                        process_bunkr_download(
-                            client, message, file_url, file_name, filename, flags
-                        )
-                    )
-                    bunkr_tasks.add(task)
-                    task.add_done_callback(bunkr_tasks.discard)
-                    await asyncio.sleep(3.5)
-
-                if not reply_msg:
-                    await reply.delete()
-                return
             else:
-                if not reply_msg:
-                    await reply.delete()
+                file_name = filename or os.path.basename(urlparse(link).path) or link
+                files = [(link, file_name)]
 
-                # IMPORTANT CHANGE:
-                # Instead of running `process_bunkr_download()` immediately,
-                # we wrap it as an asyncio Task! This is what was causing the bot to freeze when fetching links.
-                # Because the links were passed straight into the semaphore block natively!
-                global_bunkr_queue.append(filename or link)
-                task = asyncio.create_task(
-                    process_bunkr_download(client, message, link, link, filename, flags)
-                )
-                bunkr_tasks.add(task)
-                task.add_done_callback(bunkr_tasks.discard)
-                return
+            title = os.path.basename(urlparse(link).path.rstrip("/")) or "Bunkr"
+            session_doc = await bunkr_session_store.create_session(
+                owner_id=message.from_user.id,
+                chat_id=message.chat.id,
+                source_message_id=message.id,
+                source_url=link,
+                title=title,
+                mode=_bunkr_mode_from_flags(flags),
+                custom_filename=filename,
+                files=files,
+            )
+            session_id = session_doc["_id"]
+            persistence_note = (
+                ""
+                if bunkr_session_store.persistent
+                else "\n\n⚠️ <code>DB_URL</code> is not configured; this session "
+                "will not survive a bot restart."
+            )
+            session_text = (
+                f"<b>Bunkr session:</b> <code>{session_id}</code>\n"
+                f"Found <b>{len(files)}</b> video file(s). Downloading sequentially.\n\n"
+                f"Pause: <code>/pause {session_id}</code>\n"
+                f"Continue: <code>/continue {session_id}</code>\n"
+                f"Details: <code>/bsession {session_id}</code>"
+                f"{persistence_note}"
+            )
+            if reply_msg:
+                await message.reply_text(session_text)
+            else:
+                await reply.edit_text(session_text)
+            _start_bunkr_session(client, message, session_id)
+            return
         except Exception as e:
             if reply_msg:
-                pass
+                await message.reply_text(f"Bunkr session creation failed: {str(e)}")
             else:
                 await reply.edit_text(f"Bunkr extraction failed: {str(e)}")
             return
@@ -416,20 +452,389 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
 bunkr_semaphore = asyncio.Semaphore(1)
 
 
+def _start_bunkr_session(client, message, session_id):
+    existing = bunkr_session_tasks.get(session_id)
+    if existing and not existing.done():
+        return existing
+
+    task = asyncio.create_task(_run_bunkr_session(client, message, session_id))
+    bunkr_session_tasks[session_id] = task
+    bunkr_tasks.add(task)
+
+    def _discard(finished):
+        bunkr_tasks.discard(finished)
+        if bunkr_session_tasks.get(session_id) is finished:
+            bunkr_session_tasks.pop(session_id, None)
+        if not finished.cancelled():
+            error = finished.exception()
+            if error is not None:
+                asyncio.create_task(
+                    _record_bunkr_session_crash(message, session_id, error)
+                )
+
+    task.add_done_callback(_discard)
+    return task
+
+
+async def _record_bunkr_session_crash(message, session_id, error):
+    await bunkr_session_store.set_state(session_id, SESSION_FAILED)
+    await message.reply_text(
+        f"Bunkr session <code>{session_id}</code> stopped unexpectedly: "
+        f"{html.escape(str(error))}. Resume it with "
+        f"<code>/continue {session_id}</code>."
+    )
+
+
+async def _run_bunkr_session(client, message, session_id):
+    while True:
+        session_doc = await bunkr_session_store.get_session(session_id)
+        if not session_doc or session_doc["state"] != SESSION_RUNNING:
+            return
+
+        file_doc = await bunkr_session_store.claim_next_file(session_id)
+        if file_doc is None:
+            counts = await bunkr_session_store.counts(session_id)
+            final_state = (
+                SESSION_COMPLETED
+                if counts[FILE_DOWNLOADED] == session_doc["total_files"]
+                else SESSION_FAILED
+            )
+            await bunkr_session_store.set_state(session_id, final_state)
+            updated = await bunkr_session_store.get_session(session_id)
+            await _send_bunkr_session_summary(message, updated)
+            return
+
+        current = await bunkr_session_store.get_session(session_id)
+        if not current or current["state"] != SESSION_RUNNING:
+            await bunkr_session_store.update_file(
+                file_doc["_id"], FILE_PENDING, gid=None
+            )
+            return
+        await process_bunkr_download(
+            client,
+            message,
+            current,
+            file_doc,
+            _bunkr_flags_from_mode(current["mode"]),
+        )
+
+
+async def _bunkr_session_chunks(session_doc, include_files=True):
+    counts = await bunkr_session_store.counts(session_doc["_id"])
+    downloaded_count = counts[FILE_DOWNLOADED]
+    not_downloaded_count = session_doc["total_files"] - downloaded_count
+    persistence = "MongoDB" if bunkr_session_store.persistent else "memory only"
+    header = (
+        f"<b>Bunkr session:</b> <code>{session_doc['_id']}</code>\n"
+        f"<b>State:</b> {html.escape(session_doc['state'].title())}\n"
+        f"<b>Downloaded:</b> {downloaded_count}/{session_doc['total_files']} | "
+        f"<b>Not downloaded:</b> {not_downloaded_count}\n"
+        f"<b>Storage:</b> {persistence}\n"
+        f"<b>Source:</b> <a href=\"{html.escape(session_doc['source_url'], quote=True)}\">album/link</a>\n\n"
+    )
+    if not include_files:
+        return [header.rstrip()]
+
+    files = await bunkr_session_store.list_files(session_doc["_id"])
+    downloaded = [item for item in files if item["status"] == FILE_DOWNLOADED]
+    unfinished = [item for item in files if item["status"] != FILE_DOWNLOADED]
+    entries = []
+    for title, items, icon in (
+        ("Downloaded", downloaded, "✅"),
+        ("Not downloaded", unfinished, "⏳"),
+    ):
+        entries.append(f"<b>{title} ({len(items)}):</b>\n")
+        if not items:
+            entries.append("<i>None</i>\n")
+            continue
+        for item in items:
+            error = item.get("error")
+            error_text = f" — {html.escape(str(error))[:300]}" if error else ""
+            entries.append(
+                f"{icon} <b>{item['position']}.</b> "
+                f"<code>{html.escape(str(item['filename']))}</code>\n"
+                f"{html.escape(item['status'])}{error_text} | "
+                f"<a href=\"{html.escape(item['page_url'], quote=True)}\">source link</a>\n"
+            )
+        entries.append("\n")
+
+    chunks = []
+    current = header
+    for entry in entries:
+        if len(current) + len(entry) > 3900 and current != header:
+            chunks.append(current.rstrip())
+            current = (
+                f"<b>Bunkr session:</b> <code>{session_doc['_id']}</code> "
+                f"(continued)\n\n"
+            )
+        current += entry
+    if current.strip():
+        chunks.append(current.rstrip())
+    return chunks
+
+
+async def _send_bunkr_session_summary(message, session_doc, include_files=True):
+    if not session_doc:
+        return
+    for chunk in await _bunkr_session_chunks(session_doc, include_files):
+        await message.reply_text(chunk, disable_web_page_preview=True)
+
+
 @Client.on_message(filters.command("listqueue") & filters.chat(ALL_CHATS))
 async def listqueue_cmd(client, message):
-    if not global_bunkr_queue:
+    sessions = await bunkr_session_store.list_sessions(
+        owner_id=message.from_user.id,
+        states=(SESSION_RUNNING, SESSION_PAUSED),
+    )
+    if not sessions:
         await message.reply_text("The download queue is currently empty.")
         return
 
-    text = "<b>Current Download Queue:</b>\n\n"
-    for i, item in enumerate(global_bunkr_queue, 1):
-        text += f"{i}. <code>{html.escape(str(item))}</code>\n"
-
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... and more."
+    text = "<b>Current Bunkr sessions:</b>\n\n"
+    for session_doc in sessions:
+        counts = await bunkr_session_store.counts(session_doc["_id"])
+        text += (
+            f"• <code>{session_doc['_id']}</code> — "
+            f"{html.escape(session_doc['state'])} — "
+            f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded\n"
+        )
 
     await message.reply_text(text, disable_web_page_preview=True)
+
+
+def _bunkr_session_id_from_message(message):
+    if len(message.command) > 1:
+        return message.command[1].strip().lower()
+    reply = message.reply_to_message
+    if not getattr(reply, "empty", True):
+        match = re.search(r"Bunkr session:\s*([0-9a-f]{12})", reply.text or "", re.I)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+async def _owned_bunkr_session(message, default_states=None):
+    session_id = _bunkr_session_id_from_message(message)
+    if session_id:
+        return await bunkr_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+    sessions = await bunkr_session_store.list_sessions(
+        owner_id=message.from_user.id,
+        states=default_states,
+        limit=2,
+    )
+    return sessions[0] if len(sessions) == 1 else None
+
+
+async def _remove_bunkr_download(gid):
+    try:
+        torrent_info = await aria2_tell_status(session, gid)
+        dir_path = torrent_info.get("dir")
+        await aria2_remove(session, gid)
+        if dir_path and os.path.exists(dir_path):
+            import shutil
+
+            shutil.rmtree(dir_path, ignore_errors=True)
+            parent_dir = os.path.dirname(dir_path)
+            if os.path.exists(parent_dir) and not os.listdir(parent_dir):
+                os.rmdir(parent_dir)
+    except (Aria2Error, OSError):
+        pass
+
+
+async def _cancel_bunkr_session_runtime(session_id):
+    active_files = await bunkr_session_store.active_files(session_id)
+    await bunkr_session_store.cancel_session(session_id)
+    for file_doc in active_files:
+        if file_doc.get("gid"):
+            await _remove_bunkr_download(file_doc["gid"])
+    task = bunkr_session_tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()
+
+
+@Client.on_message(
+    filters.command(["bsessions", "bunkrsessions"]) & filters.chat(ALL_CHATS)
+)
+async def bunkr_sessions_cmd(client, message):
+    sessions = await bunkr_session_store.list_sessions(owner_id=message.from_user.id)
+    if not sessions:
+        await message.reply_text("You do not have any Bunkr sessions.")
+        return
+    text = "<b>Your Bunkr sessions:</b>\n\n"
+    for session_doc in sessions:
+        counts = await bunkr_session_store.counts(session_doc["_id"])
+        text += (
+            f"• <code>{session_doc['_id']}</code> — "
+            f"{html.escape(session_doc['state'])} — "
+            f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded\n"
+        )
+    text += "\nUse <code>/bsession ID</code> for every stored file link."
+    if not bunkr_session_store.persistent:
+        text += "\n\n⚠️ DB_URL is not configured; these sessions are memory-only."
+    await message.reply_text(text)
+
+
+@Client.on_message(
+    filters.command(["bsession", "bunkrsession"]) & filters.chat(ALL_CHATS)
+)
+async def bunkr_session_cmd(client, message):
+    session_doc = await _owned_bunkr_session(message)
+    if not session_doc:
+        await message.reply_text(
+            "Session not found. Use <code>/bsession &lt;session_id&gt;</code> "
+            "or reply to a Bunkr session message."
+        )
+        return
+    await _send_bunkr_session_summary(message, session_doc)
+
+
+@Client.on_message(
+    filters.command(["pause", "pausesession"]) & filters.chat(ALL_CHATS)
+)
+async def pause_bunkr_session_cmd(client, message):
+    session_doc = await _owned_bunkr_session(
+        message, default_states=(SESSION_RUNNING,)
+    )
+    if not session_doc:
+        await message.reply_text(
+            "Running session not found. Use <code>/pause &lt;session_id&gt;</code>."
+        )
+        return
+    if session_doc["state"] == SESSION_COMPLETED:
+        await message.reply_text("That Bunkr session is already complete.")
+        return
+
+    await bunkr_session_store.set_state(session_doc["_id"], SESSION_PAUSED)
+    active_files = await bunkr_session_store.active_files(session_doc["_id"])
+    for file_doc in active_files:
+        gid = file_doc.get("gid")
+        if gid:
+            try:
+                await aria2_pause(session, gid)
+            except Aria2Error:
+                pass
+    updated = await bunkr_session_store.get_session(session_doc["_id"])
+    await message.reply_text(
+        f"Paused Bunkr session <code>{session_doc['_id']}</code>. "
+        "Already queued Telegram uploads will continue normally."
+    )
+    await _send_bunkr_session_summary(message, updated)
+
+
+@Client.on_message(filters.command("continue") & filters.chat(ALL_CHATS))
+async def continue_bunkr_session_cmd(client, message):
+    session_doc = await _owned_bunkr_session(
+        message,
+        default_states=(
+            SESSION_RUNNING,
+            SESSION_PAUSED,
+            SESSION_CANCELLED,
+            SESSION_FAILED,
+        ),
+    )
+    if not session_doc:
+        await message.reply_text(
+            "Resumable session not found or more than one session needs attention. "
+            "Use <code>/continue &lt;session_id&gt;</code> or reply to its session message."
+        )
+        return
+    if session_doc["state"] == SESSION_COMPLETED:
+        await message.reply_text("That Bunkr session is already complete.")
+        return
+
+    task = bunkr_session_tasks.get(session_doc["_id"])
+    if task and not task.done():
+        await bunkr_session_store.set_state(
+            session_doc["_id"],
+            SESSION_RUNNING,
+            chat_id=message.chat.id,
+            source_message_id=message.id,
+        )
+        for file_doc in await bunkr_session_store.active_files(session_doc["_id"]):
+            gid = file_doc.get("gid")
+            if gid:
+                try:
+                    await aria2_unpause(session, gid)
+                except Aria2Error:
+                    pass
+    else:
+        # A bot-only restart can leave aria2 alive while the in-memory session
+        # task is gone. Remove any persisted stale GIDs before re-claiming them.
+        for file_doc in await bunkr_session_store.active_files(session_doc["_id"]):
+            if file_doc.get("gid"):
+                await _remove_bunkr_download(file_doc["gid"])
+        await bunkr_session_store.prepare_continue(
+            session_doc["_id"], message.chat.id, message.id
+        )
+        _start_bunkr_session(client, message, session_doc["_id"])
+
+    await message.reply_text(
+        f"Continuing Bunkr session <code>{session_doc['_id']}</code> from its "
+        "first unfinished link."
+    )
+
+
+@Client.on_message(
+    filters.command(["cancelsession", "cancelbunkr"]) & filters.chat(ALL_CHATS)
+)
+async def cancel_bunkr_session_cmd(client, message):
+    session_doc = await _owned_bunkr_session(
+        message,
+        default_states=(SESSION_RUNNING, SESSION_PAUSED, SESSION_FAILED),
+    )
+    if not session_doc:
+        await message.reply_text(
+            "Session not found. Use <code>/cancelsession &lt;session_id&gt;</code>."
+        )
+        return
+    await _cancel_bunkr_session_runtime(session_doc["_id"])
+    updated = await bunkr_session_store.get_session(session_doc["_id"])
+    await _send_bunkr_session_summary(message, updated)
+    await message.reply_text(
+        f"Continue later with <code>/continue {session_doc['_id']}</code>. "
+        "Already queued Telegram uploads were not cancelled."
+    )
+
+
+@Client.on_message(
+    filters.command(["deletesession", "deletebunkrsession"])
+    & filters.chat(ALL_CHATS)
+)
+async def delete_bunkr_session_cmd(client, message):
+    session_doc = await _owned_bunkr_session(message)
+    if not session_doc:
+        await message.reply_text(
+            "Session not found. Use <code>/deletesession &lt;session_id&gt;</code>."
+        )
+        return
+    await _cancel_bunkr_session_runtime(session_doc["_id"])
+    await bunkr_session_store.delete_session(session_doc["_id"])
+    await message.reply_text(
+        f"Deleted Bunkr session <code>{session_doc['_id']}</code> and its stored "
+        "link history. Previously uploaded Telegram files were not deleted."
+    )
+
+
+@Client.on_message(
+    filters.command(["deleteallsessions", "deleteallbunkrsessions"])
+    & filters.chat(ALL_CHATS)
+)
+async def delete_all_bunkr_sessions_cmd(client, message):
+    sessions = await bunkr_session_store.list_sessions(
+        owner_id=message.from_user.id, limit=0
+    )
+    if not sessions:
+        await message.reply_text("You do not have any Bunkr sessions to delete.")
+        return
+    for session_doc in sessions:
+        await _cancel_bunkr_session_runtime(session_doc["_id"])
+        await bunkr_session_store.delete_session(session_doc["_id"])
+    await message.reply_text(
+        f"Deleted {len(sessions)} Bunkr session(s) and their stored link "
+        "history. Previously queued/uploaded Telegram files were not deleted."
+    )
 
 
 @Client.on_message(
@@ -478,34 +883,95 @@ async def queue_cmd(client, message):
     task.add_done_callback(bunkr_tasks.discard)
 
 
-async def process_bunkr_download(client, message, file_url, file_name, filename, flags):
-    async with bunkr_semaphore:
-        try:
-            # We are the active file now, pop ourselves off the visible pending queue list.
-            search_target = file_name or file_url or filename
-            if search_target in global_bunkr_queue:
-                global_bunkr_queue.remove(search_target)
-
+async def process_bunkr_download(client, message, session_doc, file_doc, flags):
+    file_id = file_doc["_id"]
+    try:
+        async with bunkr_semaphore:
             direct_url, resolved_name, referer = await resolve_bunkr_file(
-                file_url, session
+                file_doc["page_url"], session
             )
-            file_headers = f"Referer: {referer}"
-            await initiate_directdl(
-                client,
-                message,
-                direct_url,
-                filename or resolved_name,
-                flags,
-                headers=file_headers,
-            )
-        except Exception as e:
-            await message.reply_text(f"Failed to resolve {file_name}: {str(e)}")
-        finally:
-            # Cooldown before releasing semaphore — avoids Bunkr 429 rate-limiting
+            # Serialize Bunkr page/API requests and retain the anti-429 cooldown,
+            # but do not hold the semaphore for the entire aria2 download.
             await asyncio.sleep(5)
+        await bunkr_session_store.update_file(
+            file_id,
+            FILE_RESOLVING,
+            filename=resolved_name or file_doc["filename"],
+        )
+
+        current = await bunkr_session_store.get_session(session_doc["_id"])
+        if not current or current["state"] != SESSION_RUNNING:
+            await bunkr_session_store.update_file(file_id, FILE_PENDING, gid=None)
+            return
+
+        async def on_gid(gid):
+            await bunkr_session_store.update_file(
+                file_id, FILE_DOWNLOADING, gid=gid, error=None
+            )
+            latest = await bunkr_session_store.get_session(session_doc["_id"])
+            if latest and latest["state"] == SESSION_PAUSED:
+                try:
+                    await aria2_pause(session, gid)
+                except Aria2Error:
+                    pass
+
+        async def on_downloaded():
+            await bunkr_session_store.update_file(
+                file_id, FILE_DOWNLOADED, gid=None, error=None
+            )
+
+        result = await initiate_directdl(
+            client,
+            message,
+            direct_url,
+            current.get("custom_filename") or resolved_name,
+            flags,
+            headers=f"Referer: {referer}",
+            on_gid=on_gid,
+            on_downloaded=on_downloaded,
+        )
+        if result == "complete":
+            await bunkr_session_store.update_file(
+                file_id, FILE_DOWNLOADED, gid=None, error=None
+            )
+        elif result == "removed":
+            await bunkr_session_store.update_file(
+                file_id, FILE_CANCELLED, gid=None, error="Download cancelled"
+            )
+        else:
+            await bunkr_session_store.update_file(
+                file_id,
+                FILE_FAILED,
+                gid=None,
+                error=result or "Download could not be started",
+            )
+    except asyncio.CancelledError:
+        latest_file = await bunkr_session_store.get_file(file_id)
+        if latest_file and latest_file["status"] != FILE_DOWNLOADED:
+            await bunkr_session_store.update_file(
+                file_id, FILE_CANCELLED, gid=None, error="Session cancelled"
+            )
+        raise
+    except Exception as e:
+        await bunkr_session_store.update_file(
+            file_id, FILE_FAILED, gid=None, error=str(e)
+        )
+        await message.reply_text(
+            f"Failed to download {html.escape(str(file_doc['filename']))}: "
+            f"{html.escape(str(e))}"
+        )
 
 
-async def initiate_directdl(client, message, link, filename, flags, headers=None):
+async def initiate_directdl(
+    client,
+    message,
+    link,
+    filename,
+    flags,
+    headers=None,
+    on_gid=None,
+    on_downloaded=None,
+):
     user_id = message.from_user.id
     reply = await message.reply_text("Adding url...")
     try:
@@ -522,16 +988,38 @@ async def initiate_directdl(client, message, link, filename, flags, headers=None
             ),
             reply.delete(),
         )
+        return f"Aria2 {ex.error_code}: {ex.error_message}"
     except asyncio.TimeoutError:
         await asyncio.gather(message.reply_text("Connection timed out"), reply.delete())
+        return "Connection timed out"
     else:
-        await handle_leech(client, message, gid, reply, user_id, flags, None)
+        if on_gid is not None:
+            try:
+                await on_gid(gid)
+            except Exception:
+                try:
+                    await aria2_remove(session, gid)
+                except Aria2Error:
+                    pass
+                raise
+        return await handle_leech(
+            client,
+            message,
+            gid,
+            reply,
+            user_id,
+            flags,
+            None,
+            on_downloaded=on_downloaded,
+        )
 
 
 leech_statuses = dict()
 
 
-async def handle_leech(client, message, gid, reply, user_id, flags, newFile):
+async def handle_leech(
+    client, message, gid, reply, user_id, flags, newFile, on_downloaded=None
+):
     torrent_info = await aria2_tell_status(session, gid)
     message_identifier = (reply.chat.id, reply.id)
     leech_statuses[message_identifier] = gid
@@ -547,6 +1035,7 @@ async def handle_leech(client, message, gid, reply, user_id, flags, newFile):
         torrent_info = await aria2_tell_status(session, gid)
 
     if torrent_info["status"] == "error":
+        leech_statuses.pop(message_identifier, None)
         error_code = torrent_info["errorCode"]
         error_message = torrent_info["errorMessage"]
         text = f"Aria2 Error Occured!\n{error_code}: {html.escape(error_message)}"
@@ -559,8 +1048,11 @@ async def handle_leech(client, message, gid, reply, user_id, flags, newFile):
                 "\n\nThis error may have been caused due to the torrent being too slow"
             )
         await message.reply_text(text)
+        return "error"
     elif torrent_info["status"] == "removed":
+        leech_statuses.pop(message_identifier, None)
         await message.reply_text("Your download has been manually cancelled.")
+        return "removed"
     else:
         leech_statuses.pop(message_identifier, None)
         task = None
@@ -579,6 +1071,8 @@ async def handle_leech(client, message, gid, reply, user_id, flags, newFile):
         upload_queue.put_nowait(
             (client, message, reply, torrent_info, user_id, flags, newFile)
         )
+        if on_downloaded is not None:
+            await on_downloaded()
         try:
             await aria2_remove(session, gid)
         except Aria2Error as ex:
@@ -590,6 +1084,7 @@ async def handle_leech(client, message, gid, reply, user_id, flags, newFile):
         finally:
             if task:
                 await task
+        return "complete"
 
 
 selection_waits = dict()
@@ -775,20 +1270,38 @@ async def cancelall_leech(client, message):
         return
 
     count = 0
-    # Clear the bunkr queue list instantly
-    global global_bunkr_queue
-    count += len(global_bunkr_queue)
-    global_bunkr_queue.clear()
+    affected_bunkr_sessions = await bunkr_session_store.list_sessions(
+        states=(SESSION_RUNNING, SESSION_PAUSED), limit=0
+    )
+    for session_doc in affected_bunkr_sessions:
+        await bunkr_session_store.cancel_session(session_doc["_id"])
+    count += len(affected_bunkr_sessions)
 
     # Cancel all pending asyncio tasks related to the Bunkr queue
+    cancelled_bunkr_tasks = []
     for t in list(bunkr_tasks):
         if not t.done():
             t.cancel()
+            cancelled_bunkr_tasks.append(t)
             count += 1
+    if cancelled_bunkr_tasks:
+        await asyncio.gather(*cancelled_bunkr_tasks, return_exceptions=True)
     bunkr_tasks.clear()
 
-    # Cancel all active Aria2 downloads
+    # Pause everything first: with -j5 only a handful of downloads are active and
+    # aria2 promotes a waiting one the moment we remove an active one, so without
+    # this the sweep below races against the queue refilling itself.
+    try:
+        await aria2_force_pause_all(session)
+    except Exception:
+        pass
+
+    # Cancel all active *and* queued Aria2 downloads
     downloads = await aria2_tell_active(session)
+    try:
+        downloads += await aria2_tell_waiting(session)
+    except Exception:
+        pass
     for i in downloads:
         gid = i["gid"]
         try:
@@ -819,6 +1332,11 @@ async def cancelall_leech(client, message):
         )
     else:
         await message.reply_text("No active tasks or queue to cancel.")
+
+    for session_doc in affected_bunkr_sessions:
+        if session_doc["owner_id"] == user_id:
+            updated = await bunkr_session_store.get_session(session_doc["_id"])
+            await _send_bunkr_session_summary(message, updated)
 
 
 @Client.on_message(
@@ -921,6 +1439,22 @@ async def cancel_leech(client, message):
         await message.reply_text("You did not start this leech.")
         return
 
+    bunkr_file = await bunkr_session_store.find_file_by_gid(gid)
+    if bunkr_file:
+        session_id = bunkr_file["session_id"]
+        task = bunkr_session_tasks.get(session_id)
+        await _cancel_bunkr_session_runtime(session_id)
+        if task and not task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        session_doc = await bunkr_session_store.get_session(session_id)
+        await _send_bunkr_session_summary(message, session_doc)
+        await message.reply_text(
+            f"Bunkr session cancelled. Continue later with "
+            f"<code>/continue {session_id}</code>. Already queued uploads are "
+            "still running."
+        )
+        return
+
     try:
         # If it's still downloading, try to get the directory info to clean it up before removing the task
         torrent_info = await aria2_tell_status(session, gid)
@@ -996,6 +1530,14 @@ help_dict["leech"] = (
 /filedirectdl <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files
 /filedirect <i>&lt;Direct URL&gt; | optional custom file name</i> - Sends videos as files
 /filedirect <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files
+
+/bsessions - Lists your Bunkr sessions
+/bsession <i>&lt;session ID&gt;</i> - Lists downloaded and unfinished file links
+/pause <i>&lt;session ID&gt;</i> - Pauses Bunkr downloading; queued uploads continue
+/continue <i>&lt;session ID&gt;</i> - Resumes unfinished Bunkr files
+/cancelsession <i>&lt;session ID&gt;</i> - Cancels downloading but retains the session
+/deletesession <i>&lt;session ID&gt;</i> - Deletes the stored session history
+/deleteallsessions - Deletes all of your stored Bunkr session histories
 
 /cancel <i>&lt;GID&gt;</i>
 /cancel <i>&lt;chat id&gt;</i> <i>&lt;message id&gt;</i>

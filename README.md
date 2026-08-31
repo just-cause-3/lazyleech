@@ -89,6 +89,13 @@ zipdirectdl <Direct URL> or as reply to a Direct URL | optional custom file name
 zipdirect <Direct URL> or as reply to a Direct URL | optional custom file name
 filedirectdl <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
 filedirect <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
+bsessions - List your persistent Bunkr sessions
+bsession <session ID> - List downloaded and unfinished Bunkr file links
+pause <session ID> - Pause new/current Bunkr downloading; queued uploads continue
+continue <session ID> - Resume only unfinished files in a Bunkr session
+cancelsession <session ID> - Cancel Bunkr downloading and retain the session
+deletesession <session ID> - Delete a Bunkr session and its stored link history
+deleteallsessions - Delete all of your stored Bunkr session histories
 cancel - <GID> or as reply to status message
 list - Lists your Ongoing Leeches.
 ```

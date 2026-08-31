@@ -62,6 +62,21 @@ async def aria2_tell_active(session):
     return _raise_or_return(await aria2_request(session, "aria2.tellActive"))
 
 
+async def aria2_tell_waiting(session, offset=0, num=1000):
+    # Downloads queued behind the -j concurrency limit live here, not in tellActive
+    return _raise_or_return(
+        await aria2_request(session, "aria2.tellWaiting", [offset, num])
+    )
+
+
+async def aria2_force_pause_all(session):
+    return _raise_or_return(await aria2_request(session, "aria2.forcePauseAll"))
+
+
+async def aria2_pause(session, gid):
+    return _raise_or_return(await aria2_request(session, "aria2.pause", [gid]))
+
+
 async def aria2_tell_status(session, gid):
     return _raise_or_return(await aria2_request(session, "aria2.tellStatus", [gid]))
 

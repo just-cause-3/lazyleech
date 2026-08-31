@@ -41,7 +41,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Optional: MongoDB for RSS auto-download feature
+  # Optional: MongoDB for persistent Bunkr sessions and RSS auto-download
   mongodb:
     image: mongo:6.0
     container_name: lazyleech-mongodb
@@ -55,6 +55,7 @@ services:
       - "27017:27017"
     profiles:
       - rss
+      - sessions
 
 volumes:
   mongodb_data:

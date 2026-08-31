@@ -46,6 +46,9 @@ docker-compose up -d
 # Build and start (with MongoDB for RSS)
 docker-compose --profile rss up -d
 
+# Build and start (with MongoDB for persistent Bunkr sessions)
+docker-compose --profile sessions up -d
+
 # View logs
 docker-compose logs -f
 
@@ -74,7 +77,8 @@ docker-compose down
 | `PROGRESS_UPDATE_DELAY` | Progress update interval | `5` |
 | `LEECH_TIMEOUT` | Download timeout (seconds) | `300` |
 | `MAGNET_TIMEOUT` | Magnet timeout (seconds) | `60` |
-| `DB_URL` | MongoDB URL for RSS | None |
+| `DB_URL` | MongoDB URL for persistent Bunkr sessions and RSS | None |
+| `LAZYLEECH_DB_NAME` | Mongo database containing LazyLeech collections | `ASWFeed` |
 | `NYAA_RSS_LINKS` | RSS feed URLs | None |
 
 ---

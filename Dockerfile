@@ -47,8 +47,10 @@ COPY testwatermark.jpg .
 RUN mkdir -p /app/logs /app/downloads
 
 # Copy entrypoint script
+# Strip CR line endings so the script runs even when checked out on Windows
 COPY docker-entrypoint.sh .
-RUN chmod +x docker-entrypoint.sh
+RUN sed -i 's/\r$//' docker-entrypoint.sh \
+    && chmod +x docker-entrypoint.sh
 
 # Expose port (for potential future use)
 EXPOSE 6800

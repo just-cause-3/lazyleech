@@ -17,7 +17,11 @@
             "description":"Chats where this bot will respond and leech"
         },
         "DB_URL":{
-            "description":"Mongodb url from https://cloud.mongodb.com/, guide: https://del.dog/mongodb_guide, if want to add auto download feature",
+            "description":"MongoDB URL for persistent Bunkr sessions and the optional RSS auto-download feature",
+            "required":false
+        },
+        "LAZYLEECH_DB_NAME":{
+            "description":"MongoDB database name for LazyLeech collections (default: ASWFeed)",
             "required":false
         },
         "NYAA_RSS_LINKS":{

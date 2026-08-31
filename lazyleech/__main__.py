@@ -21,7 +21,8 @@ import traceback
 
 from pyrogram import idle
 
-from . import ADMIN_CHATS, app, preserved_logs
+from . import ADMIN_CHATS, app, preserved_logs, session
+from .utils.bunkr_sessions import bunkr_session_store
 from .utils.status import status_worker
 from .utils.upload_worker import upload_worker
 
@@ -52,9 +53,12 @@ async def main():
     await idle()
     await app.stop()
     if os.environ.get("DB_URL"):
-        from plugins.nyaa_auto_download import _close_db
+        from .plugins.nyaa_auto_download import _close_db
 
         _close_db()
+    bunkr_session_store.close()
+    if session._session is not None:
+        await session._session.close()
 
 
 app.loop.run_until_complete(main())

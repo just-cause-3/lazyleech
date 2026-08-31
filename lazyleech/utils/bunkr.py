@@ -16,7 +16,14 @@ import random
 import re
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlsplit, urlunparse, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urlparse,
+    urlsplit,
+    urlunparse,
+    urlunsplit,
+)
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -50,6 +57,11 @@ MAX_RETRIES = 5
 BASE_DELAY = 2.0
 DEFAULT_TIMEOUT = 30
 PAGE_FETCH_TIMEOUT = 40
+# Pause between album page fetches when crawling a paginated album, so a
+# large album doesn't trip Bunkr's rate limiter.
+PAGE_CRAWL_DELAY = 1.5
+# Guard against a misparsed pagination nav sending us on a huge crawl.
+MAX_ALBUM_PAGES = 100
 
 # URL type mapping: True = album, False = single file/media
 URL_TYPE_MAPPING = {"a": True, "f": False, "i": False, "v": False}
@@ -75,6 +87,29 @@ def _replace_domain_with_fallback(url: str) -> str:
     """Replace the domain of a URL with the configured fallback domain."""
     parsed = urlparse(url)
     return urlunparse(parsed._replace(netloc=FALLBACK_DOMAIN))
+
+
+def _album_page_url(url: str, page: int = 1, advanced: bool = True) -> str:
+    """Build the URL for one page of an album.
+
+    Any ``page``/``advanced`` already on *url* is replaced rather than appended,
+    so a user-supplied ``?page=10`` can't produce ``...?page=10?page=2``. The
+    caller's page choice is intentionally discarded: we always crawl the whole
+    album starting from page 1.
+    """
+    parts = urlsplit(url)
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parts.query)
+        if k not in ("page", "advanced")
+    ]
+    if advanced:
+        query.append(("advanced", "1"))
+    if page > 1:
+        query.append(("page", str(page)))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
 
 
 async def _fetch_page(
@@ -384,24 +419,42 @@ def _extract_item_pages(
         return []
 
 
+def _get_album_page_count(soup: BeautifulSoup) -> int:
+    """Highest page number in the album's pagination nav (1 when unpaginated)."""
+    pagination_nav = soup.find("nav", {"class": "pagination"})
+    if pagination_nav is None:
+        return 1
+
+    # get_text() with no separator welds adjacent link labels together, so
+    # <a>1</a><a>2</a><a>3</a> reads as "123". Force a separator, and also
+    # take page numbers straight from the ?page= hrefs, which are unambiguous.
+    page_ids = re.findall(r"\d+", pagination_nav.get_text(" "))
+    page_ids += re.findall(r"[?&]page=(\d+)", str(pagination_nav))
+    if not page_ids:
+        return 1
+
+    num_pages = max(int(pid) for pid in page_ids)
+    if num_pages > MAX_ALBUM_PAGES:
+        logger.warning(
+            "Album reports %d pages, clamping to %d", num_pages, MAX_ALBUM_PAGES
+        )
+        return MAX_ALBUM_PAGES
+    return num_pages
+
+
 def _extract_next_album_pages(
     soup: BeautifulSoup,
     url: str,
 ) -> Optional[List[str]]:
     """Extract pagination links for subsequent album pages."""
-    pagination_nav = soup.find("nav", {"class": "pagination"})
-    if pagination_nav is None:
-        return None
-
-    page_ids = re.findall(r"\d+", pagination_nav.get_text())
-    if not page_ids:
-        return None
-
-    num_pages = max(int(pid) for pid in page_ids)
+    num_pages = _get_album_page_count(soup)
     if num_pages <= 1:
         return None
 
-    return [f"{url}?page={page}" for page in range(2, num_pages + 1)]
+    return [
+        _album_page_url(url, page, advanced=False)
+        for page in range(2, num_pages + 1)
+    ]
 
 
 def _normalize_album_json(raw: str) -> str:
@@ -413,24 +466,16 @@ def _normalize_album_json(raw: str) -> str:
     return out
 
 
-async def _extract_album_via_js(
-    url: str,
-    session: aiohttp.ClientSession,
+def _parse_album_files(
+    soup: BeautifulSoup,
+    scheme: str,
+    netloc: str,
 ) -> Optional[List[Tuple[str, str]]]:
-    """Try to extract album files from window.albumFiles JS variable.
+    """Pull (file_url, filename) tuples out of a page's window.albumFiles var.
 
-    This is the legacy approach that provides filenames directly.
-    Returns None if the JS variable is not found.
+    Returns None when the variable is absent or yields nothing usable, which
+    tells the caller to fall back to HTML crawling.
     """
-    parts = urlsplit(url)
-    target_url = urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, "advanced=1", parts.fragment)
-    )
-
-    soup = await _fetch_page(target_url, session)
-    if not soup:
-        return None
-
     for script in soup.find_all("script"):
         text = script.string or script.get_text()
         if not text or "window.albumFiles" not in text:
@@ -441,23 +486,75 @@ async def _extract_album_via_js(
         normalized = _normalize_album_json(m.group(1))
         try:
             album_files = json.loads(normalized)
-            results = []
-            for f in album_files:
-                slug = f.get("slug")
-                if not slug:
-                    continue
-                file_url = f"{parts.scheme}://{parts.netloc}/f/{slug}"
-                filename = f.get("original") or f.get("name") or slug
-                results.append((file_url, filename))
-            if results:
-                logger.info(
-                    "Extracted %d files from album JS for %s", len(results), url
-                )
-                return results
         except json.JSONDecodeError:
             continue
+        results = []
+        for f in album_files:
+            slug = f.get("slug")
+            if not slug:
+                continue
+            file_url = f"{scheme}://{netloc}/f/{slug}"
+            filename = f.get("original") or f.get("name") or slug
+            results.append((file_url, filename))
+        if results:
+            return results
 
     return None
+
+
+async def _extract_album_via_js(
+    url: str,
+    session: aiohttp.ClientSession,
+) -> Optional[List[Tuple[str, str]]]:
+    """Extract album files from the window.albumFiles JS variable.
+
+    This is the legacy approach that provides filenames directly. Albums larger
+    than one page are paginated, and window.albumFiles only ever describes the
+    page it was served on, so every page is crawled and the results merged.
+
+    Returns None if the JS variable is not found on the first page.
+    """
+    parts = urlsplit(url)
+
+    soup = await _fetch_page(_album_page_url(url, 1), session)
+    if not soup:
+        return None
+
+    results = _parse_album_files(soup, parts.scheme, parts.netloc)
+    if results is None:
+        return None
+
+    num_pages = _get_album_page_count(soup)
+    for page in range(2, num_pages + 1):
+        await asyncio.sleep(PAGE_CRAWL_DELAY)
+        page_soup = await _fetch_page(_album_page_url(url, page), session)
+        if not page_soup:
+            logger.warning(
+                "Failed to fetch album page %d/%d for %s", page, num_pages, url
+            )
+            continue
+        page_results = _parse_album_files(page_soup, parts.scheme, parts.netloc)
+        if not page_results:
+            logger.warning(
+                "No albumFiles found on page %d/%d for %s", page, num_pages, url
+            )
+            continue
+        results.extend(page_results)
+
+    # A file can repeat across pages if the album reflows between fetches.
+    seen = set()
+    deduped = []
+    for file_url, filename in results:
+        if file_url in seen:
+            continue
+        seen.add(file_url)
+        deduped.append((file_url, filename))
+
+    logger.info(
+        "Extracted %d files from album JS across %d page(s) for %s",
+        len(deduped), num_pages, url,
+    )
+    return deduped
 
 
 async def _extract_album_via_html(
@@ -536,8 +633,10 @@ async def extract_album_urls(
 ) -> List[Tuple[str, str]]:
     """Extract all file URLs and filenames from a Bunkr album.
 
-    Tries the JS-based approach first (provides proper filenames),
-    then falls back to HTML crawling with pagination.
+    Tries the JS-based approach first (provides proper filenames), then falls
+    back to HTML crawling. Both paths walk every page of a paginated album.
+
+    Any ``?page=N`` on *url* is ignored — the whole album is always crawled.
 
     Returns:
         List of (file_page_url, filename) tuples.
