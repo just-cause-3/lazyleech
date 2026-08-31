@@ -92,6 +92,7 @@ filedirect <Direct URL> or as reply to a Direct URL | optional custom file name 
 bsessions - List your persistent Bunkr sessions
 bsession <session ID> - List downloaded and unfinished Bunkr file links
 pause <session ID> - Pause new/current Bunkr downloading; queued uploads continue
+skip <session ID> - Move the active Bunkr file to the bottom and start the next one
 continue <session ID> - Resume only unfinished files in a Bunkr session
 cancelsession <session ID> - Cancel Bunkr downloading and retain the session
 deletesession <session ID> - Delete a Bunkr session and its stored link history
@@ -99,6 +100,17 @@ deleteallsessions - Delete all of your stored Bunkr session histories
 cancel - <GID> or as reply to status message
 list - Lists your Ongoing Leeches.
 ```
+
+Bunkr album downloads automatically move a persistently slow file to the bottom
+of its session queue. By default this happens below 128 KiB/s for 90 continuous
+seconds after a 60-second startup grace period, at most twice per file. The
+thresholds can be adjusted with the `BUNKR_SLOW_*` environment variables.
+Fresh Bunkr downloads use four range connections by default. A deferred file
+keeps its partial data and retries with one connection, which is less likely to
+remain CDN-throttled. Downloads are also serialized per Bunkr CDN host, while
+different hosts and queued Telegram uploads can continue independently. Tune
+this with `BUNKR_CONNECTIONS`, `BUNKR_RECOVERY_CONNECTIONS`, and
+`BUNKR_MAX_DOWNLOADS_PER_HOST`.
 
 **Other Modules**
 ```

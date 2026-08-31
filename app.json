@@ -4,7 +4,7 @@
   "keywords": [
     "telegram"
   ],
-  "repository": "https://github.com/lostb053/lazyleech",
+  "repository": "https://github.com/just-cause-3/lazyleech",
   "stack": "container",
   "env":{
         "API_ID":{
@@ -22,6 +22,34 @@
         },
         "LAZYLEECH_DB_NAME":{
             "description":"MongoDB database name for LazyLeech collections (default: ASWFeed)",
+            "required":false
+        },
+        "BUNKR_SLOW_SPEED_KBPS":{
+            "description":"Bunkr speed threshold in KiB/s for moving a slow file to the bottom (default: 128; 0 disables)",
+            "required":false
+        },
+        "BUNKR_SLOW_GRACE_SECONDS":{
+            "description":"Grace period before monitoring a Bunkr download for slow speed (default: 60)",
+            "required":false
+        },
+        "BUNKR_SLOW_DURATION_SECONDS":{
+            "description":"Continuous slow period before moving a Bunkr file to the bottom (default: 90)",
+            "required":false
+        },
+        "BUNKR_MAX_AUTO_SKIPS":{
+            "description":"Maximum automatic bottom-of-queue moves per Bunkr file (default: 2; 0 disables)",
+            "required":false
+        },
+        "BUNKR_CONNECTIONS":{
+            "description":"Range connections for a fresh Bunkr download (default: 4)",
+            "required":false
+        },
+        "BUNKR_RECOVERY_CONNECTIONS":{
+            "description":"Range connections after a Bunkr file is deferred (default: 1)",
+            "required":false
+        },
+        "BUNKR_MAX_DOWNLOADS_PER_HOST":{
+            "description":"Concurrent Bunkr files allowed per CDN host (default: 1)",
             "required":false
         },
         "NYAA_RSS_LINKS":{

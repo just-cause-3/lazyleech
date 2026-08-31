@@ -197,12 +197,18 @@ async def aria2_add_magnet(session, user_id, link, timeout=0, pause=False):
 
 
 async def aria2_add_directdl(
-    session, user_id, link, filename=None, timeout=60, headers=None
+    session,
+    user_id,
+    link,
+    filename=None,
+    timeout=60,
+    headers=None,
+    max_connections=8,
+    download_dir=None,
+    resume=False,
 ):
-    dir = os.path.join(os.getcwd(), str(user_id), str(time.time()))
-
-    # Hard cap Bunkr connections down to 8 based on user request
-    max_conn = "8"
+    dir = download_dir or os.path.join(os.getcwd(), str(user_id), str(time.time()))
+    max_conn = str(max(1, min(int(max_connections), 16)))
 
     options = {
         "gid": await generate_gid(session, user_id),
@@ -215,6 +221,9 @@ async def aria2_add_directdl(
         "max-tries": "20",
         "retry-wait": "3",
     }
+    if resume:
+        options["continue"] = "true"
+        options["always-resume"] = "true"
 
     # Always include User-Agent; append any extra headers (e.g. Referer for Bunkr)
     default_ua = (

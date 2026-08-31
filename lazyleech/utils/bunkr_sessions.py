@@ -132,6 +132,10 @@ class BunkrSessionStore:
                 "gid": None,
                 "error": None,
                 "attempts": 0,
+                "defer_count": 0,
+                "auto_defer_count": 0,
+                "last_deferred_at": None,
+                "last_deferred_reason": None,
                 "updated_at": now,
             }
             for position, (page_url, filename) in enumerate(files, 1)
@@ -306,6 +310,138 @@ class BunkrSessionStore:
                 return None
             doc.update(fields)
             return copy.deepcopy(doc)
+
+    async def update_file_if_status(
+        self, file_id, expected_statuses, status=None, **fields
+    ):
+        """Update a file only while it remains in one of the expected states."""
+        if isinstance(expected_statuses, str):
+            expected_statuses = (expected_statuses,)
+        expected_statuses = tuple(expected_statuses)
+        if status is not None:
+            fields["status"] = status
+        fields["updated_at"] = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            return await self.files.find_one_and_update(
+                {"_id": file_id, "status": {"$in": list(expected_statuses)}},
+                {"$set": fields},
+                return_document=ReturnDocument.AFTER,
+            )
+        async with self._memory_lock:
+            doc = self._memory_files.get(file_id)
+            if doc is None or doc["status"] not in expected_statuses:
+                return None
+            doc.update(fields)
+            return copy.deepcopy(doc)
+
+    async def defer_file_to_bottom(
+        self,
+        file_id,
+        reason,
+        *,
+        automatic=False,
+        max_auto_defers=None,
+    ):
+        """Move an active file behind every other file in its session.
+
+        A file is only deferred when another pending file can run next. The
+        conditional update prevents simultaneous manual and automatic skips
+        from moving the same file twice.
+        """
+        active_states = (FILE_RESOLVING, FILE_DOWNLOADING)
+        now = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            file_doc = await self.files.find_one({"_id": file_id})
+            if file_doc is None or file_doc["status"] not in active_states:
+                return None
+            if (
+                automatic
+                and max_auto_defers is not None
+                and file_doc.get("auto_defer_count", 0) >= max_auto_defers
+            ):
+                return None
+            has_next = await self.files.find_one(
+                {
+                    "session_id": file_doc["session_id"],
+                    "_id": {"$ne": file_id},
+                    "status": FILE_PENDING,
+                },
+                projection={"_id": 1},
+            )
+            if has_next is None:
+                return None
+            last_file = await self.files.find_one(
+                {"session_id": file_doc["session_id"]},
+                sort=[("position", -1)],
+                projection={"position": 1},
+            )
+            new_position = int(last_file["position"]) + 1
+            updated = await self.files.find_one_and_update(
+                {"_id": file_id, "status": {"$in": list(active_states)}},
+                {
+                    "$set": {
+                        "status": FILE_PENDING,
+                        "position": new_position,
+                        "gid": None,
+                        "error": reason,
+                        "last_deferred_at": now,
+                        "last_deferred_reason": reason,
+                        "updated_at": now,
+                    },
+                    "$inc": {
+                        "defer_count": 1,
+                        "auto_defer_count": 1 if automatic else 0,
+                    },
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated is not None:
+                await self.sessions.update_one(
+                    {"_id": file_doc["session_id"]},
+                    {"$set": {"updated_at": now}},
+                )
+            return updated
+
+        async with self._memory_lock:
+            file_doc = self._memory_files.get(file_id)
+            if file_doc is None or file_doc["status"] not in active_states:
+                return None
+            if (
+                automatic
+                and max_auto_defers is not None
+                and file_doc.get("auto_defer_count", 0) >= max_auto_defers
+            ):
+                return None
+            session_files = [
+                doc
+                for doc in self._memory_files.values()
+                if doc["session_id"] == file_doc["session_id"]
+            ]
+            if not any(
+                doc["_id"] != file_id and doc["status"] == FILE_PENDING
+                for doc in session_files
+            ):
+                return None
+            file_doc.update(
+                {
+                    "status": FILE_PENDING,
+                    "position": max(doc["position"] for doc in session_files) + 1,
+                    "gid": None,
+                    "error": reason,
+                    "defer_count": file_doc.get("defer_count", 0) + 1,
+                    "auto_defer_count": file_doc.get("auto_defer_count", 0)
+                    + (1 if automatic else 0),
+                    "last_deferred_at": now,
+                    "last_deferred_reason": reason,
+                    "updated_at": now,
+                }
+            )
+            session_doc = self._memory_sessions.get(file_doc["session_id"])
+            if session_doc is not None:
+                session_doc["updated_at"] = now
+            return copy.deepcopy(file_doc)
 
     async def find_file_by_gid(self, gid):
         if not gid:

@@ -14,6 +14,8 @@ import json
 import logging
 import random
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import (
@@ -33,19 +35,15 @@ logger = logging.getLogger(__name__)
 # ============================
 # Constants
 # ============================
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+USER_AGENT = (
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) "
-    "Gecko/20100101 Firefox/136.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-]
+    "Gecko/20100101 Firefox/136.0"
+)
 
 # API endpoints (from BunkrDownloader)
 BUNKR_SIGN_API = "https://glb-apisign.cdn.cr/sign"
 DOWNLOAD_API = "https://dl.bunkr.cr/api/_001_v2"
-DOWNLOAD_REFERER = "https://get.bunkrr.su/"
+DOWNLOAD_REFERER = "https://dl.bunkr.cr/"
 STATUS_PAGE = "https://status.bunkr.ru/"
 FALLBACK_DOMAIN = "bunkr.cr"
 
@@ -60,6 +58,8 @@ PAGE_FETCH_TIMEOUT = 40
 # Pause between album page fetches when crawling a paginated album, so a
 # large album doesn't trip Bunkr's rate limiter.
 PAGE_CRAWL_DELAY = 1.5
+REQUEST_INTERVAL = 0.5
+MAX_RATE_LIMIT_DELAY = 300.0
 # Guard against a misparsed pagination nav sending us on a huge crawl.
 MAX_ALBUM_PAGES = 100
 
@@ -71,12 +71,59 @@ _bunkr_status: Dict[str, str] = {}
 _status_fetched = False
 
 
+def _retry_after_seconds(value, now=None):
+    """Parse a Retry-After delta or HTTP date, capped to a safe wait."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            now = now or datetime.now(timezone.utc)
+            seconds = (retry_at - now).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return min(MAX_RATE_LIMIT_DELAY, max(0.0, seconds))
+
+
+class _BunkrRequestThrottle:
+    """Pace all Bunkr metadata calls and share server cooldowns."""
+
+    def __init__(self, interval=REQUEST_INTERVAL):
+        self.interval = interval
+        self.next_request_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            delay = self.next_request_at - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.next_request_at = loop.time() + self.interval
+
+    async def penalize(self, retry_after, attempt):
+        server_delay = _retry_after_seconds(retry_after) or 0.0
+        adaptive_delay = min(120.0, 10.0 * (2 ** max(0, attempt - 1)))
+        delay = max(server_delay, adaptive_delay + random.uniform(0.5, 2.0))
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            self.next_request_at = max(self.next_request_at, loop.time() + delay)
+        return delay
+
+
+_bunkr_request_throttle = _BunkrRequestThrottle()
+
+
 # ============================
 # HTTP Helpers
 # ============================
 def _random_headers(referer: Optional[str] = None) -> dict:
     return {
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.7",
         "Referer": referer or DOWNLOAD_REFERER,
@@ -123,11 +170,15 @@ async def _fetch_page(
         try:
             headers = _random_headers()
             timeout = aiohttp.ClientTimeout(total=PAGE_FETCH_TIMEOUT)
+            await _bunkr_request_throttle.wait()
             async with session.get(url, headers=headers, timeout=timeout) as resp:
                 if resp.status == 429:
-                    wait = 10 + random.uniform(1, 5)
+                    wait = await _bunkr_request_throttle.penalize(
+                        resp.headers.get("Retry-After"), attempt + 1
+                    )
                     logger.warning("Rate-limited (429) on %s, waiting %.1fs", url, wait)
-                    await asyncio.sleep(wait)
+                    resp.release()
+                    await _bunkr_request_throttle.wait()
                     continue
                 if resp.status == 403 and not tried_fallback:
                     tried_fallback = True
@@ -159,6 +210,7 @@ async def _ensure_bunkr_status(session: aiohttp.ClientSession) -> None:
     try:
         headers = _random_headers()
         timeout = aiohttp.ClientTimeout(total=10)
+        await _bunkr_request_throttle.wait()
         async with session.get(STATUS_PAGE, headers=headers, timeout=timeout) as resp:
             if resp.status == 200:
                 html = await resp.text()
@@ -239,15 +291,24 @@ async def _get_download_response(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+            await _bunkr_request_throttle.wait()
             async with session.post(
                 DOWNLOAD_API,
                 json={"id": file_id},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": DOWNLOAD_REFERER,
+                    "Origin": DOWNLOAD_REFERER.rstrip("/"),
+                },
                 timeout=timeout,
             ) as resp:
                 if resp.status == 429:
-                    wait = 10 + random.uniform(1, 5)
+                    wait = await _bunkr_request_throttle.penalize(
+                        resp.headers.get("Retry-After"), attempt
+                    )
                     logger.warning("Rate-limited (429) on download API, waiting %.1fs", wait)
-                    await asyncio.sleep(wait)
+                    resp.release()
+                    await _bunkr_request_throttle.wait()
                     continue
                 resp.raise_for_status()
                 data = await resp.json()
@@ -316,15 +377,24 @@ async def _get_signed_url(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+            await _bunkr_request_throttle.wait()
             async with session.get(
                 BUNKR_SIGN_API,
                 params={"path": media_path},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": DOWNLOAD_REFERER,
+                    "Origin": DOWNLOAD_REFERER.rstrip("/"),
+                },
                 timeout=timeout,
             ) as resp:
                 if resp.status == 429:
-                    wait = 10 + random.uniform(1, 5)
+                    wait = await _bunkr_request_throttle.penalize(
+                        resp.headers.get("Retry-After"), attempt
+                    )
                     logger.warning("Rate-limited (429) on signing API, waiting %.1fs", wait)
-                    await asyncio.sleep(wait)
+                    resp.release()
+                    await _bunkr_request_throttle.wait()
                     continue
                 resp.raise_for_status()
                 data = await resp.json()

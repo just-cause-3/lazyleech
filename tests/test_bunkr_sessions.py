@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import lazyleech.plugins.leech as leech
 from lazyleech.plugins.leech import _bunkr_session_id_from_message
@@ -10,6 +10,7 @@ from lazyleech.utils.bunkr_sessions import (
     FILE_DOWNLOADING,
     FILE_FAILED,
     FILE_PENDING,
+    FILE_RESOLVING,
     SESSION_CANCELLED,
     SESSION_COMPLETED,
     SESSION_RUNNING,
@@ -84,6 +85,69 @@ class BunkrSessionStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.store.get_session(self.session["_id"]))
         self.assertEqual([], await self.store.list_files(self.session["_id"]))
 
+    async def test_defer_active_file_moves_it_to_bottom(self):
+        first = await self.store.claim_next_file(self.session["_id"])
+        await self.store.update_file(
+            first["_id"], FILE_DOWNLOADING, gid="123abc0000000000"
+        )
+
+        deferred = await self.store.defer_file_to_bottom(
+            first["_id"], "Skipped by user"
+        )
+
+        self.assertIsNotNone(deferred)
+        self.assertEqual(FILE_PENDING, deferred["status"])
+        self.assertEqual(1, deferred["defer_count"])
+        self.assertIsNone(deferred["gid"])
+        files = await self.store.list_files(self.session["_id"])
+        self.assertEqual(
+            ["two.mp4", "three.mp4", "one.mp4"],
+            [item["filename"] for item in files],
+        )
+        self.assertEqual([2, 3, 4], [item["position"] for item in files])
+        next_file = await self.store.claim_next_file(self.session["_id"])
+        self.assertEqual("two.mp4", next_file["filename"])
+
+    async def test_defer_refuses_to_cycle_only_pending_file(self):
+        one_file_session = await self.store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=56,
+            source_url="https://bunkr.example/a/single",
+            title="single",
+            mode="normal",
+            custom_filename=None,
+            files=[("https://bunkr.example/f/only", "only.mp4")],
+        )
+        only_file = await self.store.claim_next_file(one_file_session["_id"])
+
+        deferred = await self.store.defer_file_to_bottom(
+            only_file["_id"], "Skipped by user"
+        )
+
+        self.assertIsNone(deferred)
+        unchanged = await self.store.get_file(only_file["_id"])
+        self.assertEqual(FILE_RESOLVING, unchanged["status"])
+
+    async def test_automatic_defer_respects_per_file_limit(self):
+        first = await self.store.claim_next_file(self.session["_id"])
+        deferred = await self.store.defer_file_to_bottom(
+            first["_id"],
+            "slow",
+            automatic=True,
+            max_auto_defers=1,
+        )
+        self.assertEqual(1, deferred["auto_defer_count"])
+
+        await self.store.update_file(first["_id"], FILE_RESOLVING)
+        rejected = await self.store.defer_file_to_bottom(
+            first["_id"],
+            "still slow",
+            automatic=True,
+            max_auto_defers=1,
+        )
+        self.assertIsNone(rejected)
+
 
 class BunkrSessionCommandParsingTests(unittest.TestCase):
     def test_session_id_from_command_argument(self):
@@ -92,6 +156,36 @@ class BunkrSessionCommandParsingTests(unittest.TestCase):
             reply_to_message=SimpleNamespace(empty=True),
         )
         self.assertEqual("abcdef123456", _bunkr_session_id_from_message(message))
+
+    def test_slow_monitor_requires_continuous_slow_period(self):
+        now = [0]
+        monitor = leech._BunkrSlowDownloadMonitor(
+            speed_limit_bps=100,
+            grace_seconds=10,
+            duration_seconds=5,
+            clock=lambda: now[0],
+        )
+
+        now[0] = 9
+        self.assertFalse(
+            monitor.should_defer({"status": "active", "downloadSpeed": "0"})
+        )
+        now[0] = 10
+        self.assertFalse(
+            monitor.should_defer({"status": "active", "downloadSpeed": "50"})
+        )
+        now[0] = 14
+        self.assertFalse(
+            monitor.should_defer({"status": "active", "downloadSpeed": "150"})
+        )
+        now[0] = 20
+        self.assertFalse(
+            monitor.should_defer({"status": "active", "downloadSpeed": "50"})
+        )
+        now[0] = 25
+        self.assertTrue(
+            monitor.should_defer({"status": "active", "downloadSpeed": "50"})
+        )
 
     def test_session_id_from_replied_summary(self):
         message = SimpleNamespace(
@@ -105,6 +199,88 @@ class BunkrSessionCommandParsingTests(unittest.TestCase):
 
 
 class BunkrSessionSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skip_during_resolution_does_not_start_deferred_file(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+            ],
+        )
+        first = await store.claim_next_file(session["_id"])
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+
+        async def resolve_after_skip(*args):
+            await store.defer_file_to_bottom(first["_id"], "Skipped by user")
+            return "https://cdn.example/one", "one.mp4", "https://bunkr.example/"
+
+        initiate = AsyncMock()
+        try:
+            with (
+                patch.object(leech, "resolve_bunkr_file", resolve_after_skip),
+                patch.object(leech, "initiate_directdl", initiate),
+                patch.object(leech.asyncio, "sleep", AsyncMock()),
+            ):
+                result = await leech.process_bunkr_download(
+                    None, SimpleNamespace(), session, first, ()
+                )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        self.assertEqual("deferred", result)
+        initiate.assert_not_awaited()
+        next_file = await store.claim_next_file(session["_id"])
+        self.assertEqual("two.mp4", next_file["filename"])
+
+    async def test_manual_defer_removes_active_download_and_advances_queue(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+            ],
+        )
+        first = await store.claim_next_file(session["_id"])
+        await store.update_file(
+            first["_id"], FILE_DOWNLOADING, gid="123abc0000000000"
+        )
+        original_store = leech.bunkr_session_store
+        original_tell_status = leech.aria2_tell_status
+        original_remove = leech._remove_bunkr_download
+        remove = AsyncMock()
+        leech.bunkr_session_store = store
+        leech.aria2_tell_status = AsyncMock(return_value={"status": "active"})
+        leech._remove_bunkr_download = remove
+        try:
+            deferred, reason = await leech._defer_active_bunkr_download(
+                session, "Skipped by user"
+            )
+        finally:
+            leech.bunkr_session_store = original_store
+            leech.aria2_tell_status = original_tell_status
+            leech._remove_bunkr_download = original_remove
+
+        self.assertIsNone(reason)
+        self.assertEqual("one.mp4", deferred["filename"])
+        remove.assert_awaited_once_with("123abc0000000000", cleanup=False)
+        next_file = await store.claim_next_file(session["_id"])
+        self.assertEqual("two.mp4", next_file["filename"])
+
     async def test_pause_stops_before_claiming_another_file(self):
         store = BunkrSessionStore(db_url="")
         session = await store.create_session(
