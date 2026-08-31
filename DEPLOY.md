@@ -79,13 +79,14 @@ docker-compose down
 | `MAGNET_TIMEOUT` | Magnet timeout (seconds) | `60` |
 | `DB_URL` | MongoDB URL for persistent Bunkr sessions and RSS | None |
 | `LAZYLEECH_DB_NAME` | Mongo database containing LazyLeech collections | `ASWFeed` |
-| `BUNKR_SLOW_SPEED_KBPS` | Bunkr automatic-skip threshold in KiB/s; `0` disables | `128` |
+| `BUNKR_SLOW_SPEED_KBPS` | Bunkr automatic-skip threshold in KiB/s; `0` disables | `650` |
 | `BUNKR_SLOW_GRACE_SECONDS` | Delay before Bunkr slow-speed monitoring starts | `60` |
 | `BUNKR_SLOW_DURATION_SECONDS` | Continuous slow time before moving a file down | `90` |
 | `BUNKR_MAX_AUTO_SKIPS` | Maximum automatic queue deferrals per Bunkr file | `2` |
 | `BUNKR_CONNECTIONS` | Range connections for a fresh Bunkr download | `4` |
 | `BUNKR_RECOVERY_CONNECTIONS` | Range connections after a Bunkr file is deferred | `1` |
-| `BUNKR_MAX_DOWNLOADS_PER_HOST` | Concurrent Bunkr files allowed per CDN host | `1` |
+| `BUNKR_MAX_DOWNLOADS_PER_HOST` | Concurrent Bunkr files allowed per CDN host | `4` |
+| `BUNKR_SLOW_HOST_COOLDOWN_SECONDS` | Time a slow CDN is deprioritized within its session | `300` |
 | `NYAA_RSS_LINKS` | RSS feed URLs | None |
 
 ---

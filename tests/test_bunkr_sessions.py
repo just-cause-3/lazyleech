@@ -148,6 +148,66 @@ class BunkrSessionStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(rejected)
 
+    async def test_cooling_host_is_deprioritized_but_can_fall_back(self):
+        files = await self.store.list_files(self.session["_id"])
+        await self.store.update_file(files[0]["_id"], cdn_host="slow.cdn.test")
+        await self.store.update_file(files[1]["_id"], cdn_host="slow.cdn.test")
+        await self.store.update_file(files[2]["_id"], cdn_host="fast.cdn.test")
+        await self.store.set_host_cooldown(
+            self.session["_id"], "slow.cdn.test", 300, now=100
+        )
+
+        cooled = await self.store.active_host_cooldowns(
+            self.session["_id"], now=101
+        )
+        self.assertEqual({"slow.cdn.test"}, cooled)
+        preferred = await self.store.claim_next_file(
+            self.session["_id"], excluded_hosts=cooled
+        )
+        self.assertEqual("three.mp4", preferred["filename"])
+
+        await self.store.update_file(preferred["_id"], FILE_DOWNLOADED)
+        fallback = await self.store.claim_next_file(
+            self.session["_id"], excluded_hosts=cooled
+        )
+        self.assertEqual("one.mp4", fallback["filename"])
+
+    async def test_same_host_pending_files_are_grouped_at_bottom(self):
+        files = await self.store.list_files(self.session["_id"])
+        for item, host in zip(
+            files,
+            ("slow.cdn.test", "slow.cdn.test", "fast.cdn.test"),
+        ):
+            await self.store.update_file(item["_id"], cdn_host=host)
+        first = await self.store.claim_next_file(self.session["_id"])
+        deferred = await self.store.defer_file_to_bottom(
+            first["_id"], "slow", automatic=True, max_auto_defers=2
+        )
+        self.assertIsNotNone(deferred)
+
+        moved = await self.store.move_pending_host_to_bottom(
+            self.session["_id"], "slow.cdn.test"
+        )
+
+        self.assertEqual(2, moved)
+        queued = await self.store.list_files(self.session["_id"])
+        self.assertEqual(
+            ["three.mp4", "two.mp4", "one.mp4"],
+            [item["filename"] for item in queued],
+        )
+
+    async def test_host_routing_does_not_consume_slow_file_retry(self):
+        first = await self.store.claim_next_file(self.session["_id"])
+        await self.store.update_file(first["_id"], cdn_host="slow.cdn.test")
+
+        routed = await self.store.route_file_to_bottom(
+            first["_id"], "CDN is cooling down"
+        )
+
+        self.assertEqual(FILE_PENDING, routed["status"])
+        self.assertEqual(0, routed["defer_count"])
+        self.assertEqual(1, routed["host_defer_count"])
+
 
 class BunkrSessionCommandParsingTests(unittest.TestCase):
     def test_session_id_from_command_argument(self):
@@ -197,8 +257,140 @@ class BunkrSessionCommandParsingTests(unittest.TestCase):
         )
         self.assertEqual("abcdef123456", _bunkr_session_id_from_message(message))
 
+    def test_cdn_host_normalization(self):
+        self.assertEqual(
+            "cdn.example",
+            leech._bunkr_cdn_host("https://CDN.Example:443/file?token=abc"),
+        )
+
 
 class BunkrSessionSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_defer_does_not_cycle_when_no_alternate_host_exists(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+            ],
+        )
+        files = await store.list_files(session["_id"])
+        for item in files:
+            await store.update_file(item["_id"], cdn_host="only.cdn.test")
+        first = await store.claim_next_file(session["_id"])
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        try:
+            deferred, reason = await leech._defer_active_bunkr_download(
+                session, "Automatically deferred: slow", automatic=True
+            )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        self.assertIsNone(deferred)
+        self.assertEqual("no_alternate_host", reason)
+        unchanged = await store.get_file(first["_id"])
+        self.assertEqual(FILE_RESOLVING, unchanged["status"])
+        self.assertEqual(set(), await store.active_host_cooldowns(session["_id"]))
+
+    async def test_automatic_slow_defer_cools_and_groups_host(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+                ("https://bunkr.example/f/three", "three.mp4"),
+            ],
+        )
+        files = await store.list_files(session["_id"])
+        for item, host in zip(
+            files,
+            ("slow.cdn.test", "slow.cdn.test", "fast.cdn.test"),
+        ):
+            await store.update_file(item["_id"], cdn_host=host)
+        await store.claim_next_file(session["_id"])
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        try:
+            deferred, reason = await leech._defer_active_bunkr_download(
+                session, "Automatically deferred: slow", automatic=True
+            )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        self.assertIsNone(reason)
+        self.assertEqual("slow.cdn.test", deferred["_cdn_host"])
+        self.assertEqual(1, deferred["_same_host_moved"])
+        self.assertEqual(
+            {"slow.cdn.test"},
+            await store.active_host_cooldowns(session["_id"]),
+        )
+        queued = await store.list_files(session["_id"])
+        self.assertEqual(
+            ["three.mp4", "two.mp4", "one.mp4"],
+            [item["filename"] for item in queued],
+        )
+
+    async def test_resolved_file_on_cooling_host_is_routed_without_download(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+            ],
+        )
+        await store.set_host_cooldown(session["_id"], "slow.cdn.test", 300)
+        first = await store.claim_next_file(session["_id"])
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        initiate = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    leech,
+                    "resolve_bunkr_file",
+                    AsyncMock(
+                        return_value=(
+                            "https://slow.cdn.test/one",
+                            "one.mp4",
+                            "https://bunkr.example/",
+                        )
+                    ),
+                ),
+                patch.object(leech, "initiate_directdl", initiate),
+            ):
+                result = await leech.process_bunkr_download(
+                    None, SimpleNamespace(), session, first, ()
+                )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        self.assertEqual("deferred", result)
+        initiate.assert_not_awaited()
+        routed = await store.get_file(first["_id"])
+        self.assertEqual("slow.cdn.test", routed["cdn_host"])
+        self.assertEqual(1, routed["host_defer_count"])
+
     async def test_skip_during_resolution_does_not_start_deferred_file(self):
         store = BunkrSessionStore(db_url="")
         session = await store.create_session(

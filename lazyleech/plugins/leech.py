@@ -104,7 +104,7 @@ def _positive_int_env(name, default, maximum=None):
     return min(value, maximum) if maximum else value
 
 
-BUNKR_SLOW_SPEED_KBPS = _nonnegative_int_env("BUNKR_SLOW_SPEED_KBPS", 128)
+BUNKR_SLOW_SPEED_KBPS = _nonnegative_int_env("BUNKR_SLOW_SPEED_KBPS", 650)
 BUNKR_SLOW_GRACE_SECONDS = _nonnegative_int_env(
     "BUNKR_SLOW_GRACE_SECONDS", 60
 )
@@ -117,13 +117,20 @@ BUNKR_RECOVERY_CONNECTIONS = _positive_int_env(
     "BUNKR_RECOVERY_CONNECTIONS", 1, maximum=16
 )
 BUNKR_MAX_DOWNLOADS_PER_HOST = _positive_int_env(
-    "BUNKR_MAX_DOWNLOADS_PER_HOST", 1, maximum=8
+    "BUNKR_MAX_DOWNLOADS_PER_HOST", 4, maximum=8
+)
+BUNKR_SLOW_HOST_COOLDOWN_SECONDS = _positive_int_env(
+    "BUNKR_SLOW_HOST_COOLDOWN_SECONDS", 300, maximum=3600
 )
 BUNKR_SIGNED_URL_REFRESH_SECONDS = 60
 
 
+def _bunkr_cdn_host(download_url):
+    return (urlparse(download_url).hostname or "").lower().rstrip(".")
+
+
 def _bunkr_host_semaphore(download_url):
-    host = urlparse(download_url).netloc.lower()
+    host = _bunkr_cdn_host(download_url)
     semaphore = bunkr_host_semaphores.get(host)
     if semaphore is None:
         semaphore = asyncio.Semaphore(BUNKR_MAX_DOWNLOADS_PER_HOST)
@@ -575,7 +582,10 @@ async def _run_bunkr_session(client, message, session_id):
         if not session_doc or session_doc["state"] != SESSION_RUNNING:
             return
 
-        file_doc = await bunkr_session_store.claim_next_file(session_id)
+        cooled_hosts = await bunkr_session_store.active_host_cooldowns(session_id)
+        file_doc = await bunkr_session_store.claim_next_file(
+            session_id, excluded_hosts=cooled_hosts
+        )
         if file_doc is None:
             counts = await bunkr_session_store.counts(session_id)
             final_state = (
@@ -605,15 +615,25 @@ async def _run_bunkr_session(client, message, session_id):
 
 async def _bunkr_session_chunks(session_doc, include_files=True):
     counts = await bunkr_session_store.counts(session_doc["_id"])
+    cooled_hosts = await bunkr_session_store.active_host_cooldowns(
+        session_doc["_id"]
+    )
     downloaded_count = counts[FILE_DOWNLOADED]
     not_downloaded_count = session_doc["total_files"] - downloaded_count
     persistence = "MongoDB" if bunkr_session_store.persistent else "memory only"
+    cooling_line = (
+        f"<b>Cooling CDNs:</b> "
+        f"{html.escape(', '.join(sorted(cooled_hosts)))}\n"
+        if cooled_hosts
+        else ""
+    )
     header = (
         f"<b>Bunkr session:</b> <code>{session_doc['_id']}</code>\n"
         f"<b>State:</b> {html.escape(session_doc['state'].title())}\n"
         f"<b>Downloaded:</b> {downloaded_count}/{session_doc['total_files']} | "
         f"<b>Not downloaded:</b> {not_downloaded_count}\n"
         f"<b>Storage:</b> {persistence}\n"
+        f"{cooling_line}"
         f"<b>Source:</b> <a href=\"{html.escape(session_doc['source_url'], quote=True)}\">album/link</a>\n\n"
     )
     if not include_files:
@@ -636,10 +656,20 @@ async def _bunkr_session_chunks(session_doc, include_files=True):
             error_text = f" — {html.escape(str(error))[:300]}" if error else ""
             defer_count = item.get("defer_count", 0)
             defer_text = f" | deferred {defer_count}x" if defer_count else ""
+            host_defer_count = item.get("host_defer_count", 0)
+            host_defer_text = (
+                f" | CDN-routed {host_defer_count}x" if host_defer_count else ""
+            )
+            cdn_text = (
+                f" | CDN {html.escape(str(item['cdn_host']))}"
+                if item.get("cdn_host")
+                else ""
+            )
             entries.append(
                 f"{icon} <b>{item['position']}.</b> "
                 f"<code>{html.escape(str(item['filename']))}</code>\n"
-                f"{html.escape(item['status'])}{error_text}{defer_text} | "
+                f"{html.escape(item['status'])}{error_text}{defer_text}"
+                f"{host_defer_text}{cdn_text} | "
                 f"<a href=\"{html.escape(item['page_url'], quote=True)}\">source link</a>\n"
             )
         entries.append("\n")
@@ -755,6 +785,15 @@ async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
     if not active_files:
         return None, "no_active"
     file_doc = sorted(active_files, key=lambda item: item["position"])[0]
+    cdn_host = str(file_doc.get("cdn_host") or "").lower()
+    if (
+        automatic
+        and cdn_host
+        and not await bunkr_session_store.has_pending_outside_hosts(
+            session_doc["_id"], {cdn_host}
+        )
+    ):
+        return None, "no_alternate_host"
     gid = file_doc.get("gid")
     if gid:
         try:
@@ -775,6 +814,17 @@ async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
         # Keep aria2's partial data. A later pass uses the same stable directory
         # and a freshly signed URL, so range-capable CDN downloads can resume.
         await _remove_bunkr_download(gid, cleanup=False)
+    if automatic and cdn_host:
+        await bunkr_session_store.set_host_cooldown(
+            session_doc["_id"],
+            cdn_host,
+            BUNKR_SLOW_HOST_COOLDOWN_SECONDS,
+        )
+        moved = await bunkr_session_store.move_pending_host_to_bottom(
+            session_doc["_id"], cdn_host
+        )
+        deferred["_cdn_host"] = cdn_host
+        deferred["_same_host_moved"] = max(0, moved - 1)
     return deferred, None
 
 
@@ -1056,9 +1106,11 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             # Metadata requests have their own shared pacing/backoff in bunkr.py.
             # Keep this lock only to prevent simultaneous page/signing resolution.
             resolved_at = time.monotonic()
+        cdn_host = _bunkr_cdn_host(direct_url)
         await bunkr_session_store.update_file(
             file_id,
             filename=resolved_name or file_doc["filename"],
+            cdn_host=cdn_host or None,
         )
 
         current = await bunkr_session_store.get_session(session_doc["_id"])
@@ -1071,6 +1123,22 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                     file_id, FILE_RESOLVING, FILE_PENDING, gid=None
                 )
             return
+
+        cooled_hosts = await bunkr_session_store.active_host_cooldowns(
+            session_doc["_id"]
+        )
+        if (
+            cdn_host in cooled_hosts
+            and await bunkr_session_store.has_pending_outside_hosts(
+                session_doc["_id"], cooled_hosts
+            )
+        ):
+            routed = await bunkr_session_store.route_file_to_bottom(
+                file_id,
+                f"Deferred while CDN {cdn_host} is cooling down",
+            )
+            if routed is not None:
+                return "deferred"
 
         async def on_gid(gid):
             nonlocal slow_monitor
@@ -1126,10 +1194,14 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                 session_doc, reason, automatic=True
             )
             if deferred and deferred["_id"] == file_id:
+                cdn_host = html.escape(str(deferred.get("_cdn_host") or "unknown"))
+                same_host_moved = int(deferred.get("_same_host_moved", 0))
                 await message.reply_text(
                     f"Slow Bunkr download moved to the bottom: "
                     f"<code>{html.escape(str(deferred['filename']))}</code> "
-                    f"({format_bytes(speed)}/s). Starting the next queued file."
+                    f"({format_bytes(speed)}/s). CDN <code>{cdn_host}</code> "
+                    f"is cooling down; moved {same_host_moved} additional known "
+                    f"same-CDN file(s) behind alternate hosts."
                 )
                 return "deferred"
             auto_defer_unavailable = True

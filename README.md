@@ -102,15 +102,23 @@ list - Lists your Ongoing Leeches.
 ```
 
 Bunkr album downloads automatically move a persistently slow file to the bottom
-of its session queue. By default this happens below 128 KiB/s for 90 continuous
+of its session queue. By default this happens below 650 KiB/s for 90 continuous
 seconds after a 60-second startup grace period, at most twice per file. The
 thresholds can be adjusted with the `BUNKR_SLOW_*` environment variables.
 Fresh Bunkr downloads use four range connections by default. A deferred file
 keeps its partial data and retries with one connection, which is less likely to
-remain CDN-throttled. Downloads are also serialized per Bunkr CDN host, while
-different hosts and queued Telegram uploads can continue independently. Tune
-this with `BUNKR_CONNECTIONS`, `BUNKR_RECOVERY_CONNECTIONS`, and
+remain CDN-throttled. Up to four Bunkr downloads may run concurrently per CDN
+host by default, while queued Telegram uploads continue independently. Tune this
+with `BUNKR_CONNECTIONS`, `BUNKR_RECOVERY_CONNECTIONS`, and
 `BUNKR_MAX_DOWNLOADS_PER_HOST`.
+
+When a Bunkr file triggers automatic slow-file deferral, its resolved CDN host
+is put on a five-minute session cooldown. Known pending files on that same host
+are grouped at the bottom, and unresolved files are classified lazily as the
+queue reaches them. Files assigned to other CDN hosts are preferred; if no
+alternate host exists, the scheduler falls back to the original queue so the
+session cannot deadlock. Configure the cooldown with
+`BUNKR_SLOW_HOST_COOLDOWN_SECONDS`.
 
 **Other Modules**
 ```

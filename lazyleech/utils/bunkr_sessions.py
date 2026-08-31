@@ -88,6 +88,13 @@ class BunkrSessionStore:
             await self.files.create_index(
                 [("session_id", ASCENDING), ("position", ASCENDING)], unique=True
             )
+            await self.files.create_index(
+                [
+                    ("session_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("cdn_host", ASCENDING),
+                ]
+            )
             await self.files.create_index("gid", sparse=True)
             self._indexes_ready = True
 
@@ -118,6 +125,7 @@ class BunkrSessionStore:
             "custom_filename": custom_filename,
             "state": SESSION_RUNNING,
             "total_files": len(files),
+            "cdn_cooldowns": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -128,6 +136,7 @@ class BunkrSessionStore:
                 "position": position,
                 "page_url": page_url,
                 "filename": filename or page_url,
+                "cdn_host": None,
                 "status": FILE_PENDING,
                 "gid": None,
                 "error": None,
@@ -136,6 +145,9 @@ class BunkrSessionStore:
                 "auto_defer_count": 0,
                 "last_deferred_at": None,
                 "last_deferred_reason": None,
+                "host_defer_count": 0,
+                "last_host_deferred_at": None,
+                "last_host_deferred_reason": None,
                 "updated_at": now,
             }
             for position, (page_url, filename) in enumerate(files, 1)
@@ -251,21 +263,43 @@ class BunkrSessionStore:
             doc.update(fields)
             return copy.deepcopy(doc)
 
-    async def claim_next_file(self, session_id):
+    async def claim_next_file(self, session_id, excluded_hosts=None):
+        """Claim the next pending file, preferring hosts outside a cooldown.
+
+        Files without a known host remain eligible so their real CDN can be
+        discovered lazily. If every pending file is on an excluded host, the
+        normal first-in-queue file is claimed so a session cannot deadlock.
+        """
         now = utcnow()
+        excluded_hosts = {
+            str(host).lower() for host in (excluded_hosts or ()) if host
+        }
         if self.persistent:
             await self._ensure_indexes()
-            return await self.files.find_one_and_update(
-                {"session_id": session_id, "status": FILE_PENDING},
-                {
-                    "$set": {
-                        "status": FILE_RESOLVING,
-                        "gid": None,
-                        "error": None,
-                        "updated_at": now,
-                    },
-                    "$inc": {"attempts": 1},
+            base_query = {"session_id": session_id, "status": FILE_PENDING}
+            update = {
+                "$set": {
+                    "status": FILE_RESOLVING,
+                    "gid": None,
+                    "error": None,
+                    "updated_at": now,
                 },
+                "$inc": {"attempts": 1},
+            }
+            if excluded_hosts:
+                preferred_query = dict(base_query)
+                preferred_query["cdn_host"] = {"$nin": list(excluded_hosts)}
+                preferred = await self.files.find_one_and_update(
+                    preferred_query,
+                    update,
+                    sort=[("position", ASCENDING)],
+                    return_document=ReturnDocument.AFTER,
+                )
+                if preferred is not None:
+                    return preferred
+            return await self.files.find_one_and_update(
+                base_query,
+                update,
                 sort=[("position", ASCENDING)],
                 return_document=ReturnDocument.AFTER,
             )
@@ -281,7 +315,13 @@ class BunkrSessionStore:
             )
             if not candidates:
                 return None
-            doc = candidates[0]
+            preferred = [
+                doc
+                for doc in candidates
+                if not doc.get("cdn_host")
+                or str(doc["cdn_host"]).lower() not in excluded_hosts
+            ]
+            doc = (preferred or candidates)[0]
             doc.update(
                 {
                     "status": FILE_RESOLVING,
@@ -292,6 +332,225 @@ class BunkrSessionStore:
                 }
             )
             return copy.deepcopy(doc)
+
+    async def has_pending_outside_hosts(self, session_id, excluded_hosts):
+        """Return whether another pending file may use a non-cooled CDN."""
+        excluded_hosts = {
+            str(host).lower() for host in (excluded_hosts or ()) if host
+        }
+        query = {"session_id": session_id, "status": FILE_PENDING}
+        if excluded_hosts:
+            query["cdn_host"] = {"$nin": list(excluded_hosts)}
+        if self.persistent:
+            await self._ensure_indexes()
+            candidate = await self.files.find_one(query, projection={"_id": 1})
+            return candidate is not None
+        async with self._memory_lock:
+            return any(
+                doc["session_id"] == session_id
+                and doc["status"] == FILE_PENDING
+                and (
+                    not excluded_hosts
+                    or not doc.get("cdn_host")
+                    or str(doc["cdn_host"]).lower() not in excluded_hosts
+                )
+                for doc in self._memory_files.values()
+            )
+
+    async def set_host_cooldown(self, session_id, cdn_host, seconds, now=None):
+        """Persist a per-session CDN cooldown and return its expiry epoch."""
+        cdn_host = str(cdn_host or "").lower()
+        if not cdn_host:
+            return None
+        now_epoch = float(now if now is not None else utcnow().timestamp())
+        until_epoch = now_epoch + max(0, int(seconds))
+        entry = {"host": cdn_host, "until": until_epoch}
+        if self.persistent:
+            await self._ensure_indexes()
+            session_doc = await self.sessions.find_one(
+                {"_id": session_id}, projection={"cdn_cooldowns": 1}
+            )
+            if session_doc is None:
+                return None
+            cooldowns = [
+                item
+                for item in session_doc.get("cdn_cooldowns", [])
+                if item.get("host") != cdn_host
+                and float(item.get("until", 0)) > now_epoch
+            ]
+            cooldowns.append(entry)
+            updated = await self.sessions.update_one(
+                {"_id": session_id},
+                {"$set": {"cdn_cooldowns": cooldowns, "updated_at": utcnow()}},
+            )
+            return until_epoch if updated.matched_count else None
+        async with self._memory_lock:
+            session_doc = self._memory_sessions.get(session_id)
+            if session_doc is None:
+                return None
+            cooldowns = [
+                item
+                for item in session_doc.get("cdn_cooldowns", [])
+                if item.get("host") != cdn_host
+                and float(item.get("until", 0)) > now_epoch
+            ]
+            cooldowns.append(entry)
+            session_doc["cdn_cooldowns"] = cooldowns
+            session_doc["updated_at"] = utcnow()
+            return until_epoch
+
+    async def active_host_cooldowns(self, session_id, now=None):
+        """Return the set of CDN hosts whose session cooldown is still active."""
+        now_epoch = float(now if now is not None else utcnow().timestamp())
+        session_doc = await self.get_session(session_id)
+        if session_doc is None:
+            return set()
+        return {
+            str(item.get("host", "")).lower()
+            for item in session_doc.get("cdn_cooldowns", [])
+            if item.get("host") and float(item.get("until", 0)) > now_epoch
+        }
+
+    async def route_file_to_bottom(self, file_id, reason):
+        """Route a resolving file behind the queue without marking a slow retry."""
+        now = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            file_doc = await self.files.find_one({"_id": file_id})
+            if file_doc is None or file_doc["status"] != FILE_RESOLVING:
+                return None
+            has_next = await self.files.find_one(
+                {
+                    "session_id": file_doc["session_id"],
+                    "_id": {"$ne": file_id},
+                    "status": FILE_PENDING,
+                },
+                projection={"_id": 1},
+            )
+            if has_next is None:
+                return None
+            last_file = await self.files.find_one(
+                {"session_id": file_doc["session_id"]},
+                sort=[("position", -1)],
+                projection={"position": 1},
+            )
+            updated = await self.files.find_one_and_update(
+                {"_id": file_id, "status": FILE_RESOLVING},
+                {
+                    "$set": {
+                        "status": FILE_PENDING,
+                        "position": int(last_file["position"]) + 1,
+                        "gid": None,
+                        "error": reason,
+                        "last_host_deferred_at": now,
+                        "last_host_deferred_reason": reason,
+                        "updated_at": now,
+                    },
+                    "$inc": {"host_defer_count": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            return updated
+        async with self._memory_lock:
+            file_doc = self._memory_files.get(file_id)
+            if file_doc is None or file_doc["status"] != FILE_RESOLVING:
+                return None
+            session_files = [
+                doc
+                for doc in self._memory_files.values()
+                if doc["session_id"] == file_doc["session_id"]
+            ]
+            if not any(
+                doc["_id"] != file_id and doc["status"] == FILE_PENDING
+                for doc in session_files
+            ):
+                return None
+            file_doc.update(
+                {
+                    "status": FILE_PENDING,
+                    "position": max(doc["position"] for doc in session_files) + 1,
+                    "gid": None,
+                    "error": reason,
+                    "host_defer_count": file_doc.get("host_defer_count", 0) + 1,
+                    "last_host_deferred_at": now,
+                    "last_host_deferred_reason": reason,
+                    "updated_at": now,
+                }
+            )
+            return copy.deepcopy(file_doc)
+
+    async def move_pending_host_to_bottom(self, session_id, cdn_host):
+        """Group all known pending files for one CDN behind other hosts."""
+        cdn_host = str(cdn_host or "").lower()
+        if not cdn_host:
+            return 0
+        now = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            pending = [
+                doc
+                async for doc in self.files.find(
+                    {
+                        "session_id": session_id,
+                        "status": FILE_PENDING,
+                        "cdn_host": cdn_host,
+                    }
+                ).sort("position", ASCENDING)
+            ]
+            if not pending:
+                return 0
+            last_file = await self.files.find_one(
+                {"session_id": session_id},
+                sort=[("position", -1)],
+                projection={"position": 1},
+            )
+            next_position = int(last_file["position"]) + 1
+            moved = 0
+            for file_doc in pending:
+                result = await self.files.update_one(
+                    {"_id": file_doc["_id"], "status": FILE_PENDING},
+                    {
+                        "$set": {
+                            "position": next_position,
+                            "updated_at": now,
+                        }
+                    },
+                )
+                if result.modified_count:
+                    moved += 1
+                    next_position += 1
+            if moved:
+                await self.sessions.update_one(
+                    {"_id": session_id}, {"$set": {"updated_at": now}}
+                )
+            return moved
+        async with self._memory_lock:
+            session_files = [
+                doc
+                for doc in self._memory_files.values()
+                if doc["session_id"] == session_id
+            ]
+            pending = sorted(
+                (
+                    doc
+                    for doc in session_files
+                    if doc["status"] == FILE_PENDING
+                    and str(doc.get("cdn_host") or "").lower() == cdn_host
+                ),
+                key=lambda doc: doc["position"],
+            )
+            next_position = max(
+                (doc["position"] for doc in session_files), default=0
+            ) + 1
+            for file_doc in pending:
+                file_doc["position"] = next_position
+                file_doc["updated_at"] = now
+                next_position += 1
+            if pending:
+                session_doc = self._memory_sessions.get(session_id)
+                if session_doc is not None:
+                    session_doc["updated_at"] = now
+            return len(pending)
 
     async def update_file(self, file_id, status=None, **fields):
         if status is not None:
