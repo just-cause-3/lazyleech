@@ -47,6 +47,7 @@ from .. import (
     SendAsZipFlag,
     preserved_logs,
 )
+from .file_cleanup import remove_uploaded_source
 from .file_split import TELEGRAM_SPLIT_SIZE
 from .misc import (
     calculate_eta,
@@ -243,6 +244,8 @@ async def _upload_worker(client, message, reply, torrent_info, user_id, flags, n
                     ForceDocumentFlag in flags,
                     newFile,
                     fcount,
+                    cleanup_source=SendAsZipFlag not in flags,
+                    download_root=torrent_info.get("dir"),
                 )
             )
     text = "Files:\n"
@@ -280,7 +283,16 @@ async def _upload_worker(client, message, reply, torrent_info, user_id, flags, n
 
 
 async def _upload_file(
-    client, message, reply, filename, filepath, force_document, newFile, count
+    client,
+    message,
+    reply,
+    filename,
+    filepath,
+    force_document,
+    newFile,
+    count,
+    cleanup_source=False,
+    download_root=None,
 ):
     if not os.path.getsize(filepath):
         return [(os.path.basename(filename), None)]
@@ -343,6 +355,7 @@ async def _upload_file(
             )
             os.rename(filepath, newFileName)
             filepath = newFileName
+        source_filepath = filepath
         with tempfile.TemporaryDirectory(dir=str(user_id)) as tempdir:
             if file_has_big:
 
@@ -510,6 +523,21 @@ async def _upload_file(
                     remove_upload_status(upload_identifier)
                     return sent_files
                 remove_upload_status(upload_identifier)
+        upload_complete = bool(to_upload) and len(sent_files) == len(to_upload)
+        if upload_complete and cleanup_source and download_root:
+            removed = await asyncio.to_thread(
+                remove_uploaded_source, source_filepath, download_root
+            )
+            if removed:
+                logging.info(
+                    "Removed successfully uploaded source file: %s",
+                    source_filepath,
+                )
+            else:
+                logging.warning(
+                    "Could not remove successfully uploaded source file: %s",
+                    source_filepath,
+                )
         return sent_files
     finally:
         remove_upload_status(upload_identifier)
