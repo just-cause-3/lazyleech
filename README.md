@@ -89,6 +89,12 @@ zipdirectdl <Direct URL> or as reply to a Direct URL | optional custom file name
 zipdirect <Direct URL> or as reply to a Direct URL | optional custom file name
 filedirectdl <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
 filedirect <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
+tera <TeraBox share URL> - Download a TeraBox share and upload it
+ziptera <TeraBox share URL> - Download and upload as ZIP
+filetera <TeraBox share URL> - Send videos as files
+setteraboxcookie <ndus value> - Validate and persist a replacement cookie (chat admin)
+teraboxcookiestatus - Show cookie source without revealing it (chat admin)
+clearteraboxcookie - Remove the database override (chat admin)
 queue <URL1> <URL2> ... - Queue links; all Bunkr links form one session
 zipqueue <URL1> <URL2> ... - Same queue behavior, uploaded as ZIP
 filequeue <URL1> <URL2> ... - Same queue behavior, videos sent as files
@@ -136,6 +142,26 @@ the throttled rate. A healthy completed download reduces the CDN's adaptive
 level. Tune this behavior with the `BUNKR_SLOW_*`, `BUNKR_CONNECTIONS`,
 `BUNKR_RECOVERY_CONNECTIONS`, `BUNKR_MAX_DOWNLOADS_PER_HOST`, and
 `BUNKR_MAX_HOST_COOLDOWN_SECONDS` environment variables.
+
+TeraBox downloads use the `TERABOX_COOKIE` (`ndus`) value to resolve a share
+through `TERABOX_BASE_URL`. The regional download hop receives that cookie,
+but its redirect is handled manually so the cookie is not forwarded to the
+storage CDN. The default endpoint is
+`https://dm.1024terabox.com/ai/index`. Keep the cookie only in `.env` or your
+deployment secret store.
+
+An administrator can replace an expired cookie in a configured admin chat with
+`/setteraboxcookie VALUE`. In groups, the sender must be a Telegram owner or
+administrator. The bot attempts to delete that command immediately, validates
+the cookie before replacing the old value, and saves the override in the
+`TERABOX_CONFIG` MongoDB collection. `/clearteraboxcookie` restores the
+environment fallback.
+
+The same resolver can be tested without Telegram:
+
+```powershell
+python scripts/terabox_download.py "<TeraBox share URL>" -d downloads/terabox
+```
 
 **Other Modules**
 ```

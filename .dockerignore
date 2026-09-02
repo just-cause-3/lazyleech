@@ -7,17 +7,21 @@ README.md
 LICENSE
 pre-commit
 
-# Environment files
+# Environment files and sessions
 .env
 .env.*
 !.env.example
+*.session*
 
 # Logs
 *.log
 logs/
 
-# Downloads
+# Downloads and archives
 downloads/
+*.rar
+*.zip
+*.7z
 
 # User data
 data/
@@ -32,6 +36,9 @@ venv/
 env/
 .venv/
 ENV/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # IDE
 .idea/

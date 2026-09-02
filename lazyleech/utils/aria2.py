@@ -225,16 +225,18 @@ async def aria2_add_directdl(
         options["continue"] = "true"
         options["always-resume"] = "true"
 
-    # Always include User-Agent; append any extra headers (e.g. Referer for Bunkr)
+    # Always include a User-Agent unless the caller provided a service-specific one.
     default_ua = (
         "User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) "
         "Gecko/20100101 Firefox/136.0"
     )
     if headers:
-        if isinstance(headers, list):
-            header_list = [default_ua] + headers
-        else:
-            header_list = [default_ua, headers]
+        header_list = headers if isinstance(headers, list) else [headers]
+        if not any(
+            str(header).lower().startswith("user-agent:")
+            for header in header_list
+        ):
+            header_list = [default_ua] + header_list
         options["header"] = header_list
     else:
         options["header"] = default_ua

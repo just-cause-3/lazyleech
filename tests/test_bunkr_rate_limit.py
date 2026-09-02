@@ -89,6 +89,28 @@ class Aria2DirectDownloadProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("true", options["continue"])
         self.assertEqual("true", options["always-resume"])
 
+    async def test_service_user_agent_replaces_default(self):
+        request = AsyncMock(return_value={"result": "123abc0000000000"})
+        with (
+            patch.object(aria2, "generate_gid", AsyncMock(return_value="123abc0000000000")),
+            patch.object(aria2, "aria2_request", request),
+        ):
+            await aria2.aria2_add_directdl(
+                object(),
+                123,
+                "https://cdn.example/file.rar",
+                headers=[
+                    "User-Agent: TeraBox-Test",
+                    "Referer: https://example.test/",
+                ],
+            )
+
+        options = request.await_args.args[2][1]
+        self.assertEqual(
+            ["User-Agent: TeraBox-Test", "Referer: https://example.test/"],
+            options["header"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

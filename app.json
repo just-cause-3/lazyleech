@@ -68,6 +68,18 @@
             "description":"Maximum escalating shared CDN cooldown (default: 1200)",
             "required":false
         },
+        "TERABOX_COOKIE":{
+            "description":"Value of the disposable/account ndus cookie used for TeraBox share downloads. Store as a secret.",
+            "required":false
+        },
+        "TERABOX_BASE_URL":{
+            "description":"TeraBox resolver/bootstrap endpoint (default: https://dm.1024terabox.com/ai/index)",
+            "required":false
+        },
+        "XAPIVERSE_KEY":{
+            "description":"Optional xAPIverse TeraBox fallback key when TERABOX_COOKIE is not configured",
+            "required":false
+        },
         "NYAA_RSS_LINKS":{
             "description":"Add multiple nyaa links you wish to auto-download animes from, else leave it and will auto-download animes from AWS in all admin chats [Useless if no DB_URL added]",
             "required":false

@@ -103,7 +103,7 @@ Pyrogram auto-discovers these via `plugins={"root": ".../plugins"}`.
 | `nyaa.py` | `ts` `nyaa` `nyaasi`, `sts` `sukebei` | Searches Nyaa.si / Sukebei RSS, caches results 1h, paginated inline results. |
 | `nyaa_auto_download.py` | `listrss` `addrss` `delrss`/`removerss` (admins) | **Optional** (needs `DB_URL`). APScheduler polls RSS feeds, stores last-seen titles in MongoDB, and auto-leeches new torrents to admin chats. |
 | `ytdl.py` | `ytdl` + inline callback flow | YouTube search + format selection + download (video via `_tubeDl`, audio via `_mp3Dl`) using `youtube-dl`; posts result galleries, uses Telegraph for long text. Search state stored in `ytdl/ytsearch.json`. |
-| `terabox.py` | `tera` `ziptera` `filetera` | Resolves Terabox links through the xAPIverse API, then hands direct URLs to `initiate_directdl`. |
+| `terabox.py` | `tera` `ziptera` `filetera` | Resolves TeraBox shares with the configured `ndus` cookie, exchanges the authenticated regional link for a cookie-free CDN URL, then hands it to `initiate_directdl`; xAPIverse remains an optional fallback. |
 | `thumbnail.py` | `thumbnail`/`set`/`save`, `clear`/`rm`/`del`/`remove`/`delete` | Per-user custom upload thumbnail (`<user_id>/thumbnail.jpg`), auto re-watermarked. |
 | `watermark.py` | `watermark`/`set`/`save`, clear variants, `testwatermark` | Per-user watermark overlay applied to thumbnails (`<user_id>/watermark.jpg`). |
 | `help.py` | `help` | Inline, module-based help menu populated from `help_dict`. |
