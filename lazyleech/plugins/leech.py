@@ -16,11 +16,13 @@
 
 import asyncio
 import html
+import itertools
 import os
 import re
 import tempfile
 import time
 from collections import deque
+from types import SimpleNamespace
 from urllib.parse import unquote as urldecode
 from urllib.parse import urlparse, urlunparse
 
@@ -89,6 +91,18 @@ from ..utils.upload_worker import (
 bunkr_tasks = set()
 bunkr_session_tasks = {}
 bunkr_host_semaphores = {}
+download_reference_ids = itertools.count(1)
+
+
+def _new_download_reference(message):
+    """Return a unique internal task key without sending a Telegram message."""
+    return SimpleNamespace(chat=message.chat, id=-next(download_reference_ids))
+
+
+async def _delete_download_placeholder(reference):
+    delete = getattr(reference, "delete", None)
+    if delete is not None:
+        await delete()
 
 
 def _nonnegative_int_env(name, default):
@@ -395,19 +409,21 @@ async def torrent_cmd(client, message):
 
 async def initiate_torrent(client, message, link, flags, newFile: str = None):
     user_id = message.from_user.id
-    reply = await message.reply_text("Adding torrent...")
     pause = SelectFilesFlag in flags
+    reply = None
+    if pause:
+        # Selective torrents need a real message which becomes the file prompt.
+        reply = await message.reply_text("Loading torrent file list...")
     try:
         gid = await aria2_add_torrent(
             session, user_id, link, LEECH_TIMEOUT, pause=pause
         )
     except Aria2Error as ex:
-        await asyncio.gather(
-            message.reply_text(
-                f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
-            ),
-            reply.delete(),
+        await message.reply_text(
+            f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
         )
+        if reply is not None:
+            await _delete_download_placeholder(reply)
         return
     finally:
         if os.path.isfile(link):
@@ -418,7 +434,15 @@ async def initiate_torrent(client, message, link, flags, newFile: str = None):
             client, message, gid, reply, user_id, flags, newFile
         )
     else:
-        await handle_leech(client, message, gid, reply, user_id, flags, newFile)
+        await handle_leech(
+            client,
+            message,
+            gid,
+            _new_download_reference(message),
+            user_id,
+            flags,
+            newFile,
+        )
 
 
 @Client.on_message(
@@ -469,27 +493,38 @@ async def magnet_cmd(client, message):
 
 async def initiate_magnet(client, message, link, flags, nf: str = None):
     user_id = message.from_user.id
-    reply = await message.reply_text("Adding magnet...")
     pause = SelectFilesFlag in flags
+    reply = None
+    if pause:
+        reply = await message.reply_text("Loading magnet file list...")
     try:
         gid = await asyncio.wait_for(
             aria2_add_magnet(session, user_id, link, LEECH_TIMEOUT, pause=pause),
             MAGNET_TIMEOUT,
         )
     except Aria2Error as ex:
-        await asyncio.gather(
-            message.reply_text(
-                f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
-            ),
-            reply.delete(),
+        await message.reply_text(
+            f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
         )
+        if reply is not None:
+            await _delete_download_placeholder(reply)
     except asyncio.TimeoutError:
-        await asyncio.gather(message.reply_text("Magnet timed out"), reply.delete())
+        await message.reply_text("Magnet timed out")
+        if reply is not None:
+            await _delete_download_placeholder(reply)
     else:
         if pause:
             await handle_file_selection(client, message, gid, reply, user_id, flags, nf)
         else:
-            await handle_leech(client, message, gid, reply, user_id, flags, nf)
+            await handle_leech(
+                client,
+                message,
+                gid,
+                _new_download_reference(message),
+                user_id,
+                flags,
+                nf,
+            )
 
 
 @Client.on_message(
@@ -1736,7 +1771,7 @@ async def initiate_directdl(
     resume=False,
 ):
     user_id = message.from_user.id
-    reply = await message.reply_text("Adding url...")
+    reply = _new_download_reference(message)
     try:
         gid = await asyncio.wait_for(
             aria2_add_directdl(
@@ -1753,15 +1788,12 @@ async def initiate_directdl(
             MAGNET_TIMEOUT,
         )
     except Aria2Error as ex:
-        await asyncio.gather(
-            message.reply_text(
-                f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
-            ),
-            reply.delete(),
+        await message.reply_text(
+            f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
         )
         return f"Aria2 {ex.error_code}: {ex.error_message}"
     except asyncio.TimeoutError:
-        await asyncio.gather(message.reply_text("Connection timed out"), reply.delete())
+        await message.reply_text("Connection timed out")
         return "Connection timed out"
     else:
         if on_gid is not None:
@@ -1772,7 +1804,6 @@ async def initiate_directdl(
                 raise
             if accepted is False:
                 await _remove_bunkr_download(gid)
-                await reply.delete()
                 return "deferred"
         return await handle_leech(
             client,
@@ -1809,7 +1840,7 @@ async def handle_leech(
 
     # Trigger sending the initial unified status message when a task is added
     await send_status_message(client, message)
-    await reply.delete()
+    await _delete_download_placeholder(reply)
 
     while torrent_info["status"] in ("active", "waiting", "paused"):
         if torrent_info.get("seeder") == "true":

@@ -150,6 +150,16 @@ storage CDN. The default endpoint is
 `https://dm.1024terabox.com/ai/index`. Keep the cookie only in `.env` or your
 deployment secret store.
 
+`/splittera URL 40GB` partitions a TeraBox share in its original file order.
+Each session contains as many whole files as fit under the requested cumulative
+size; a single oversized file receives its own session. Part 1 starts
+immediately, and each following part starts automatically only after all files
+in the previous part have downloaded and entered the Telegram upload queue.
+The chain is stored in MongoDB collections `TERABOX_SESSIONS` and
+`TERABOX_SESSION_FILES` when `DB_URL` is configured. Use `/terasession ID` to
+inspect a part and `/continuetera ID` to retry a stopped part. `GB` and `GiB`
+both use 1024-based units.
+
 An administrator can replace an expired cookie in a configured admin chat with
 `/setteraboxcookie VALUE`. In groups, the sender must be a Telegram owner or
 administrator. The bot attempts to delete that command immediately, validates

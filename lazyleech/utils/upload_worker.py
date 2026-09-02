@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import time
 import traceback
+import unicodedata
 import zipfile
 from collections import defaultdict
 
@@ -68,6 +69,42 @@ from .status import (
 upload_queue = asyncio.Queue()
 upload_statuses = dict()
 upload_tamper_lock = asyncio.Lock()
+
+
+def _truncate_utf8_filename(filename, max_bytes=250):
+    """Shorten a filename without cutting a Unicode code point or extension."""
+    if len(filename.encode("utf-8")) <= max_bytes:
+        return filename
+
+    stem, extension = os.path.splitext(filename)
+    extension_bytes = extension.encode("utf-8")
+    if len(extension_bytes) >= max_bytes:
+        extension = ""
+        stem = filename
+        stem_budget = max_bytes
+    else:
+        stem_budget = max_bytes - len(extension_bytes)
+
+    while stem and len(stem.encode("utf-8")) > stem_budget:
+        stem = stem[:-1]
+    return stem + extension
+
+
+def sanitize_upload_filename(filename, max_bytes=250):
+    """Keep valid Unicode while removing characters unsafe for an upload path."""
+    original = str(filename or "")
+    basename = os.path.basename(original.replace("\\", "/"))
+    normalized = unicodedata.normalize("NFC", basename)
+    cleaned = "".join(
+        character
+        for character in normalized
+        if character not in ("/", "\\")
+        and unicodedata.category(character) not in {"Cc", "Cs"}
+    ).strip()
+    if not cleaned or not cleaned.strip(". "):
+        extension = os.path.splitext(basename)[1]
+        cleaned = f"download_{int(time.time())}{extension}"
+    return _truncate_utf8_filename(cleaned, max_bytes=max_bytes)
 
 
 async def upload_worker():
@@ -177,7 +214,7 @@ async def _upload_worker(client, message, reply, torrent_info, user_id, flags, n
                 filename = torrent_info["bittorrent"]["info"]["name"]
             else:
                 filename = os.path.basename(torrent_info["files"][0]["path"])
-            filename = filename[-251:] + ".zip"
+            filename = sanitize_upload_filename(filename + ".zip")
             filepath = os.path.join(zip_tempdir, filename)
 
             def _zip_files():
@@ -303,23 +340,13 @@ async def _upload_file(
     user_watermarked_thumbnail = os.path.join(str(user_id), "watermarked_thumbnail.jpg")
     file_has_big = os.path.getsize(filepath) > TELEGRAM_SPLIT_SIZE
 
-    import re
-
-    # Strip complex emojis/unicode from the physical filename path to prevent Pyrogram Base64 decode crashes
-    # Using a whitelist regex to strictly allow only standard alphanumeric, dashes, dots, and spaces
-    safe_filename = re.sub(r"[^A-Za-z0-9_\-\. ]+", "", filename).strip()
-    if not safe_filename:
-        # Fallback if filename was completely wiped out by regex
-        ext = os.path.splitext(filename)[1]
-        safe_filename = f"bunkr_file_{int(time.time())}{ext}"
+    safe_filename = sanitize_upload_filename(filename)
 
     if safe_filename != filename:
-        # Construct new safe path and rename it on disk
         safe_path = os.path.join(os.path.dirname(filepath), safe_filename)
         try:
             os.rename(filepath, safe_path)
             filepath = safe_path
-            # Important: also update the filename parameter so the renaming logic below inherits the correct extension/name!
             filename = safe_filename
         except Exception as e:
             logging.error(f"Failed to sanitize filename path: {e}")

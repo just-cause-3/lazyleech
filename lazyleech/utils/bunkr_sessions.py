@@ -47,27 +47,35 @@ class BunkrSessionStore:
     but those sessions intentionally do not survive a process restart.
     """
 
-    def __init__(self, db_url=None, database_name=None):
+    def __init__(
+        self,
+        db_url=None,
+        database_name=None,
+        collection_prefix="BUNKR",
+    ):
         if db_url is None:
             db_url = os.environ.get("DB_URL", "")
         self.db_url = db_url
         self.database_name = database_name or os.environ.get(
             "LAZYLEECH_DB_NAME", "ASWFeed"
         )
+        self.collection_prefix = str(collection_prefix or "BUNKR").upper()
         self.client = AsyncIOMotorClient(db_url) if db_url else None
         self.database = (
             self.client[self.database_name] if self.client is not None else None
         )
         self.sessions = (
-            self.database["BUNKR_SESSIONS"] if self.database is not None else None
+            self.database[f"{self.collection_prefix}_SESSIONS"]
+            if self.database is not None
+            else None
         )
         self.files = (
-            self.database["BUNKR_SESSION_FILES"]
+            self.database[f"{self.collection_prefix}_SESSION_FILES"]
             if self.database is not None
             else None
         )
         self.cdn_health = (
-            self.database["BUNKR_CDN_HEALTH"]
+            self.database[f"{self.collection_prefix}_CDN_HEALTH"]
             if self.database is not None
             else None
         )
@@ -119,6 +127,7 @@ class BunkrSessionStore:
         files,
         source_urls=None,
         initial_state=SESSION_RUNNING,
+        session_fields=None,
     ):
         if not files:
             raise ValueError("A Bunkr session must contain at least one file")
@@ -143,13 +152,31 @@ class BunkrSessionStore:
             "created_at": now,
             "updated_at": now,
         }
-        file_docs = [
-            {
+        reserved_session_fields = set(session_doc)
+        for key, value in (session_fields or {}).items():
+            if key not in reserved_session_fields:
+                session_doc[key] = copy.deepcopy(value)
+
+        file_docs = []
+        for position, file_info in enumerate(files, 1):
+            if isinstance(file_info, dict):
+                page_url = file_info.get("page_url") or source_url
+                filename = file_info.get("filename") or page_url
+                extra_fields = {
+                    key: copy.deepcopy(value)
+                    for key, value in file_info.items()
+                    if key not in {"page_url", "filename"}
+                }
+            else:
+                page_url, filename = file_info
+                filename = filename or page_url
+                extra_fields = {}
+            file_doc = {
                 "_id": f"{session_id}:{position}",
                 "session_id": session_id,
                 "position": position,
                 "page_url": page_url,
-                "filename": filename or page_url,
+                "filename": filename,
                 "cdn_host": None,
                 "status": FILE_PENDING,
                 "gid": None,
@@ -164,8 +191,11 @@ class BunkrSessionStore:
                 "last_host_deferred_reason": None,
                 "updated_at": now,
             }
-            for position, (page_url, filename) in enumerate(files, 1)
-        ]
+            reserved_file_fields = set(file_doc)
+            for key, value in extra_fields.items():
+                if key not in reserved_file_fields:
+                    file_doc[key] = value
+            file_docs.append(file_doc)
         if self.persistent:
             await self._ensure_indexes()
             await self.sessions.insert_one(session_doc)
@@ -297,6 +327,50 @@ class BunkrSessionStore:
                 return None
             doc.update(fields)
             return copy.deepcopy(doc)
+
+    async def list_chain(self, chain_id):
+        """Return every session in a split chain in part order."""
+        if self.persistent:
+            await self._ensure_indexes()
+            cursor = self.sessions.find({"chain_id": chain_id}).sort("part_index", 1)
+            return [doc async for doc in cursor]
+        async with self._memory_lock:
+            docs = [
+                doc
+                for doc in self._memory_sessions.values()
+                if doc.get("chain_id") == chain_id
+            ]
+            docs.sort(key=lambda doc: doc.get("part_index", 0))
+            return copy.deepcopy(docs)
+
+    async def activate_next_chain_part(self, session_id):
+        """Atomically activate the queued part immediately after a completed one."""
+        current = await self.get_session(session_id)
+        if current is None or current.get("state") != SESSION_COMPLETED:
+            return None
+        chain_id = current.get("chain_id")
+        part_index = current.get("part_index")
+        if not chain_id or part_index is None:
+            return None
+        query = {
+            "chain_id": chain_id,
+            "part_index": int(part_index) + 1,
+            "state": SESSION_PAUSED,
+        }
+        now = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            return await self.sessions.find_one_and_update(
+                query,
+                {"$set": {"state": SESSION_RUNNING, "updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+            )
+        async with self._memory_lock:
+            for doc in self._memory_sessions.values():
+                if all(doc.get(key) == value for key, value in query.items()):
+                    doc.update({"state": SESSION_RUNNING, "updated_at": now})
+                    return copy.deepcopy(doc)
+        return None
 
     async def claim_next_file(
         self, session_id, excluded_hosts=None, *, allow_excluded_fallback=True

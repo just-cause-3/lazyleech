@@ -7,6 +7,13 @@ TELEGRAM_SPLIT_SIZE = 2097152000
 SPLIT_COPY_BUFFER_SIZE = 8 * 1024 * 1024
 
 
+def _utf8_safe_tail(value, max_bytes):
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+
 def split_binary_file(filename, destination_dir, part_size=TELEGRAM_SPLIT_SIZE):
     """Split *filename* into deterministic, Telegram-sized numbered parts.
 
@@ -19,9 +26,9 @@ def split_binary_file(filename, destination_dir, part_size=TELEGRAM_SPLIT_SIZE):
 
     os.makedirs(destination_dir, exist_ok=True)
     source_size = os.path.getsize(filename)
-    # The upload path is sanitized to ASCII before reaching this function.
-    # Leave five characters for the dot and four-digit numeric suffix.
-    part_prefix = os.path.basename(filename)[-250:]
+    # Leave five bytes for the dot and four-digit numeric suffix while keeping
+    # multibyte Unicode characters intact.
+    part_prefix = _utf8_safe_tail(os.path.basename(filename), 250)
     parts = []
     bytes_written = 0
 

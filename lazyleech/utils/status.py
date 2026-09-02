@@ -11,6 +11,7 @@ from .aria2 import aria2_tell_active
 from .misc import calculate_eta, format_bytes, return_progress_string
 
 status_messages = {}  # chat_id -> Message
+status_message_locks = {}  # chat_id -> asyncio.Lock
 active_uploads = {}  # identifier -> dict
 status_pages = {}  # chat_id -> page_int
 
@@ -169,16 +170,18 @@ async def update_status_message(client, chat_id):
 
 async def send_status_message(client, message):
     chat_id = message.chat.id
-    if chat_id in status_messages:
-        try:
-            await status_messages[chat_id].delete()
-        except Exception:
-            pass
-    text, reply_markup = await get_status_text(chat_id)
-    msg = await client.send_message(chat_id, text, reply_markup=reply_markup)
-    msg.text = text
-    msg.reply_markup = reply_markup
-    status_messages[chat_id] = msg
+    lock = status_message_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        if chat_id in status_messages:
+            await update_status_message(client, chat_id)
+            if chat_id in status_messages:
+                return status_messages[chat_id]
+        text, reply_markup = await get_status_text(chat_id)
+        msg = await client.send_message(chat_id, text, reply_markup=reply_markup)
+        msg.text = text
+        msg.reply_markup = reply_markup
+        status_messages[chat_id] = msg
+        return msg
 
 
 async def status_worker(client):

@@ -77,7 +77,7 @@ docker-compose down
 | `PROGRESS_UPDATE_DELAY` | Progress update interval | `5` |
 | `LEECH_TIMEOUT` | Download timeout (seconds) | `300` |
 | `MAGNET_TIMEOUT` | Magnet timeout (seconds) | `60` |
-| `DB_URL` | MongoDB URL for persistent Bunkr sessions and RSS | None |
+| `DB_URL` | MongoDB URL for persistent Bunkr/TeraBox sessions and RSS | None |
 | `LAZYLEECH_DB_NAME` | Mongo database containing LazyLeech collections | `ASWFeed` |
 | `BUNKR_SLOW_SPEED_KBPS` | Bunkr automatic-skip threshold in KiB/s; `0` disables | `650` |
 | `BUNKR_SLOW_GRACE_SECONDS` | Delay before Bunkr slow-speed monitoring starts | `30` |
