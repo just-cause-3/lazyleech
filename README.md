@@ -152,9 +152,17 @@ deployment secret store.
 
 `/splittera URL 40GB` partitions a TeraBox share in its original file order.
 Each session contains as many whole files as fit under the requested cumulative
-size; a single oversized file receives its own session. Part 1 starts
+size; a single oversized file receives its own session. `/teraintelligent URL
+40GB` treats the size as available workspace instead: files above Telegram's
+upload boundary are budgeted at twice their source size because the original
+and complete set of numbered split parts coexist temporarily. Part 1 starts
 immediately, and each following part starts automatically only after all files
-in the previous part have downloaded and entered the Telegram upload queue.
+in the previous part have uploaded successfully and their temporary files have
+been removed.
+
+Per-file `Files:` summaries are suppressed for these session chains. After the
+entire chain uploads, the bot sends one folder-style, numbered index containing
+the Telegram links for normal files and every `.0001`, `.0002`, ... split part.
 The chain is stored in MongoDB collections `TERABOX_SESSIONS` and
 `TERABOX_SESSION_FILES` when `DB_URL` is configured. Use `/terasession ID` to
 inspect a part and `/continuetera ID` to retry a stopped part. `GB` and `GiB`

@@ -1769,6 +1769,8 @@ async def initiate_directdl(
     max_connections=8,
     download_dir=None,
     resume=False,
+    on_uploaded=None,
+    suppress_upload_summary=False,
 ):
     user_id = message.from_user.id
     reply = _new_download_reference(message)
@@ -1816,6 +1818,8 @@ async def initiate_directdl(
             on_downloaded=on_downloaded,
             on_status=on_status,
             on_removed=on_removed,
+            on_uploaded=on_uploaded,
+            suppress_upload_summary=suppress_upload_summary,
         )
 
 
@@ -1833,6 +1837,8 @@ async def handle_leech(
     on_downloaded=None,
     on_status=None,
     on_removed=None,
+    on_uploaded=None,
+    suppress_upload_summary=False,
 ):
     torrent_info = await aria2_tell_status(session, gid)
     message_identifier = (reply.chat.id, reply.id)
@@ -1895,10 +1901,24 @@ async def handle_leech(
 
         await update_upload_status_state(reply.chat.id, reply.id, tor_name, "Waiting")
 
+        if on_uploaded is not None and on_downloaded is not None:
+            await on_downloaded()
         upload_queue.put_nowait(
-            (client, message, reply, torrent_info, user_id, flags, newFile)
+            (
+                client,
+                message,
+                reply,
+                torrent_info,
+                user_id,
+                flags,
+                newFile,
+                {
+                    "on_uploaded": on_uploaded,
+                    "suppress_summary": suppress_upload_summary,
+                },
+            )
         )
-        if on_downloaded is not None:
+        if on_uploaded is None and on_downloaded is not None:
             await on_downloaded()
         try:
             await aria2_remove(session, gid)

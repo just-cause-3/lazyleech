@@ -109,6 +109,7 @@ def sanitize_upload_filename(filename, max_bytes=250):
 
 async def upload_worker():
     while True:
+        queue_item = await upload_queue.get()
         (
             client,
             message,
@@ -117,14 +118,22 @@ async def upload_worker():
             user_id,
             flags,
             newFile,
-        ) = await upload_queue.get()
+        ) = queue_item[:7]
+        upload_options = queue_item[7] if len(queue_item) > 7 else {}
         try:
             message_identifier = (reply.chat.id, reply.id)
             if SendAsZipFlag not in flags:
                 pass
             task = asyncio.create_task(
                 _upload_worker(
-                    client, message, reply, torrent_info, user_id, flags, newFile
+                    client,
+                    message,
+                    reply,
+                    torrent_info,
+                    user_id,
+                    flags,
+                    newFile,
+                    upload_options,
                 )
             )
             if message_identifier not in upload_statuses:
@@ -138,7 +147,10 @@ async def upload_worker():
                 mi=message_identifier,
                 ti=torrent_info,
                 r=reply,
-                uid=user_id: asyncio.create_task(cleanup_upload(t, mi, ti, r, uid))
+                uid=user_id,
+                options=upload_options: asyncio.create_task(
+                    cleanup_upload(t, mi, ti, r, uid, options)
+                )
             )
 
         except asyncio.CancelledError:
@@ -156,12 +168,17 @@ async def upload_worker():
             upload_queue.task_done()
 
 
-async def cleanup_upload(task, message_identifier, torrent_info, reply, user_id):
+async def cleanup_upload(
+    task, message_identifier, torrent_info, reply, user_id, upload_options=None
+):
+    sent_files = []
+    upload_error = None
     try:
-        await task
+        sent_files = await task
     except asyncio.CancelledError:
-        pass
+        upload_error = "upload cancelled"
     except Exception as ex:
+        upload_error = str(ex)
         logging.exception("Background upload task failed")
 
     worker_identifier = (reply.chat.id, reply.id)
@@ -200,11 +217,27 @@ async def cleanup_upload(task, message_identifier, torrent_info, reply, user_id)
                 f"Failed to completely clean up {torrent_info.get('dir')}: {e}"
             )
 
+    on_uploaded = (upload_options or {}).get("on_uploaded")
+    if on_uploaded is not None:
+        try:
+            await on_uploaded(sent_files, upload_error)
+        except Exception:
+            logging.exception("Upload completion callback failed")
+
 
 upload_waits = dict()
 
 
-async def _upload_worker(client, message, reply, torrent_info, user_id, flags, newFile):
+async def _upload_worker(
+    client,
+    message,
+    reply,
+    torrent_info,
+    user_id,
+    flags,
+    newFile,
+    upload_options=None,
+):
     files = dict()
     sent_files = []
 
@@ -285,6 +318,9 @@ async def _upload_worker(client, message, reply, torrent_info, user_id, flags, n
                     download_root=torrent_info.get("dir"),
                 )
             )
+    if bool((upload_options or {}).get("suppress_summary")):
+        return sent_files
+
     text = "Files:\n"
     parser = pyrogram_html.HTML(client)
     quote = None
@@ -315,8 +351,13 @@ async def _upload_worker(client, message, reply, torrent_info, user_id, flags, n
         await client.send_sticker(LICHER_CHAT, LICHER_STICKER)
 
     # Only send the summary index message if there is an error, or if there are multiple files
-    if len(sent_files) != 1 or (len(sent_files) == 1 and sent_files[0][1] is None):
+    if (
+        len(sent_files) != 1
+        or (len(sent_files) == 1 and sent_files[0][1] is None)
+    ):
         await message.reply_text(text, quote=quote, disable_web_page_preview=True)
+
+    return sent_files
 
 
 async def _upload_file(

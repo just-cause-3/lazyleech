@@ -17,6 +17,7 @@ from .. import (
     help_dict,
     session,
 )
+from ..utils.file_split import TELEGRAM_SPLIT_SIZE
 from ..utils.terabox import (
     DEFAULT_TERABOX_ENDPOINT,
     TERABOX_USER_AGENT,
@@ -31,6 +32,7 @@ from ..utils.terabox_sessions import (
     FILE_FAILED,
     FILE_PENDING,
     FILE_RESOLVING,
+    FILE_UPLOADED,
     SESSION_COMPLETED,
     SESSION_FAILED,
     SESSION_PAUSED,
@@ -49,6 +51,7 @@ TERABOX_API_URL = "https://xapiverse.com/api/terabox"
 TERABOX_CONFIG = TeraboxConfigStore()
 terabox_session_tasks = {}
 terabox_tasks = set()
+terabox_chain_locks = {}
 
 
 def _reported_size_bytes(value):
@@ -460,7 +463,7 @@ async def _fail_terabox_session(message, session_id, file_doc, error):
     if file_doc is not None:
         await terabox_session_store.update_file_if_status(
             file_doc["_id"],
-            (FILE_PENDING, FILE_RESOLVING, FILE_DOWNLOADING),
+            (FILE_PENDING, FILE_RESOLVING, FILE_DOWNLOADING, FILE_DOWNLOADED),
             FILE_FAILED,
             gid=None,
             error=str(error),
@@ -471,6 +474,156 @@ async def _fail_terabox_session(message, session_id, file_doc, error):
         f"{html.escape(str(error))}. Resume with "
         f"<code>/continuetera {session_id}</code>."
     )
+
+
+def _intelligent_workspace_bytes(file_info):
+    """Estimate peak bytes while a source is prepared for Telegram."""
+    source_bytes = max(0, int(file_info.get("size_bytes") or 0))
+    if source_bytes > TELEGRAM_SPLIT_SIZE:
+        # split_binary_file creates a complete second copy in numbered parts
+        # before upload starts, so both copies coexist temporarily.
+        return source_bytes * 2
+    return source_bytes
+
+
+def _chain_index_lines(chain, files_by_session):
+    chain_id = chain[0]["chain_id"]
+    title = re.sub(r"\s*\(part \d+/\d+\)$", "", chain[0]["title"])
+    lines = [
+        f"<b>TeraBox upload complete</b> — <code>{chain_id}</code>",
+        f"📁 <b>{html.escape(title)}</b>/",
+    ]
+
+    def new_directory():
+        return {"directories": {}, "entries": []}
+
+    root = new_directory()
+    for session_doc in chain:
+        for file_doc in files_by_session.get(session_doc["_id"], []):
+            relative_path = str(
+                file_doc.get("relative_path") or file_doc["filename"]
+            ).replace("\\", "/").strip("/")
+            parts = [part for part in relative_path.split("/") if part]
+            source_name = parts.pop() if parts else file_doc["filename"]
+            directory = root
+            for part in parts:
+                if part not in directory["directories"]:
+                    child = new_directory()
+                    directory["directories"][part] = child
+                    directory["entries"].append(("directory", part, child))
+                directory = directory["directories"][part]
+            directory["entries"].append(("file", source_name, file_doc))
+
+    item_index = 0
+
+    def render_directory(directory, prefix=""):
+        nonlocal item_index
+        entries = directory["entries"]
+        for entry_index, (kind, name, value) in enumerate(entries):
+            last = entry_index == len(entries) - 1
+            branch = "└──" if last else "├──"
+            continuation = "    " if last else "│   "
+            if kind == "directory":
+                lines.append(
+                    f"{prefix}{branch} 📁 <b>{html.escape(name)}/</b>"
+                )
+                render_directory(value, prefix + continuation)
+                continue
+
+            file_doc = value
+            uploads = file_doc.get("telegram_files") or []
+            item_index += 1
+            if len(uploads) > 1:
+                lines.append(
+                    f"{prefix}{branch} 📦 {item_index}. "
+                    f"<b>{html.escape(name)}</b>"
+                )
+                part_prefix = prefix + continuation
+                for part_index, upload in enumerate(uploads, 1):
+                    part_branch = "└──" if part_index == len(uploads) else "├──"
+                    upload_name = html.escape(str(upload.get("name") or "part"))
+                    link = html.escape(str(upload.get("link") or ""), quote=True)
+                    lines.append(
+                        f'{part_prefix}{part_branch} <a href="{link}">'
+                        f"{item_index}.{part_index} {upload_name}</a>"
+                    )
+            elif uploads:
+                upload = uploads[0]
+                upload_name = html.escape(str(upload.get("name") or name))
+                link = html.escape(str(upload.get("link") or ""), quote=True)
+                lines.append(
+                    f'{prefix}{branch} {item_index}. '
+                    f'<a href="{link}">{upload_name}</a>'
+                )
+            else:
+                lines.append(
+                    f"{prefix}{branch} {item_index}. "
+                    f"{html.escape(name)} (upload missing)"
+                )
+
+    render_directory(root)
+    return lines
+
+
+async def _send_terabox_chain_index(message, chain):
+    files_by_session = {
+        session_doc["_id"]: await terabox_session_store.list_files(
+            session_doc["_id"]
+        )
+        for session_doc in chain
+    }
+    lines = _chain_index_lines(chain, files_by_session)
+    chunks = []
+    current = ""
+    for line in lines:
+        candidate = current + line + "\n"
+        if current and len(candidate.encode("utf-8")) > 3500:
+            chunks.append(current.rstrip())
+            current = (
+                f"<b>TeraBox upload index (continued)</b> — "
+                f"<code>{chain[0]['chain_id']}</code>\n{line}\n"
+            )
+        else:
+            current = candidate
+    if current:
+        chunks.append(current.rstrip())
+    for chunk in chunks:
+        await message.reply_text(chunk, disable_web_page_preview=True)
+
+
+async def _maybe_complete_terabox_session(client, message, session_id):
+    session_doc = await terabox_session_store.get_session(session_id)
+    if not session_doc:
+        return False
+    chain_id = session_doc.get("chain_id") or session_id
+    lock = terabox_chain_locks.setdefault(chain_id, asyncio.Lock())
+    async with lock:
+        session_doc = await terabox_session_store.get_session(session_id)
+        if not session_doc or session_doc["state"] != SESSION_RUNNING:
+            return False
+        counts = await terabox_session_store.counts(session_id)
+        if counts.get(FILE_UPLOADED, 0) != session_doc["total_files"]:
+            return False
+        completed = await terabox_session_store.set_state(
+            session_id, SESSION_COMPLETED
+        )
+        next_session = await terabox_session_store.activate_next_chain_part(
+            session_id
+        )
+        if next_session is not None:
+            _start_terabox_session(client, message, next_session["_id"])
+            return True
+
+        chain = await terabox_session_store.list_chain(completed["chain_id"])
+        if chain and all(item["state"] == SESSION_COMPLETED for item in chain):
+            last = chain[-1]
+            if not last.get("index_sent"):
+                await _send_terabox_chain_index(message, chain)
+                await terabox_session_store.set_state(
+                    last["_id"], SESSION_COMPLETED, index_sent=True
+                )
+        terabox_chain_locks.pop(chain_id, None)
+        return True
 
 
 async def _run_terabox_session(client, message, session_id, resolved=None):
@@ -492,40 +645,19 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
         file_doc = await terabox_session_store.claim_next_file(session_id)
         if file_doc is None:
             counts = await terabox_session_store.counts(session_id)
-            if counts[FILE_DOWNLOADED] != session_doc["total_files"]:
+            queued_or_uploaded = (
+                counts.get(FILE_DOWNLOADED, 0) + counts.get(FILE_UPLOADED, 0)
+            )
+            if queued_or_uploaded != session_doc["total_files"]:
                 await _fail_terabox_session(
                     message, session_id, None, "one or more files did not download"
                 )
                 return
-            completed = await terabox_session_store.set_state(
-                session_id, SESSION_COMPLETED
+            # Upload callbacks complete the part after Telegram accepted every
+            # file and cleanup released its temporary disk space.
+            await _maybe_complete_terabox_session(
+                client, message, session_id
             )
-            await message.reply_text(
-                f"TeraBox session <code>{session_id}</code> "
-                f"(part {completed['part_index']}/{completed['total_parts']}) "
-                "finished downloading."
-            )
-            next_session = await terabox_session_store.activate_next_chain_part(
-                session_id
-            )
-            if next_session is not None:
-                await message.reply_text(
-                    f"Starting TeraBox part "
-                    f"{next_session['part_index']}/{next_session['total_parts']}: "
-                    f"<code>{next_session['_id']}</code>"
-                )
-                _start_terabox_session(client, message, next_session["_id"])
-            else:
-                chain = await terabox_session_store.list_chain(
-                    completed["chain_id"]
-                )
-                if chain and all(
-                    item["state"] == SESSION_COMPLETED for item in chain
-                ):
-                    await message.reply_text(
-                        f"TeraBox split chain "
-                        f"<code>{completed['chain_id']}</code> completed."
-                    )
             return
 
         try:
@@ -565,6 +697,41 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     current_file["_id"], FILE_DOWNLOADED, gid=None, error=None
                 )
 
+            async def on_uploaded(
+                sent_files, upload_error, current_file=file_doc
+            ):
+                source_size = max(0, int(current_file.get("size_bytes") or 0))
+                expected_uploads = max(
+                    1,
+                    (source_size + TELEGRAM_SPLIT_SIZE - 1)
+                    // TELEGRAM_SPLIT_SIZE,
+                )
+                successful = len(sent_files) >= expected_uploads and all(
+                    link for _, link in sent_files
+                )
+                if upload_error or not successful:
+                    reason = upload_error or "Telegram upload did not return a link"
+                    await _fail_terabox_session(
+                        message, session_id, current_file, reason
+                    )
+                    return
+                telegram_files = [
+                    {"name": name, "link": link}
+                    for name, link in sent_files
+                ]
+                updated = await terabox_session_store.update_file_if_status(
+                    current_file["_id"],
+                    FILE_DOWNLOADED,
+                    FILE_UPLOADED,
+                    gid=None,
+                    error=None,
+                    telegram_files=telegram_files,
+                )
+                if updated is not None:
+                    await _maybe_complete_terabox_session(
+                        client, message, session_id
+                    )
+
             result = await initiate_directdl(
                 client,
                 message,
@@ -576,6 +743,8 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 on_downloaded=on_downloaded,
                 download_dir=_terabox_download_dir(session_doc, file_doc),
                 resume=True,
+                on_uploaded=on_uploaded,
+                suppress_upload_summary=True,
             )
             if result != "complete":
                 current_session = await terabox_session_store.get_session(session_id)
@@ -635,12 +804,21 @@ def _split_terabox_request_from_message(message):
 
 
 async def _create_split_terabox_sessions(
-    client, message, source_url, max_bytes, reply, mode="normal"
+    client,
+    message,
+    source_url,
+    max_bytes,
+    reply,
+    mode="normal",
+    intelligent=False,
 ):
     try:
         resolver, file_list = await _resolve_terabox_share(source_url)
         normalized = _normalize_file_list(file_list, source_url)
-        groups = split_by_cumulative_size(normalized, max_bytes)
+        size_getter = _intelligent_workspace_bytes if intelligent else None
+        groups = split_by_cumulative_size(
+            normalized, max_bytes, size_getter=size_getter
+        )
     except Exception as error:
         await reply.edit_text(
             f"TeraBox split failed: {html.escape(str(error))[:500]}"
@@ -657,6 +835,9 @@ async def _create_split_terabox_sessions(
     try:
         for part_index, group in enumerate(groups, 1):
             part_bytes = sum(item["size_bytes"] for item in group)
+            workspace_bytes = sum(
+                _intelligent_workspace_bytes(item) for item in group
+            )
             session_docs.append(
                 await terabox_session_store.create_session(
                     owner_id=message.from_user.id,
@@ -677,6 +858,10 @@ async def _create_split_terabox_sessions(
                         "total_parts": total_parts,
                         "max_bytes": max_bytes,
                         "part_bytes": part_bytes,
+                        "workspace_bytes": workspace_bytes,
+                        "planning_mode": (
+                            "intelligent_workspace" if intelligent else "source_size"
+                        ),
                         "auto_continue": True,
                     },
                 )
@@ -692,18 +877,45 @@ async def _create_split_terabox_sessions(
 
     lines = [
         f"<b>TeraBox chain:</b> <code>{chain_id}</code>",
-        f"<b>Files:</b> {len(normalized)} | <b>Limit:</b> {_human_size(max_bytes)}",
+        f"<b>Files:</b> {len(normalized)} | "
+        f"<b>{'Workspace' if intelligent else 'Source'} limit:</b> "
+        f"{_human_size(max_bytes)}",
         f"<b>Parts:</b> {total_parts} (automatic, sequential)",
         "",
     ]
     for session_doc, group in zip(session_docs, groups):
         part_size = sum(item["size_bytes"] for item in group)
+        workspace_size = sum(_intelligent_workspace_bytes(item) for item in group)
         state = "running now" if session_doc["part_index"] == 1 else "queued"
+        size_text = _human_size(part_size)
+        if intelligent:
+            size_text += f" source, {_human_size(workspace_size)} peak workspace"
         lines.append(
             f"<b>Part {session_doc['part_index']}/{total_parts}</b> - "
-            f"{len(group)} file(s), {_human_size(part_size)} - "
+            f"{len(group)} file(s), {size_text} - "
             f"<code>{session_doc['_id']}</code> ({state})"
         )
+    if intelligent:
+        split_count = sum(
+            1 for item in normalized if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
+        )
+        oversized = sum(
+            1
+            for item in normalized
+            if _intelligent_workspace_bytes(item) > max_bytes
+        )
+        lines.extend(
+            [
+                "",
+                f"<b>Telegram splitting:</b> {split_count} file(s) over "
+                f"{_human_size(TELEGRAM_SPLIT_SIZE)}",
+            ]
+        )
+        if oversized:
+            lines.append(
+                f"⚠️ {oversized} file(s) individually need more than the "
+                "requested workspace limit and were placed alone."
+            )
     persistence_note = (
         "MongoDB"
         if terabox_session_store.persistent
@@ -754,6 +966,37 @@ async def split_terabox_cmd(client, message):
     )
 
 
+@Client.on_message(
+    filters.command(["teraintelligent", "teraintellegent"])
+    & filters.chat(ALL_CHATS)
+)
+async def intelligent_terabox_cmd(client, message):
+    request = _split_terabox_request_from_message(message)
+    if request is None:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/teraintelligent &lt;TeraBox URL&gt; "
+            "&lt;available workspace&gt;</code>\n"
+            "Example: <code>/teraintelligent https://terabox.com/s/... "
+            "40GB</code>\n"
+            "Files over Telegram's 2 GB boundary count twice because the "
+            "original and all numbered split parts temporarily coexist."
+        )
+        return
+    source_url, max_bytes = request
+    reply = await message.reply_text(
+        "Resolving TeraBox files and calculating peak split workspace..."
+    )
+    await _create_split_terabox_sessions(
+        client,
+        message,
+        source_url,
+        max_bytes,
+        reply,
+        intelligent=True,
+    )
+
+
 def _terabox_session_id_from_message(message):
     if len(message.command) > 1:
         return message.command[1].strip().lower()
@@ -788,7 +1031,10 @@ async def terabox_session_cmd(client, message):
         f"<b>Chain:</b> <code>{session_doc['chain_id']}</code>\n"
         f"<b>Part:</b> {session_doc['part_index']}/{session_doc['total_parts']}\n"
         f"<b>State:</b> {html.escape(session_doc['state'])}\n"
-        f"<b>Downloaded:</b> {counts[FILE_DOWNLOADED]}/"
+        f"<b>Downloaded:</b> "
+        f"{counts[FILE_DOWNLOADED] + counts.get(FILE_UPLOADED, 0)}/"
+        f"{session_doc['total_files']}\n"
+        f"<b>Uploaded:</b> {counts.get(FILE_UPLOADED, 0)}/"
         f"{session_doc['total_files']}\n"
         f"<b>Part size:</b> {_human_size(session_doc['part_bytes'])}"
     )
@@ -847,6 +1093,7 @@ help_dict["terabox"] = (
 /splittera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - Size-based sequential sessions
 /splitziptera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - Zip mode
 /splitfiletera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - File mode
+/teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Account for original + split-part disk usage
 /terasession <i>&lt;session ID&gt;</i> - Show part status
 /continuetera <i>&lt;session ID&gt;</i> - Resume a stopped part
 

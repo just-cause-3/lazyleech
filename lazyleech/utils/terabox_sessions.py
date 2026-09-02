@@ -1,5 +1,6 @@
 """Persistent download sessions for size-split TeraBox shares."""
 
+import copy
 import re
 
 from .bunkr_sessions import (
@@ -16,7 +17,11 @@ from .bunkr_sessions import (
     SESSION_RUNNING,
     BunkrSessionStore,
     new_session_id,
+    utcnow,
 )
+
+
+FILE_UPLOADED = "uploaded"
 
 
 class TeraboxSessionStore(BunkrSessionStore):
@@ -27,6 +32,34 @@ class TeraboxSessionStore(BunkrSessionStore):
             db_url=db_url,
             database_name=database_name,
             collection_prefix="TERABOX",
+        )
+
+    async def prepare_continue(self, session_id, chat_id, source_message_id):
+        """Redownload files whose queued upload was lost after a restart."""
+        now = utcnow()
+        reset = {
+            "status": FILE_PENDING,
+            "gid": None,
+            "error": None,
+            "telegram_files": [],
+            "updated_at": now,
+        }
+        if self.persistent:
+            await self._ensure_indexes()
+            await self.files.update_many(
+                {"session_id": session_id, "status": FILE_DOWNLOADED},
+                {"$set": reset},
+            )
+        else:
+            async with self._memory_lock:
+                for doc in self._memory_files.values():
+                    if (
+                        doc["session_id"] == session_id
+                        and doc["status"] == FILE_DOWNLOADED
+                    ):
+                        doc.update(copy.deepcopy(reset))
+        return await super().prepare_continue(
+            session_id, chat_id, source_message_id
         )
 
 
@@ -98,6 +131,7 @@ __all__ = [
     "FILE_FAILED",
     "FILE_PENDING",
     "FILE_RESOLVING",
+    "FILE_UPLOADED",
     "SESSION_CANCELLED",
     "SESSION_COMPLETED",
     "SESSION_FAILED",
