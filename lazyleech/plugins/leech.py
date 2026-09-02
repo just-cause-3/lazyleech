@@ -20,11 +20,13 @@ import os
 import re
 import tempfile
 import time
+from collections import deque
 from urllib.parse import unquote as urldecode
 from urllib.parse import urlparse, urlunparse
 
 from pyrogram import Client, filters
 from pyrogram.parser import html as pyrogram_html
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import (
     ADMIN_CHATS,
@@ -106,23 +108,46 @@ def _positive_int_env(name, default, maximum=None):
 
 BUNKR_SLOW_SPEED_KBPS = _nonnegative_int_env("BUNKR_SLOW_SPEED_KBPS", 650)
 BUNKR_SLOW_GRACE_SECONDS = _nonnegative_int_env(
-    "BUNKR_SLOW_GRACE_SECONDS", 60
+    "BUNKR_SLOW_GRACE_SECONDS", 30
 )
 BUNKR_SLOW_DURATION_SECONDS = _nonnegative_int_env(
-    "BUNKR_SLOW_DURATION_SECONDS", 90
+    "BUNKR_SLOW_DURATION_SECONDS", 30
 )
-BUNKR_MAX_AUTO_SKIPS = _nonnegative_int_env("BUNKR_MAX_AUTO_SKIPS", 2)
+BUNKR_SLOW_WINDOW_SECONDS = _positive_int_env(
+    "BUNKR_SLOW_WINDOW_SECONDS", 20, maximum=120
+)
+BUNKR_SLOW_PEAK_PERCENT = _positive_int_env(
+    "BUNKR_SLOW_PEAK_PERCENT", 20, maximum=100
+)
+BUNKR_MAX_AUTO_SKIPS = _nonnegative_int_env("BUNKR_MAX_AUTO_SKIPS", 3)
 BUNKR_CONNECTIONS = _positive_int_env("BUNKR_CONNECTIONS", 4, maximum=16)
 BUNKR_RECOVERY_CONNECTIONS = _positive_int_env(
-    "BUNKR_RECOVERY_CONNECTIONS", 1, maximum=16
+    "BUNKR_RECOVERY_CONNECTIONS", 2, maximum=16
 )
 BUNKR_MAX_DOWNLOADS_PER_HOST = _positive_int_env(
-    "BUNKR_MAX_DOWNLOADS_PER_HOST", 4, maximum=8
+    "BUNKR_MAX_DOWNLOADS_PER_HOST", 1, maximum=8
 )
 BUNKR_SLOW_HOST_COOLDOWN_SECONDS = _positive_int_env(
     "BUNKR_SLOW_HOST_COOLDOWN_SECONDS", 300, maximum=3600
 )
+BUNKR_MAX_HOST_COOLDOWN_SECONDS = _positive_int_env(
+    "BUNKR_MAX_HOST_COOLDOWN_SECONDS", 1200, maximum=21600
+)
+BUNKR_COOLDOWN_POLL_SECONDS = 15
 BUNKR_SIGNED_URL_REFRESH_SECONDS = 60
+BUNKR_SESSIONS_PAGE_SIZE = 10
+BUNKR_VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".m4a",
+    ".ts",
+)
 
 
 def _bunkr_cdn_host(download_url):
@@ -138,6 +163,15 @@ def _bunkr_host_semaphore(download_url):
     return semaphore
 
 
+async def _active_bunkr_cooldowns(session_id):
+    session_hosts, global_hosts, known_hosts = await asyncio.gather(
+        bunkr_session_store.active_host_cooldowns(session_id),
+        bunkr_session_store.active_global_host_cooldowns(),
+        bunkr_session_store.session_cdn_hosts(session_id),
+    )
+    return session_hosts | (global_hosts & known_hosts)
+
+
 def _bunkr_download_dir(owner_id, session_id, file_id):
     position = str(file_id).rsplit(":", 1)[-1]
     return os.path.join(
@@ -145,38 +179,102 @@ def _bunkr_download_dir(owner_id, session_id, file_id):
     )
 
 
-def _bunkr_connection_count(file_doc):
-    if file_doc.get("defer_count", 0):
+async def _extract_bunkr_video_files(link, filename=None):
+    """Resolve one Bunkr source into the files stored by a session."""
+    if "/a/" not in urlparse(link).path:
+        file_name = filename or os.path.basename(urlparse(link).path) or link
+        return [(link, file_name)]
+
+    files = await extract_album_urls(link, session)
+    return [
+        (file_url, file_name)
+        for file_url, file_name in files
+        if file_name and file_name.lower().endswith(BUNKR_VIDEO_EXTENSIONS)
+    ]
+
+
+def _bunkr_connection_count(file_doc, cdn_health=None):
+    file_strikes = max(0, int(file_doc.get("auto_defer_count", 0)))
+    host_strikes = max(0, int((cdn_health or {}).get("slow_strikes", 0)))
+    adaptive_level = max(file_strikes, host_strikes)
+    if adaptive_level >= 2:
+        return 1
+    if adaptive_level == 1:
         return min(BUNKR_CONNECTIONS, BUNKR_RECOVERY_CONNECTIONS)
     return BUNKR_CONNECTIONS
 
 
 class _BunkrSlowDownloadMonitor:
-    def __init__(self, speed_limit_bps, grace_seconds, duration_seconds, clock=None):
+    def __init__(
+        self,
+        speed_limit_bps,
+        grace_seconds,
+        duration_seconds,
+        *,
+        window_seconds=20,
+        peak_ratio=0.20,
+        clock=None,
+    ):
         self.speed_limit_bps = speed_limit_bps
         self.grace_seconds = grace_seconds
         self.duration_seconds = duration_seconds
+        self.window_seconds = max(1, window_seconds)
+        self.peak_ratio = max(0.0, min(float(peak_ratio), 1.0))
         self.clock = clock or time.monotonic
         self.started_at = self.clock()
         self.slow_since = None
+        self.samples = deque()
+        self.rolling_speed_bps = 0.0
+        self.peak_speed_bps = 0.0
+        self.effective_limit_bps = float(speed_limit_bps)
+        self.triggered = False
+
+    def _sample_speed(self, now, speed):
+        self.samples.append((now, speed))
+        cutoff = now - self.window_seconds
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+        self.rolling_speed_bps = sum(value for _, value in self.samples) / len(
+            self.samples
+        )
+        self.peak_speed_bps = max(self.peak_speed_bps, self.rolling_speed_bps)
+        # A short CDN burst must not create an unreasonably high permanent floor.
+        # Cap peak-relative detection at four times the configured absolute limit.
+        relative_limit = self.peak_speed_bps * self.peak_ratio
+        relative_limit = min(relative_limit, self.speed_limit_bps * 4)
+        self.effective_limit_bps = max(self.speed_limit_bps, relative_limit)
 
     def should_defer(self, torrent_info):
         if self.speed_limit_bps <= 0 or torrent_info.get("status") != "active":
             self.slow_since = None
             return False
         now = self.clock()
-        if now - self.started_at < self.grace_seconds:
-            return False
         try:
             speed = int(torrent_info.get("downloadSpeed", 0))
         except (TypeError, ValueError):
             speed = 0
-        if speed >= self.speed_limit_bps:
+        self._sample_speed(now, speed)
+        if now - self.started_at < self.grace_seconds:
+            return False
+        if (
+            speed >= self.effective_limit_bps
+            or self.rolling_speed_bps >= self.effective_limit_bps
+        ):
             self.slow_since = None
             return False
         if self.slow_since is None:
             self.slow_since = now
-        return now - self.slow_since >= self.duration_seconds
+        self.triggered = now - self.slow_since >= self.duration_seconds
+        return self.triggered
+
+    def completed_healthy(self):
+        return bool(
+            self.speed_limit_bps <= 0
+            or (
+                self.peak_speed_bps >= self.speed_limit_bps
+                and not self.triggered
+            )
+        )
 
 
 def _bunkr_mode_from_flags(flags):
@@ -466,37 +564,13 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
             "Fetching Bunkr metadata..."
         )
         try:
-            if "/a/" in link:
-                files = await extract_album_urls(link, session)
-
-                # Filter for video files only
-                video_exts = (
-                    ".mp4",
-                    ".mkv",
-                    ".avi",
-                    ".mov",
-                    ".wmv",
-                    ".flv",
-                    ".webm",
-                    ".m4v",
-                    ".m4a",
-                    ".ts",
-                )
-                files = [
-                    (f_url, f_name)
-                    for f_url, f_name in files
-                    if f_name and f_name.lower().endswith(video_exts)
-                ]
-
-                if not files:
-                    if reply_msg:
-                        await message.reply_text("No video files found in the album.")
-                    else:
-                        await reply.edit_text("No video files found in the album.")
-                    return
-            else:
-                file_name = filename or os.path.basename(urlparse(link).path) or link
-                files = [(link, file_name)]
+            files = await _extract_bunkr_video_files(link, filename)
+            if not files:
+                if reply_msg:
+                    await message.reply_text("No video files found in the album.")
+                else:
+                    await reply.edit_text("No video files found in the album.")
+                return
 
             title = os.path.basename(urlparse(link).path.rstrip("/")) or "Bunkr"
             session_doc = await bunkr_session_store.create_session(
@@ -582,12 +656,19 @@ async def _run_bunkr_session(client, message, session_id):
         if not session_doc or session_doc["state"] != SESSION_RUNNING:
             return
 
-        cooled_hosts = await bunkr_session_store.active_host_cooldowns(session_id)
+        cooled_hosts = await _active_bunkr_cooldowns(session_id)
         file_doc = await bunkr_session_store.claim_next_file(
-            session_id, excluded_hosts=cooled_hosts
+            session_id,
+            excluded_hosts=cooled_hosts,
+            allow_excluded_fallback=False,
         )
         if file_doc is None:
             counts = await bunkr_session_store.counts(session_id)
+            if counts[FILE_PENDING] and cooled_hosts:
+                # No eligible host is available. Leave partial files parked while
+                # uploads continue, and periodically re-check the circuit breakers.
+                await asyncio.sleep(BUNKR_COOLDOWN_POLL_SECONDS)
+                continue
             final_state = (
                 SESSION_COMPLETED
                 if counts[FILE_DOWNLOADED] == session_doc["total_files"]
@@ -615,9 +696,7 @@ async def _run_bunkr_session(client, message, session_id):
 
 async def _bunkr_session_chunks(session_doc, include_files=True):
     counts = await bunkr_session_store.counts(session_doc["_id"])
-    cooled_hosts = await bunkr_session_store.active_host_cooldowns(
-        session_doc["_id"]
-    )
+    cooled_hosts = await _active_bunkr_cooldowns(session_doc["_id"])
     downloaded_count = counts[FILE_DOWNLOADED]
     not_downloaded_count = session_doc["total_files"] - downloaded_count
     persistence = "MongoDB" if bunkr_session_store.persistent else "memory only"
@@ -627,6 +706,17 @@ async def _bunkr_session_chunks(session_doc, include_files=True):
         if cooled_hosts
         else ""
     )
+    source_urls = session_doc.get("source_urls") or [session_doc["source_url"]]
+    if len(source_urls) > 1:
+        source_line = (
+            f"<b>Sources:</b> {len(source_urls)} queued Bunkr links "
+            f"(<a href=\"{html.escape(source_urls[0], quote=True)}\">first source</a>)\n"
+        )
+    else:
+        source_line = (
+            f"<b>Source:</b> "
+            f"<a href=\"{html.escape(source_urls[0], quote=True)}\">album/link</a>\n"
+        )
     header = (
         f"<b>Bunkr session:</b> <code>{session_doc['_id']}</code>\n"
         f"<b>State:</b> {html.escape(session_doc['state'].title())}\n"
@@ -634,7 +724,7 @@ async def _bunkr_session_chunks(session_doc, include_files=True):
         f"<b>Not downloaded:</b> {not_downloaded_count}\n"
         f"<b>Storage:</b> {persistence}\n"
         f"{cooling_line}"
-        f"<b>Source:</b> <a href=\"{html.escape(session_doc['source_url'], quote=True)}\">album/link</a>\n\n"
+        f"{source_line}\n"
     )
     if not include_files:
         return [header.rstrip()]
@@ -709,7 +799,9 @@ async def listqueue_cmd(client, message):
     text = "<b>Current Bunkr sessions:</b>\n\n"
     for session_doc in sessions:
         counts = await bunkr_session_store.counts(session_doc["_id"])
+        title = html.escape(str(session_doc.get("title") or "Bunkr"))
         text += (
+            f"<b>{title}</b>\n"
             f"• <code>{session_doc['_id']}</code> — "
             f"{html.escape(session_doc['state'])} — "
             f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded\n"
@@ -759,9 +851,8 @@ async def _remove_bunkr_download(gid, *, cleanup=True):
         pass
 
 
-async def _cancel_bunkr_session_runtime(session_id, *, cleanup_downloads=False):
+async def _cancel_bunkr_session_runtime(session_id):
     active_files = await bunkr_session_store.active_files(session_id)
-    session_doc = await bunkr_session_store.get_session(session_id)
     await bunkr_session_store.cancel_session(session_id)
     for file_doc in active_files:
         if file_doc.get("gid"):
@@ -769,15 +860,10 @@ async def _cancel_bunkr_session_runtime(session_id, *, cleanup_downloads=False):
     task = bunkr_session_tasks.get(session_id)
     if task and not task.done():
         task.cancel()
-    if cleanup_downloads and session_doc:
-        import shutil
-
-        root = os.path.abspath(
-            os.path.join(os.getcwd(), str(int(session_doc["owner_id"])), "bunkr_sessions")
-        )
-        target = os.path.abspath(os.path.join(root, session_id))
-        if os.path.commonpath((root, target)) == root and os.path.isdir(target):
-            shutil.rmtree(target, ignore_errors=True)
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
@@ -786,14 +872,6 @@ async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
         return None, "no_active"
     file_doc = sorted(active_files, key=lambda item: item["position"])[0]
     cdn_host = str(file_doc.get("cdn_host") or "").lower()
-    if (
-        automatic
-        and cdn_host
-        and not await bunkr_session_store.has_pending_outside_hosts(
-            session_doc["_id"], {cdn_host}
-        )
-    ):
-        return None, "no_alternate_host"
     gid = file_doc.get("gid")
     if gid:
         try:
@@ -808,23 +886,43 @@ async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
         automatic=automatic,
         max_auto_defers=BUNKR_MAX_AUTO_SKIPS if automatic else None,
     )
+    if deferred is None and automatic:
+        # If every remaining item uses this CDN, park the active file in place.
+        # This opens a real quiet period instead of downloading through a throttle.
+        deferred = await bunkr_session_store.park_file_for_cooldown(
+            file_doc["_id"],
+            reason,
+            max_auto_defers=BUNKR_MAX_AUTO_SKIPS,
+        )
     if deferred is None:
-        return None, "no_next"
+        return None, "auto_limit" if automatic else "no_next"
     if gid:
         # Keep aria2's partial data. A later pass uses the same stable directory
         # and a freshly signed URL, so range-capable CDN downloads can resume.
         await _remove_bunkr_download(gid, cleanup=False)
     if automatic and cdn_host:
+        health = await bunkr_session_store.record_cdn_slowdown(
+            cdn_host,
+            BUNKR_SLOW_HOST_COOLDOWN_SECONDS,
+            BUNKR_MAX_HOST_COOLDOWN_SECONDS,
+        )
+        cooldown_seconds = int(
+            (health or {}).get(
+                "cooldown_seconds", BUNKR_SLOW_HOST_COOLDOWN_SECONDS
+            )
+        )
         await bunkr_session_store.set_host_cooldown(
             session_doc["_id"],
             cdn_host,
-            BUNKR_SLOW_HOST_COOLDOWN_SECONDS,
+            cooldown_seconds,
         )
         moved = await bunkr_session_store.move_pending_host_to_bottom(
             session_doc["_id"], cdn_host
         )
         deferred["_cdn_host"] = cdn_host
         deferred["_same_host_moved"] = max(0, moved - 1)
+        deferred["_cooldown_seconds"] = cooldown_seconds
+        deferred["_host_strikes"] = int((health or {}).get("slow_strikes", 1))
     return deferred, None
 
 
@@ -832,22 +930,82 @@ async def _defer_active_bunkr_download(session_doc, reason, *, automatic=False):
     filters.command(["bsessions", "bunkrsessions"]) & filters.chat(ALL_CHATS)
 )
 async def bunkr_sessions_cmd(client, message):
-    sessions = await bunkr_session_store.list_sessions(owner_id=message.from_user.id)
-    if not sessions:
-        await message.reply_text("You do not have any Bunkr sessions.")
-        return
-    text = "<b>Your Bunkr sessions:</b>\n\n"
+    page = 1
+    if len(message.command) > 1:
+        try:
+            page = int(message.command[1])
+        except (TypeError, ValueError):
+            await message.reply_text("Usage: <code>/bsessions [page]</code>")
+            return
+    text, reply_markup = await _bunkr_sessions_page(message.from_user.id, page)
+    await message.reply_text(text, reply_markup=reply_markup)
+
+
+async def _bunkr_sessions_page(owner_id, requested_page=1):
+    total = await bunkr_session_store.count_sessions(owner_id=owner_id)
+    if not total:
+        return "You do not have any Bunkr sessions.", None
+
+    total_pages = max(
+        1, (total + BUNKR_SESSIONS_PAGE_SIZE - 1) // BUNKR_SESSIONS_PAGE_SIZE
+    )
+    page = min(max(1, int(requested_page)), total_pages)
+    sessions = await bunkr_session_store.list_sessions(
+        owner_id=owner_id,
+        limit=BUNKR_SESSIONS_PAGE_SIZE,
+        skip=(page - 1) * BUNKR_SESSIONS_PAGE_SIZE,
+    )
+    text = f"<b>Your Bunkr sessions</b> - Page {page}/{total_pages}\n\n"
     for session_doc in sessions:
         counts = await bunkr_session_store.counts(session_doc["_id"])
+        title = html.escape(str(session_doc.get("title") or "Bunkr"))[:120]
+        state = html.escape(str(session_doc["state"]))
         text += (
-            f"• <code>{session_doc['_id']}</code> — "
-            f"{html.escape(session_doc['state'])} — "
+            f"<b>{title}</b>\n"
+            f"• <code>{session_doc['_id']}</code> - {state} - "
             f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded\n"
         )
     text += "\nUse <code>/bsession ID</code> for every stored file link."
     if not bunkr_session_store.persistent:
-        text += "\n\n⚠️ DB_URL is not configured; these sessions are memory-only."
-    await message.reply_text(text)
+        text += "\n\nDB_URL is not configured; these sessions are memory-only."
+
+    buttons = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                "Previous",
+                callback_data=f"bsessions_page:{int(owner_id)}:{page - 1}",
+            )
+        )
+    buttons.append(
+        InlineKeyboardButton(
+            f"{page}/{total_pages}",
+            callback_data=f"bsessions_page:{int(owner_id)}:{page}",
+        )
+    )
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton(
+                "Next",
+                callback_data=f"bsessions_page:{int(owner_id)}:{page + 1}",
+            )
+        )
+    return text, InlineKeyboardMarkup([buttons])
+
+
+@Client.on_callback_query(filters.regex(r"^bsessions_page:\d+:\d+$"))
+async def bunkr_sessions_page_callback(client, callback_query):
+    _, owner_text, page_text = callback_query.data.split(":", 2)
+    owner_id = int(owner_text)
+    if callback_query.from_user.id != owner_id:
+        await callback_query.answer(
+            "Only the user who opened this list can change its page.",
+            show_alert=True,
+        )
+        return
+    text, reply_markup = await _bunkr_sessions_page(owner_id, int(page_text))
+    await callback_query.message.edit_text(text, reply_markup=reply_markup)
+    await callback_query.answer()
 
 
 @Client.on_message(
@@ -1006,7 +1164,7 @@ async def cancel_bunkr_session_cmd(client, message):
 
 
 @Client.on_message(
-    filters.command(["deletesession", "deletebunkrsession"])
+    filters.command(["deletesession", "delsession", "deletebunkrsession"])
     & filters.chat(ALL_CHATS)
 )
 async def delete_bunkr_session_cmd(client, message):
@@ -1016,13 +1174,12 @@ async def delete_bunkr_session_cmd(client, message):
             "Session not found. Use <code>/deletesession &lt;session_id&gt;</code>."
         )
         return
-    await _cancel_bunkr_session_runtime(
-        session_doc["_id"], cleanup_downloads=True
-    )
+    await _cancel_bunkr_session_runtime(session_doc["_id"])
     await bunkr_session_store.delete_session(session_doc["_id"])
     await message.reply_text(
-        f"Deleted Bunkr session <code>{session_doc['_id']}</code> and its stored "
-        "link history. Previously uploaded Telegram files were not deleted."
+        f"Deleted Bunkr session <code>{session_doc['_id']}</code> and its link "
+        "history from the database. Downloaded and queued Telegram files were "
+        "not deleted."
     )
 
 
@@ -1038,13 +1195,153 @@ async def delete_all_bunkr_sessions_cmd(client, message):
         await message.reply_text("You do not have any Bunkr sessions to delete.")
         return
     for session_doc in sessions:
-        await _cancel_bunkr_session_runtime(
-            session_doc["_id"], cleanup_downloads=True
-        )
+        await _cancel_bunkr_session_runtime(session_doc["_id"])
         await bunkr_session_store.delete_session(session_doc["_id"])
     await message.reply_text(
-        f"Deleted {len(sessions)} Bunkr session(s) and their stored link "
-        "history. Previously queued/uploaded Telegram files were not deleted."
+        f"Deleted {len(sessions)} Bunkr session(s) and their link history from "
+        "the database. Downloaded and queued Telegram files were not deleted."
+    )
+
+
+def _split_bunkr_request_from_message(message):
+    """Return ``(album_url, files_per_session)`` for /splitbunkr."""
+    args = list(message.command[1:])
+    reply = message.reply_to_message
+    if len(args) == 1 and args[0].isdigit() and not getattr(reply, "empty", True):
+        reply_text = (getattr(reply, "text", None) or getattr(reply, "caption", None) or "")
+        reply_parts = reply_text.split()
+        if reply_parts:
+            args.append(reply_parts[0])
+
+    if len(args) != 2:
+        return None
+    if args[0].isdigit():
+        files_per_session, raw_link = int(args[0]), args[1]
+    elif args[1].isdigit():
+        raw_link, files_per_session = args[0], int(args[1])
+    else:
+        return None
+    if not 1 <= files_per_session <= 1000:
+        return None
+
+    parsed = list(urlparse(raw_link, "https"))
+    if not parsed[0]:
+        parsed[0] = "https"
+    if parsed[0] not in ("http", "https"):
+        return None
+    link = urlunparse(parsed)
+    if not is_bunkr_url(link) or "/a/" not in urlparse(link).path:
+        return None
+    return link, files_per_session
+
+
+async def _create_split_bunkr_sessions(
+    client, message, album_url, files_per_session, reply
+):
+    """Create all album parts, leaving every part except the first paused."""
+    try:
+        files = await _extract_bunkr_video_files(album_url)
+    except Exception as error:
+        await reply.edit_text(
+            f"Bunkr album extraction failed: {html.escape(str(error))[:500]}"
+        )
+        return []
+    if not files:
+        await reply.edit_text("No video files found in the Bunkr album.")
+        return []
+
+    file_groups = [
+        files[index : index + files_per_session]
+        for index in range(0, len(files), files_per_session)
+    ]
+    album_title = os.path.basename(urlparse(album_url).path.rstrip("/")) or "Bunkr"
+    session_docs = []
+    try:
+        for index, group in enumerate(file_groups, 1):
+            session_docs.append(
+                await bunkr_session_store.create_session(
+                    owner_id=message.from_user.id,
+                    chat_id=message.chat.id,
+                    source_message_id=message.id,
+                    source_url=album_url,
+                    source_urls=[album_url],
+                    title=f"{album_title} (part {index}/{len(file_groups)})",
+                    mode="normal",
+                    custom_filename=None,
+                    files=group,
+                    initial_state=(
+                        SESSION_RUNNING if index == 1 else SESSION_PAUSED
+                    ),
+                )
+            )
+    except Exception as error:
+        for session_doc in session_docs:
+            await bunkr_session_store.delete_session(session_doc["_id"])
+        await reply.edit_text(
+            "Could not store the split Bunkr sessions; any partial database "
+            f"records were removed. Error: {html.escape(str(error))[:500]}"
+        )
+        return []
+
+    lines = [
+        f"<b>Split Bunkr album into {len(session_docs)} sessions</b>",
+        f"<b>Files:</b> {len(files)} | "
+        f"<b>Maximum per session:</b> {files_per_session}",
+        "",
+    ]
+    for index, (session_doc, group) in enumerate(
+        zip(session_docs, file_groups), 1
+    ):
+        if index == 1:
+            action = "running now"
+        else:
+            action = f"paused - <code>/continue {session_doc['_id']}</code>"
+        lines.append(
+            f"<b>Part {index}/{len(session_docs)}</b> ({len(group)} files): "
+            f"<code>{session_doc['_id']}</code> - {action}"
+        )
+    lines.extend(
+        [
+            "",
+            "Delete a part with <code>/deletesession SESSION_ID</code>.",
+        ]
+    )
+
+    chunks = []
+    current = ""
+    for line in lines:
+        entry = f"{line}\n"
+        if current and len(current) + len(entry) > 3900:
+            chunks.append(current.rstrip())
+            current = ""
+        current += entry
+    if current:
+        chunks.append(current.rstrip())
+    first_session = session_docs[0]
+    _start_bunkr_session(client, message, first_session["_id"])
+    await reply.edit_text(chunks[0], disable_web_page_preview=True)
+    for chunk in chunks[1:]:
+        await message.reply_text(chunk, disable_web_page_preview=True)
+
+    return session_docs
+
+
+@Client.on_message(filters.command("splitbunkr") & filters.chat(ALL_CHATS))
+async def split_bunkr_cmd(client, message):
+    request = _split_bunkr_request_from_message(message)
+    if request is None:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/splitbunkr &lt;album URL&gt; &lt;files per session&gt;</code>\n"
+            "<code>/splitbunkr &lt;files per session&gt; &lt;album URL&gt;</code>\n"
+            "Or reply to a Bunkr album URL with "
+            "<code>/splitbunkr &lt;files per session&gt;</code>."
+        )
+        return
+    album_url, files_per_session = request
+    reply = await message.reply_text("Fetching and splitting Bunkr album metadata...")
+    await _create_split_bunkr_sessions(
+        client, message, album_url, files_per_session, reply
     )
 
 
@@ -1078,20 +1375,113 @@ async def queue_cmd(client, message):
         f"Added {len(links)} links to queue. Processing..."
     )
 
-    async def run_queue():
-        for link in links:
-            await process_link(client, message, link, None, flags, reply_msg=reply)
-            await asyncio.sleep(2.5)
-        try:
-            await reply.edit_text(
-                f"Successfully processed queue of {len(links)} links!"
-            )
-        except Exception:
-            pass
-
-    task = asyncio.create_task(run_queue())
+    task = asyncio.create_task(
+        _process_queue_links(client, message, links, flags, reply)
+    )
     bunkr_tasks.add(task)
     task.add_done_callback(bunkr_tasks.discard)
+
+
+async def _process_queue_links(client, message, links, flags, reply):
+    """Process one /queue invocation, grouping all Bunkr sources together."""
+    bunkr_files = []
+    bunkr_sources = []
+    failed_bunkr_sources = []
+    non_bunkr_count = 0
+
+    for raw_link in links:
+        parsed = list(urlparse(raw_link, "https"))
+        normalized_link = None
+        if parsed[0] != "magnet":
+            if not parsed[0]:
+                parsed[0] = "https"
+            if parsed[0] in ("http", "https"):
+                normalized_link = urlunparse(parsed)
+
+        if normalized_link and is_bunkr_url(normalized_link):
+            try:
+                files = await _extract_bunkr_video_files(normalized_link)
+            except Exception as error:
+                failed_bunkr_sources.append((normalized_link, str(error)))
+            else:
+                if files:
+                    bunkr_sources.append(normalized_link)
+                    bunkr_files.extend(files)
+                else:
+                    failed_bunkr_sources.append(
+                        (normalized_link, "No video files found")
+                    )
+        else:
+            non_bunkr_count += 1
+            await process_link(
+                client, message, raw_link, None, flags, reply_msg=reply
+            )
+        await asyncio.sleep(2.5)
+
+    session_doc = None
+    session_error = None
+    if bunkr_files:
+        source_count = len(bunkr_sources)
+        try:
+            session_doc = await bunkr_session_store.create_session(
+                owner_id=message.from_user.id,
+                chat_id=message.chat.id,
+                source_message_id=message.id,
+                source_url=bunkr_sources[0],
+                source_urls=bunkr_sources,
+                title=f"Bunkr queue ({source_count} sources)",
+                mode=_bunkr_mode_from_flags(flags),
+                custom_filename=None,
+                files=bunkr_files,
+            )
+        except Exception as error:
+            session_error = str(error)
+            await message.reply_text(
+                "Bunkr queue session creation failed: "
+                f"{html.escape(session_error)[:500]}"
+            )
+        else:
+            session_id = session_doc["_id"]
+            persistence_note = (
+                ""
+                if bunkr_session_store.persistent
+                else "\n\nDB_URL is not configured; this session will not survive "
+                "a bot restart."
+            )
+            await message.reply_text(
+                f"<b>Bunkr queue session:</b> <code>{session_id}</code>\n"
+                f"Combined <b>{len(bunkr_files)}</b> video file(s) from "
+                f"<b>{source_count}</b> queued Bunkr link(s).\n\n"
+                f"Pause: <code>/pause {session_id}</code>\n"
+                f"Continue: <code>/continue {session_id}</code>\n"
+                f"Delete: <code>/deletesession {session_id}</code>\n"
+                f"Details: <code>/bsession {session_id}</code>"
+                f"{persistence_note}"
+            )
+            _start_bunkr_session(client, message, session_id)
+
+    summary_parts = [f"Processed queue of {len(links)} links."]
+    if session_doc:
+        summary_parts.append(
+            f"Bunkr: {len(bunkr_files)} files in one session "
+            f"<code>{session_doc['_id']}</code>."
+        )
+    if non_bunkr_count:
+        summary_parts.append(
+            f"Other downloads started separately: {non_bunkr_count}."
+        )
+    if failed_bunkr_sources:
+        summary_parts.append(
+            f"Bunkr links with no usable files/errors: "
+            f"{len(failed_bunkr_sources)}."
+        )
+    if session_error:
+        summary_parts.append("The combined Bunkr session could not be created.")
+    try:
+        await reply.edit_text("\n".join(summary_parts))
+    except Exception:
+        pass
+    return session_doc
 
 
 async def process_bunkr_download(client, message, session_doc, file_doc, flags):
@@ -1124,19 +1514,20 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                 )
             return
 
-        cooled_hosts = await bunkr_session_store.active_host_cooldowns(
-            session_doc["_id"]
-        )
-        if (
-            cdn_host in cooled_hosts
-            and await bunkr_session_store.has_pending_outside_hosts(
-                session_doc["_id"], cooled_hosts
-            )
-        ):
+        cooled_hosts = await _active_bunkr_cooldowns(session_doc["_id"])
+        if cdn_host in cooled_hosts:
             routed = await bunkr_session_store.route_file_to_bottom(
                 file_id,
                 f"Deferred while CDN {cdn_host} is cooling down",
             )
+            if routed is None:
+                routed = await bunkr_session_store.update_file_if_status(
+                    file_id,
+                    FILE_RESOLVING,
+                    FILE_PENDING,
+                    gid=None,
+                    error=f"Waiting for CDN {cdn_host} cooldown",
+                )
             if routed is not None:
                 return "deferred"
 
@@ -1155,6 +1546,8 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                 BUNKR_SLOW_SPEED_KBPS * 1024 if BUNKR_MAX_AUTO_SKIPS else 0,
                 BUNKR_SLOW_GRACE_SECONDS,
                 BUNKR_SLOW_DURATION_SECONDS,
+                window_seconds=BUNKR_SLOW_WINDOW_SECONDS,
+                peak_ratio=BUNKR_SLOW_PEAK_PERCENT / 100,
             )
             latest = await bunkr_session_store.get_session(session_doc["_id"])
             if latest and latest["state"] == SESSION_PAUSED:
@@ -1168,6 +1561,8 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             await bunkr_session_store.update_file(
                 file_id, FILE_DOWNLOADED, gid=None, error=None
             )
+            if cdn_host and (slow_monitor is None or slow_monitor.completed_healthy()):
+                await bunkr_session_store.record_cdn_success(cdn_host)
 
         async def on_removed():
             latest = await bunkr_session_store.get_file(file_id)
@@ -1186,8 +1581,9 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             except (TypeError, ValueError):
                 speed = 0
             reason = (
-                f"Automatically deferred: speed stayed below "
-                f"{BUNKR_SLOW_SPEED_KBPS} KiB/s for "
+                f"Automatically deferred: {int(slow_monitor.rolling_speed_bps / 1024)} "
+                f"KiB/s rolling speed stayed below the adaptive "
+                f"{int(slow_monitor.effective_limit_bps / 1024)} KiB/s floor for "
                 f"{BUNKR_SLOW_DURATION_SECONDS}s"
             )
             deferred, _ = await _defer_active_bunkr_download(
@@ -1196,18 +1592,22 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             if deferred and deferred["_id"] == file_id:
                 cdn_host = html.escape(str(deferred.get("_cdn_host") or "unknown"))
                 same_host_moved = int(deferred.get("_same_host_moved", 0))
+                cooldown_minutes = max(
+                    1, int(deferred.get("_cooldown_seconds", 0) / 60)
+                )
+                host_strikes = int(deferred.get("_host_strikes", 1))
                 await message.reply_text(
-                    f"Slow Bunkr download moved to the bottom: "
+                    f"Slow Bunkr download parked/requeued: "
                     f"<code>{html.escape(str(deferred['filename']))}</code> "
                     f"({format_bytes(speed)}/s). CDN <code>{cdn_host}</code> "
-                    f"is cooling down; moved {same_host_moved} additional known "
+                    f"is cooling down for about {cooldown_minutes} minute(s) "
+                    f"(adaptive level {host_strikes}); moved {same_host_moved} additional known "
                     f"same-CDN file(s) behind alternate hosts."
                 )
                 return "deferred"
             auto_defer_unavailable = True
             return None
 
-        max_connections = _bunkr_connection_count(file_doc)
         download_dir = _bunkr_download_dir(
             session_doc["owner_id"], session_doc["_id"], file_id
         )
@@ -1227,6 +1627,19 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                 return
             current = latest_session
 
+            # Another session may have opened this host's circuit breaker while
+            # this file waited for the one-per-CDN semaphore.
+            cooled_hosts = await _active_bunkr_cooldowns(session_doc["_id"])
+            if cdn_host in cooled_hosts:
+                await bunkr_session_store.update_file_if_status(
+                    file_id,
+                    FILE_RESOLVING,
+                    FILE_PENDING,
+                    gid=None,
+                    error=f"Waiting for CDN {cdn_host} cooldown",
+                )
+                return "deferred"
+
             # Waiting behind a large same-host file can outlive the signed URL.
             # Refresh only after acquiring the slot so addUri gets a fresh token.
             if time.monotonic() - resolved_at >= BUNKR_SIGNED_URL_REFRESH_SECONDS:
@@ -1239,6 +1652,9 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                     await bunkr_session_store.update_file(
                         file_id, filename=refreshed_name
                     )
+
+            cdn_health = await bunkr_session_store.get_cdn_health(cdn_host)
+            max_connections = _bunkr_connection_count(latest_file, cdn_health)
 
             result = await initiate_directdl(
                 client,
@@ -1911,14 +2327,19 @@ help_dict["leech"] = (
 /filedirect <i>&lt;Direct URL&gt; | optional custom file name</i> - Sends videos as files
 /filedirect <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files
 
-/bsessions - Lists your Bunkr sessions
+/queue <i>&lt;URL1&gt; &lt;URL2&gt; ...</i> - One session for all queued Bunkr links
+/zipqueue <i>&lt;URL1&gt; &lt;URL2&gt; ...</i> - Same, uploaded as ZIP
+/filequeue <i>&lt;URL1&gt; &lt;URL2&gt; ...</i> - Same, videos sent as files
+/splitbunkr <i>&lt;album URL&gt; &lt;files per session&gt;</i> - Stores split sessions; part 1 starts
+
+/bsessions <i>[page]</i> - Lists your Bunkr sessions with Previous/Next buttons
 /bsession <i>&lt;session ID&gt;</i> - Lists downloaded and unfinished file links
 /pause <i>&lt;session ID&gt;</i> - Pauses Bunkr downloading; queued uploads continue
 /skip <i>&lt;session ID&gt;</i> - Moves the active Bunkr file to the queue bottom
 /continue <i>&lt;session ID&gt;</i> - Resumes unfinished Bunkr files
 /cancelsession <i>&lt;session ID&gt;</i> - Cancels downloading but retains the session
-/deletesession <i>&lt;session ID&gt;</i> - Deletes the stored session history
-/deleteallsessions - Deletes all of your stored Bunkr session histories
+/deletesession <i>&lt;session ID&gt;</i> - Deletes session history from the database
+/deleteallsessions - Deletes all of your session histories from the database
 
 /cancel <i>&lt;GID&gt;</i>
 /cancel <i>&lt;chat id&gt;</i> <i>&lt;message id&gt;</i>

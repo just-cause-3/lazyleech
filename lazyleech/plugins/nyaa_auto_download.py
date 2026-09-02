@@ -11,6 +11,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from motor.core import AgnosticClient, AgnosticDatabase, AgnosticCollection
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .. import app, ADMIN_CHATS, ForceDocumentFlag
+from ..utils.rss_control import RSSControlStore
 from .leech import initiate_torrent
 
 rsslink = list(
@@ -40,13 +41,56 @@ if os.environ.get("DB_URL"):
 
     A = get_collection("ASW_TITLE")
     FEEDS_DB = get_collection("RSS_FEEDS")
+    RSS_CONTROL = RSSControlStore(get_collection("RSS_CONTROL"))
+
+    @Client.on_message(filters.command("pauserss") & filters.chat(ADMIN_CHATS))
+    async def pause_rss(client, message):
+        await RSS_CONTROL.set_paused(True, updated_by=message.from_user.id)
+        try:
+            scheduler.pause_job("rss_parser")
+        except Exception:
+            pass
+        await message.reply_text(
+            "RSS auto-download is persistently paused. Future feed scans are "
+            "disabled; downloads already started will continue."
+        )
+
+    @Client.on_message(filters.command("resumerss") & filters.chat(ADMIN_CHATS))
+    async def resume_rss(client, message):
+        await RSS_CONTROL.set_paused(False, updated_by=message.from_user.id)
+        try:
+            scheduler.resume_job("rss_parser")
+        except Exception:
+            pass
+        await message.reply_text(
+            "RSS auto-download resumed. Feeds will be checked at the next "
+            "scheduled interval."
+        )
+
+    @Client.on_message(filters.command("rssstatus") & filters.chat(ADMIN_CHATS))
+    async def rss_status(client, message):
+        state = await RSS_CONTROL.get_state()
+        db_feed_count = await FEEDS_DB.count_documents({})
+        status = "Paused" if state.get("paused") else "Running"
+        await message.reply_text(
+            f"<b>RSS auto-download:</b> {status}\n"
+            f"<b>Environment feeds:</b> {len(rsslink)}\n"
+            f"<b>Database feeds:</b> {db_feed_count}\n"
+            f"<b>Check interval:</b> "
+            f"{int(os.environ.get('RSS_RECHECK_INTERVAL', 5))} minutes"
+        )
 
     @Client.on_message(filters.command("listrss") & filters.chat(ADMIN_CHATS))
     async def list_rss(client, message):
+        paused = await RSS_CONTROL.is_paused()
         db_feeds_cursor = FEEDS_DB.find({})
         db_feeds = [doc["url"] async for doc in db_feeds_cursor]
 
-        text = "<b>Base RSS Feeds (Env):</b>\n"
+        text = (
+            f"<b>RSS auto-download:</b> "
+            f"{'Paused' if paused else 'Running'}\n\n"
+            "<b>Base RSS Feeds (Env):</b>\n"
+        )
         for idx, url in enumerate(rsslink, 1):
             text += f"{idx}. {url}\n"
 
@@ -105,6 +149,8 @@ if os.environ.get("DB_URL"):
         return await asyncio.get_event_loop().run_in_executor(None, requests.get, url)
 
     async def rss_parser():
+        if await RSS_CONTROL.is_paused():
+            return
         cr = []
         db_feeds_cursor = FEEDS_DB.find({})
         db_feeds = [doc["url"] async for doc in db_feeds_cursor]
@@ -161,6 +207,7 @@ if os.environ.get("DB_URL"):
     scheduler.add_job(
         rss_parser,
         "interval",
+        id="rss_parser",
         minutes=int(os.environ.get("RSS_RECHECK_INTERVAL", 5)),
         max_instances=5,
     )

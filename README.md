@@ -89,40 +89,64 @@ zipdirectdl <Direct URL> or as reply to a Direct URL | optional custom file name
 zipdirect <Direct URL> or as reply to a Direct URL | optional custom file name
 filedirectdl <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
 filedirect <Direct URL> or as reply to a Direct URL | optional custom file name - Sends videos as files
-bsessions - List your persistent Bunkr sessions
+queue <URL1> <URL2> ... - Queue links; all Bunkr links form one session
+zipqueue <URL1> <URL2> ... - Same queue behavior, uploaded as ZIP
+filequeue <URL1> <URL2> ... - Same queue behavior, videos sent as files
+splitbunkr <album URL> <files per session> - Split one album into separately resumable sessions
+bsessions [page] - List your persistent Bunkr sessions with Previous/Next buttons
 bsession <session ID> - List downloaded and unfinished Bunkr file links
 pause <session ID> - Pause new/current Bunkr downloading; queued uploads continue
 skip <session ID> - Move the active Bunkr file to the bottom and start the next one
 continue <session ID> - Resume only unfinished files in a Bunkr session
 cancelsession <session ID> - Cancel Bunkr downloading and retain the session
-deletesession <session ID> - Delete a Bunkr session and its stored link history
-deleteallsessions - Delete all of your stored Bunkr session histories
+deletesession <session ID> - Delete one session history from the database
+deleteallsessions - Delete all of your session histories from the database
 cancel - <GID> or as reply to status message
 list - Lists your Ongoing Leeches.
 ```
 
-Bunkr album downloads automatically move a persistently slow file to the bottom
-of its session queue. By default this happens below 650 KiB/s for 90 continuous
-seconds after a 60-second startup grace period, at most twice per file. The
-thresholds can be adjusted with the `BUNKR_SLOW_*` environment variables.
-Fresh Bunkr downloads use four range connections by default. A deferred file
-keeps its partial data and retries with one connection, which is less likely to
-remain CDN-throttled. Up to four Bunkr downloads may run concurrently per CDN
-host by default, while queued Telegram uploads continue independently. Tune this
-with `BUNKR_CONNECTIONS`, `BUNKR_RECOVERY_CONNECTIONS`, and
-`BUNKR_MAX_DOWNLOADS_PER_HOST`.
+Each `/queue`, `/zipqueue`, or `/filequeue` invocation combines every valid
+Bunkr album/file link it contains into one persistent Bunkr session. Non-Bunkr
+links in a mixed queue continue through their normal independent download path.
+Deleting a session removes its MongoDB history but does not remove files already
+downloaded or waiting in the Telegram upload queue.
 
-When a Bunkr file triggers automatic slow-file deferral, its resolved CDN host
-is put on a five-minute session cooldown. Known pending files on that same host
-are grouped at the bottom, and unresolved files are classified lazily as the
-queue reaches them. Files assigned to other CDN hosts are preferred; if no
-alternate host exists, the scheduler falls back to the original queue so the
-session cannot deadlock. Configure the cooldown with
-`BUNKR_SLOW_HOST_COOLDOWN_SECONDS`.
+`/splitbunkr` extracts an album once and divides its ordered video list into
+sessions of the requested maximum size. Part 1 starts immediately; every later
+part is stored as paused and starts only when you run `/continue SESSION_ID`.
+The command also accepts the size before the URL, or the size alone when replying
+to a Bunkr album URL.
+
+Bunkr album downloads track a 20-second rolling speed average and the observed
+peak. After a 30-second startup grace period, a file that remains below its
+adaptive speed floor for 30 seconds is parked with its partial data intact. The
+default absolute floor is 650 KiB/s, peak-relative detection is capped to avoid
+overreacting to a short initial burst, and a file may be parked three times.
+
+Fresh files use four range connections. Adaptive recovery steps down from four
+to two and then one connection after repeated CDN slowdowns. Only one Bunkr file
+may use a CDN host at a time across all sessions, while queued Telegram uploads
+continue independently.
+
+Slow CDN health is shared across sessions and persisted in MongoDB in the
+`BUNKR_CDN_HEALTH` collection. Its circuit breaker escalates from five to ten to
+twenty minutes. Known same-CDN files move behind alternate hosts; when no
+alternate exists, the download waits for the cooldown instead of continuing at
+the throttled rate. A healthy completed download reduces the CDN's adaptive
+level. Tune this behavior with the `BUNKR_SLOW_*`, `BUNKR_CONNECTIONS`,
+`BUNKR_RECOVERY_CONNECTIONS`, `BUNKR_MAX_DOWNLOADS_PER_HOST`, and
+`BUNKR_MAX_HOST_COOLDOWN_SECONDS` environment variables.
 
 **Other Modules**
 ```
 help - to get organised help message
+
+listrss - List RSS feeds and persistent scheduler state (admin)
+addrss <RSS URL> - Add a database-backed RSS feed (admin)
+delrss <RSS URL> - Remove a database-backed RSS feed (admin)
+pauserss - Persistently pause future RSS feed scans (admin)
+resumerss - Resume RSS feed scans (admin)
+rssstatus - Show RSS scheduler state and feed counts (admin)
 
 ts - [search query]
 nyaa - [search query]

@@ -80,13 +80,16 @@ docker-compose down
 | `DB_URL` | MongoDB URL for persistent Bunkr sessions and RSS | None |
 | `LAZYLEECH_DB_NAME` | Mongo database containing LazyLeech collections | `ASWFeed` |
 | `BUNKR_SLOW_SPEED_KBPS` | Bunkr automatic-skip threshold in KiB/s; `0` disables | `650` |
-| `BUNKR_SLOW_GRACE_SECONDS` | Delay before Bunkr slow-speed monitoring starts | `60` |
-| `BUNKR_SLOW_DURATION_SECONDS` | Continuous slow time before moving a file down | `90` |
-| `BUNKR_MAX_AUTO_SKIPS` | Maximum automatic queue deferrals per Bunkr file | `2` |
+| `BUNKR_SLOW_GRACE_SECONDS` | Delay before Bunkr slow-speed monitoring starts | `30` |
+| `BUNKR_SLOW_DURATION_SECONDS` | Continuous slow time before moving a file down | `30` |
+| `BUNKR_SLOW_WINDOW_SECONDS` | Rolling speed-average window | `20` |
+| `BUNKR_SLOW_PEAK_PERCENT` | Peak-relative adaptive slow floor percentage | `20` |
+| `BUNKR_MAX_AUTO_SKIPS` | Maximum automatic queue deferrals per Bunkr file | `3` |
 | `BUNKR_CONNECTIONS` | Range connections for a fresh Bunkr download | `4` |
-| `BUNKR_RECOVERY_CONNECTIONS` | Range connections after a Bunkr file is deferred | `1` |
-| `BUNKR_MAX_DOWNLOADS_PER_HOST` | Concurrent Bunkr files allowed per CDN host | `4` |
-| `BUNKR_SLOW_HOST_COOLDOWN_SECONDS` | Time a slow CDN is deprioritized within its session | `300` |
+| `BUNKR_RECOVERY_CONNECTIONS` | Range connections at the first adaptive recovery level | `2` |
+| `BUNKR_MAX_DOWNLOADS_PER_HOST` | Concurrent Bunkr files allowed per CDN host across sessions | `1` |
+| `BUNKR_SLOW_HOST_COOLDOWN_SECONDS` | Initial shared CDN circuit-breaker cooldown | `300` |
+| `BUNKR_MAX_HOST_COOLDOWN_SECONDS` | Maximum escalating shared CDN cooldown | `1200` |
 | `NYAA_RSS_LINKS` | RSS feed URLs | None |
 
 ---

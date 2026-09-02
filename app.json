@@ -29,15 +29,23 @@
             "required":false
         },
         "BUNKR_SLOW_GRACE_SECONDS":{
-            "description":"Grace period before monitoring a Bunkr download for slow speed (default: 60)",
+            "description":"Grace period before monitoring a Bunkr download for slow speed (default: 30)",
             "required":false
         },
         "BUNKR_SLOW_DURATION_SECONDS":{
-            "description":"Continuous slow period before moving a Bunkr file to the bottom (default: 90)",
+            "description":"Continuous slow period before parking a Bunkr file (default: 30)",
+            "required":false
+        },
+        "BUNKR_SLOW_WINDOW_SECONDS":{
+            "description":"Rolling window used for adaptive Bunkr speed detection (default: 20)",
+            "required":false
+        },
+        "BUNKR_SLOW_PEAK_PERCENT":{
+            "description":"Peak-relative adaptive Bunkr slow floor percentage (default: 20)",
             "required":false
         },
         "BUNKR_MAX_AUTO_SKIPS":{
-            "description":"Maximum automatic bottom-of-queue moves per Bunkr file (default: 2; 0 disables)",
+            "description":"Maximum automatic cooldown parks per Bunkr file (default: 3; 0 disables)",
             "required":false
         },
         "BUNKR_CONNECTIONS":{
@@ -45,15 +53,19 @@
             "required":false
         },
         "BUNKR_RECOVERY_CONNECTIONS":{
-            "description":"Range connections after a Bunkr file is deferred (default: 1)",
+            "description":"Range connections at the first Bunkr recovery level (default: 2)",
             "required":false
         },
         "BUNKR_MAX_DOWNLOADS_PER_HOST":{
-            "description":"Concurrent Bunkr files allowed per CDN host (default: 4)",
+            "description":"Concurrent Bunkr files allowed per CDN host across sessions (default: 1)",
             "required":false
         },
         "BUNKR_SLOW_HOST_COOLDOWN_SECONDS":{
-            "description":"Seconds to deprioritize a slow Bunkr CDN within its session (default: 300)",
+            "description":"Initial shared slow-CDN circuit-breaker cooldown (default: 300)",
+            "required":false
+        },
+        "BUNKR_MAX_HOST_COOLDOWN_SECONDS":{
+            "description":"Maximum escalating shared CDN cooldown (default: 1200)",
             "required":false
         },
         "NYAA_RSS_LINKS":{

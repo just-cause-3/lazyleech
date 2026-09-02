@@ -66,9 +66,16 @@ class BunkrSessionStore:
             if self.database is not None
             else None
         )
+        self.cdn_health = (
+            self.database["BUNKR_CDN_HEALTH"]
+            if self.database is not None
+            else None
+        )
         self._memory_sessions = {}
         self._memory_files = {}
+        self._memory_cdn_health = {}
         self._memory_lock = asyncio.Lock()
+        self._cdn_health_lock = asyncio.Lock()
         self._indexes_ready = False
         self._index_lock = asyncio.Lock()
 
@@ -96,6 +103,7 @@ class BunkrSessionStore:
                 ]
             )
             await self.files.create_index("gid", sparse=True)
+            await self.cdn_health.create_index("cooldown_until")
             self._indexes_ready = True
 
     async def create_session(
@@ -109,21 +117,27 @@ class BunkrSessionStore:
         mode,
         custom_filename,
         files,
+        source_urls=None,
+        initial_state=SESSION_RUNNING,
     ):
         if not files:
             raise ValueError("A Bunkr session must contain at least one file")
+        if initial_state not in (SESSION_RUNNING, SESSION_PAUSED):
+            raise ValueError("A new Bunkr session must be running or paused")
         session_id = new_session_id()
         now = utcnow()
+        source_urls = list(source_urls or [source_url])
         session_doc = {
             "_id": session_id,
             "owner_id": int(owner_id),
             "chat_id": int(chat_id),
             "source_message_id": int(source_message_id),
             "source_url": source_url,
+            "source_urls": source_urls,
             "title": title,
             "mode": mode,
             "custom_filename": custom_filename,
-            "state": SESSION_RUNNING,
+            "state": initial_state,
             "total_files": len(files),
             "cdn_cooldowns": [],
             "created_at": now,
@@ -182,15 +196,35 @@ class BunkrSessionStore:
                 return None
             return copy.deepcopy(doc)
 
-    async def list_sessions(self, owner_id=None, states=None, limit=20):
+    def _session_query(self, owner_id=None, states=None):
         query = {}
         if owner_id is not None:
             query["owner_id"] = int(owner_id)
         if states:
             query["state"] = {"$in": list(states)}
+        return query
+
+    async def count_sessions(self, owner_id=None, states=None):
+        query = self._session_query(owner_id, states)
+        if self.persistent:
+            await self._ensure_indexes()
+            return await self.sessions.count_documents(query)
+        async with self._memory_lock:
+            return sum(
+                1
+                for doc in self._memory_sessions.values()
+                if (owner_id is None or doc["owner_id"] == int(owner_id))
+                and (not states or doc["state"] in states)
+            )
+
+    async def list_sessions(self, owner_id=None, states=None, limit=20, skip=0):
+        query = self._session_query(owner_id, states)
+        skip = max(0, int(skip))
         if self.persistent:
             await self._ensure_indexes()
             cursor = self.sessions.find(query).sort("updated_at", -1)
+            if skip:
+                cursor = cursor.skip(skip)
             if limit:
                 cursor = cursor.limit(limit)
             return [doc async for doc in cursor]
@@ -201,6 +235,7 @@ class BunkrSessionStore:
             if states:
                 docs = [doc for doc in docs if doc["state"] in states]
             docs.sort(key=lambda doc: doc["updated_at"], reverse=True)
+            docs = docs[skip:]
             return copy.deepcopy(docs[:limit] if limit else docs)
 
     async def list_files(self, session_id):
@@ -263,12 +298,14 @@ class BunkrSessionStore:
             doc.update(fields)
             return copy.deepcopy(doc)
 
-    async def claim_next_file(self, session_id, excluded_hosts=None):
+    async def claim_next_file(
+        self, session_id, excluded_hosts=None, *, allow_excluded_fallback=True
+    ):
         """Claim the next pending file, preferring hosts outside a cooldown.
 
         Files without a known host remain eligible so their real CDN can be
-        discovered lazily. If every pending file is on an excluded host, the
-        normal first-in-queue file is claimed so a session cannot deadlock.
+        discovered lazily. Callers may disable the normal excluded-host fallback
+        when they intend to wait for a CDN circuit breaker to expire.
         """
         now = utcnow()
         excluded_hosts = {
@@ -297,6 +334,8 @@ class BunkrSessionStore:
                 )
                 if preferred is not None:
                     return preferred
+                if not allow_excluded_fallback:
+                    return None
             return await self.files.find_one_and_update(
                 base_query,
                 update,
@@ -321,6 +360,8 @@ class BunkrSessionStore:
                 if not doc.get("cdn_host")
                 or str(doc["cdn_host"]).lower() not in excluded_hosts
             ]
+            if excluded_hosts and not preferred and not allow_excluded_fallback:
+                return None
             doc = (preferred or candidates)[0]
             doc.update(
                 {
@@ -410,6 +451,127 @@ class BunkrSessionStore:
             for item in session_doc.get("cdn_cooldowns", [])
             if item.get("host") and float(item.get("until", 0)) > now_epoch
         }
+
+    async def get_cdn_health(self, cdn_host):
+        """Return shared adaptive health for a CDN host."""
+        cdn_host = str(cdn_host or "").lower()
+        if not cdn_host:
+            return None
+        if self.persistent:
+            await self._ensure_indexes()
+            health = await self.cdn_health.find_one({"_id": cdn_host})
+        else:
+            async with self._memory_lock:
+                health = self._memory_cdn_health.get(cdn_host)
+                health = copy.deepcopy(health) if health is not None else None
+        if health is not None:
+            return health
+        return {
+            "_id": cdn_host,
+            "slow_strikes": 0,
+            "cooldown_until": 0.0,
+            "last_slow_at": None,
+            "last_success_at": None,
+        }
+
+    async def active_global_host_cooldowns(self, now=None):
+        """Return CDN hosts whose process-wide/database circuit breaker is open."""
+        now_epoch = float(now if now is not None else utcnow().timestamp())
+        if self.persistent:
+            await self._ensure_indexes()
+            return {
+                doc["_id"]
+                async for doc in self.cdn_health.find(
+                    {"cooldown_until": {"$gt": now_epoch}}, projection={"_id": 1}
+                )
+            }
+        async with self._memory_lock:
+            return {
+                host
+                for host, health in self._memory_cdn_health.items()
+                if float(health.get("cooldown_until", 0)) > now_epoch
+            }
+
+    async def session_cdn_hosts(self, session_id):
+        """Return the resolved CDN hosts currently known for one session."""
+        if self.persistent:
+            await self._ensure_indexes()
+            hosts = await self.files.distinct(
+                "cdn_host", {"session_id": session_id, "cdn_host": {"$ne": None}}
+            )
+        else:
+            async with self._memory_lock:
+                hosts = [
+                    doc.get("cdn_host")
+                    for doc in self._memory_files.values()
+                    if doc["session_id"] == session_id and doc.get("cdn_host")
+                ]
+        return {str(host).lower() for host in hosts if host}
+
+    async def record_cdn_slowdown(
+        self, cdn_host, base_cooldown_seconds, max_cooldown_seconds, now=None
+    ):
+        """Open a shared CDN circuit breaker with exponential backoff."""
+        cdn_host = str(cdn_host or "").lower()
+        if not cdn_host:
+            return None
+        now_epoch = float(now if now is not None else utcnow().timestamp())
+        base_seconds = max(1, int(base_cooldown_seconds))
+        max_seconds = max(base_seconds, int(max_cooldown_seconds))
+        async with self._cdn_health_lock:
+            current = await self.get_cdn_health(cdn_host)
+            strikes = max(0, int(current.get("slow_strikes", 0))) + 1
+            cooldown_seconds = base_seconds
+            for _ in range(strikes - 1):
+                if cooldown_seconds >= max_seconds:
+                    break
+                cooldown_seconds = min(max_seconds, cooldown_seconds * 2)
+            health = {
+                "_id": cdn_host,
+                "slow_strikes": strikes,
+                "cooldown_until": now_epoch + cooldown_seconds,
+                "cooldown_seconds": cooldown_seconds,
+                "last_slow_at": now_epoch,
+                "last_success_at": current.get("last_success_at"),
+                "updated_at": utcnow(),
+            }
+            if self.persistent:
+                await self._ensure_indexes()
+                await self.cdn_health.replace_one(
+                    {"_id": cdn_host}, health, upsert=True
+                )
+            else:
+                async with self._memory_lock:
+                    self._memory_cdn_health[cdn_host] = health
+            return copy.deepcopy(health)
+
+    async def record_cdn_success(self, cdn_host, now=None):
+        """Recover one adaptive level after a healthy completed download."""
+        cdn_host = str(cdn_host or "").lower()
+        if not cdn_host:
+            return None
+        now_epoch = float(now if now is not None else utcnow().timestamp())
+        async with self._cdn_health_lock:
+            current = await self.get_cdn_health(cdn_host)
+            strikes = max(0, int(current.get("slow_strikes", 0)) - 1)
+            health = {
+                "_id": cdn_host,
+                "slow_strikes": strikes,
+                "cooldown_until": 0.0,
+                "cooldown_seconds": 0,
+                "last_slow_at": current.get("last_slow_at"),
+                "last_success_at": now_epoch,
+                "updated_at": utcnow(),
+            }
+            if self.persistent:
+                await self._ensure_indexes()
+                await self.cdn_health.replace_one(
+                    {"_id": cdn_host}, health, upsert=True
+                )
+            else:
+                async with self._memory_lock:
+                    self._memory_cdn_health[cdn_host] = health
+            return copy.deepcopy(health)
 
     async def route_file_to_bottom(self, file_id, reason):
         """Route a resolving file behind the queue without marking a slow retry."""
@@ -593,6 +755,70 @@ class BunkrSessionStore:
                 return None
             doc.update(fields)
             return copy.deepcopy(doc)
+
+    async def park_file_for_cooldown(
+        self, file_id, reason, *, max_auto_defers=None
+    ):
+        """Return an active file to pending without requiring another queue item.
+
+        This is used when the only available CDN is cooling down. The file keeps
+        its stable download directory and queue position so aria2 can resume its
+        partial data after a freshly signed URL is obtained.
+        """
+        active_states = (FILE_RESOLVING, FILE_DOWNLOADING)
+        now = utcnow()
+        if self.persistent:
+            await self._ensure_indexes()
+            query = {"_id": file_id, "status": {"$in": list(active_states)}}
+            if max_auto_defers is not None:
+                query["auto_defer_count"] = {"$lt": int(max_auto_defers)}
+            updated = await self.files.find_one_and_update(
+                query,
+                {
+                    "$set": {
+                        "status": FILE_PENDING,
+                        "gid": None,
+                        "error": reason,
+                        "last_deferred_at": now,
+                        "last_deferred_reason": reason,
+                        "updated_at": now,
+                    },
+                    "$inc": {"defer_count": 1, "auto_defer_count": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated is not None:
+                await self.sessions.update_one(
+                    {"_id": updated["session_id"]},
+                    {"$set": {"updated_at": now}},
+                )
+            return updated
+
+        async with self._memory_lock:
+            file_doc = self._memory_files.get(file_id)
+            if file_doc is None or file_doc["status"] not in active_states:
+                return None
+            if (
+                max_auto_defers is not None
+                and file_doc.get("auto_defer_count", 0) >= max_auto_defers
+            ):
+                return None
+            file_doc.update(
+                {
+                    "status": FILE_PENDING,
+                    "gid": None,
+                    "error": reason,
+                    "defer_count": file_doc.get("defer_count", 0) + 1,
+                    "auto_defer_count": file_doc.get("auto_defer_count", 0) + 1,
+                    "last_deferred_at": now,
+                    "last_deferred_reason": reason,
+                    "updated_at": now,
+                }
+            )
+            session_doc = self._memory_sessions.get(file_doc["session_id"])
+            if session_doc is not None:
+                session_doc["updated_at"] = now
+            return copy.deepcopy(file_doc)
 
     async def defer_file_to_bottom(
         self,

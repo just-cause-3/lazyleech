@@ -16,9 +16,32 @@ class BunkrConnectionProfileTests(unittest.TestCase):
     def test_deferred_file_uses_conservative_profile(self):
         with (
             patch.object(leech, "BUNKR_CONNECTIONS", 4),
-            patch.object(leech, "BUNKR_RECOVERY_CONNECTIONS", 1),
+            patch.object(leech, "BUNKR_RECOVERY_CONNECTIONS", 2),
         ):
-            self.assertEqual(1, leech._bunkr_connection_count({"defer_count": 1}))
+            self.assertEqual(
+                2, leech._bunkr_connection_count({"auto_defer_count": 1})
+            )
+
+    def test_repeated_or_host_slowdown_uses_single_connection(self):
+        with (
+            patch.object(leech, "BUNKR_CONNECTIONS", 4),
+            patch.object(leech, "BUNKR_RECOVERY_CONNECTIONS", 2),
+        ):
+            self.assertEqual(
+                1,
+                leech._bunkr_connection_count(
+                    {"auto_defer_count": 0}, {"slow_strikes": 2}
+                ),
+            )
+
+    def test_manual_skip_does_not_reduce_connections(self):
+        with patch.object(leech, "BUNKR_CONNECTIONS", 4):
+            self.assertEqual(
+                4,
+                leech._bunkr_connection_count(
+                    {"defer_count": 1, "auto_defer_count": 0}
+                ),
+            )
 
     def test_session_download_directory_is_stable(self):
         first = leech._bunkr_download_dir(123, "abcdef123456", "abcdef123456:7")
