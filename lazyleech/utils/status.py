@@ -23,6 +23,10 @@ def update_upload_status(identifier, current, total, filename, chat_id):
             "chat_id": chat_id,
             "state": "Uploading",
         }
+    # A large file first enters the status board under its source name while it
+    # is being split. Replace that placeholder with the actual numbered part
+    # name as soon as Telegram starts receiving the part.
+    active_uploads[identifier]["filename"] = filename
     active_uploads[identifier]["current"] = current
     active_uploads[identifier]["total"] = total
     active_uploads[identifier]["state"] = "Uploading"

@@ -348,8 +348,10 @@ async def _upload_file(
 
                 async def _split_files():
                     splitted = await split_files(filepath, tempdir, force_document)
-                    for a, split in enumerate(splitted, 1):
-                        to_upload.append((split, filename + f" (part {a})"))
+                    for split in splitted:
+                        # Use the physical part name for the Telegram document,
+                        # caption, progress board, and final link summary.
+                        to_upload.append((split, os.path.basename(split)))
 
                 split_task = asyncio.create_task(_split_files())
             else:
