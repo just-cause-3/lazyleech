@@ -17,7 +17,6 @@
 import os
 import time
 import json
-import shlex
 import asyncio
 import tempfile
 import mimetypes
@@ -25,6 +24,7 @@ from decimal import Decimal
 from datetime import timedelta
 from pyrogram.errors.exceptions.bad_request_400 import UserNotParticipant
 from .. import app, ADMIN_CHATS
+from .file_split import split_binary_file
 
 # https://stackoverflow.com/a/49361727
 def format_bytes(size):
@@ -68,14 +68,7 @@ async def split_files(filename, destination_dir, no_ffmpeg=False):
                 times += 1
                 ss += Decimal(video_info['duration'])
             return files
-    args = ['split', '--verbose', '--numeric-suffixes=1', '--bytes=2097152000', '--suffix-length=2']
-    if ext:
-        args.append(f'--additional-suffix={ext}')
-    args.append(filename)
-    args.append(os.path.join(destination_dir, os.path.basename(filename)[-(248-len(ext)):] + ('-' if ext else '.') + 'part'))
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE)
-    stdout, _ = await proc.communicate()
-    return shlex.split(' '.join([i[14:] for i in stdout.decode().strip().split('\n')]))
+    return await asyncio.to_thread(split_binary_file, filename, destination_dir)
 
 video_duration_cache = dict()
 video_duration_lock = asyncio.Lock()

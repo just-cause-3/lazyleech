@@ -47,6 +47,7 @@ from .. import (
     SendAsZipFlag,
     preserved_logs,
 )
+from .file_split import TELEGRAM_SPLIT_SIZE
 from .misc import (
     calculate_eta,
     format_bytes,
@@ -288,7 +289,7 @@ async def _upload_file(
     user_thumbnail = os.path.join(str(user_id), "thumbnail.jpg")
     user_watermark = os.path.join(str(user_id), "watermark.jpg")
     user_watermarked_thumbnail = os.path.join(str(user_id), "watermarked_thumbnail.jpg")
-    file_has_big = os.path.getsize(filepath) > 2097152000
+    file_has_big = os.path.getsize(filepath) > TELEGRAM_SPLIT_SIZE
 
     import re
 
@@ -372,6 +373,26 @@ async def _upload_file(
                     if upload_identifier in stop_uploads:
                         return sent_files
                     await asyncio.sleep(1)
+            if split_task:
+                try:
+                    await split_task
+                except Exception as error:
+                    logging.exception(
+                        "Failed to split %s for Telegram upload", filepath
+                    )
+                    await message.reply_text(
+                        "Could not split "
+                        f"<code>{html.escape(str(filename))}</code> for upload: "
+                        f"{html.escape(str(error))}"
+                    )
+                    return sent_files
+                if not to_upload:
+                    await message.reply_text(
+                        "Could not split "
+                        f"<code>{html.escape(str(filename))}</code>: "
+                        "no parts were created."
+                    )
+                    return sent_files
             if upload_identifier in stop_uploads:
                 return sent_files
             for a, (filepath, filename) in enumerate(to_upload):
