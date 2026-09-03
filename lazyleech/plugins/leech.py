@@ -1844,8 +1844,11 @@ async def handle_leech(
     message_identifier = (reply.chat.id, reply.id)
     leech_statuses[message_identifier] = gid
 
-    # Trigger sending the initial unified status message when a task is added
-    await send_status_message(client, message)
+    # Create the unified status board when the first task starts, but do not
+    # force an edit for every later task in a burst. The periodic worker will
+    # include those tasks on its next configured refresh; /status still forces
+    # an immediate manual refresh.
+    await send_status_message(client, message, refresh_existing=False)
     await _delete_download_placeholder(reply)
 
     while torrent_info["status"] in ("active", "waiting", "paused"):

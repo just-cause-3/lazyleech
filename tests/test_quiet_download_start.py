@@ -71,6 +71,24 @@ class StatusMessageReuseTests(unittest.IsolatedAsyncioTestCase):
         existing.delete.assert_not_awaited()
         client.send_message.assert_not_awaited()
 
+    async def test_task_start_reuses_status_without_forcing_edit(self):
+        existing = SimpleNamespace(
+            text="old", reply_markup=None, edit_text=AsyncMock(), delete=AsyncMock()
+        )
+        status.status_messages[-1001] = existing
+        client = SimpleNamespace(send_message=AsyncMock())
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1001))
+
+        with patch.object(status, "update_status_message", AsyncMock()) as update:
+            returned = await status.send_status_message(
+                client, message, refresh_existing=False
+            )
+
+        self.assertIs(existing, returned)
+        update.assert_not_awaited()
+        existing.edit_text.assert_not_awaited()
+        client.send_message.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()
