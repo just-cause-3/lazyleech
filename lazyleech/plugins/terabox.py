@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import shutil
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
@@ -517,6 +518,21 @@ async def _fail_terabox_session(message, session_id, file_doc, error):
     )
 
 
+async def _skip_terabox_file(session_doc, file_doc, error):
+    """Persist one failed transfer and release its partial workspace."""
+    reason = str(error or "download failed")
+    await terabox_session_store.update_file_if_status(
+        file_doc["_id"],
+        (FILE_PENDING, FILE_RESOLVING, FILE_DOWNLOADING),
+        FILE_FAILED,
+        gid=None,
+        error=reason,
+    )
+    download_dir = _terabox_download_dir(session_doc, file_doc)
+    await asyncio.to_thread(shutil.rmtree, download_dir, True)
+    return reason
+
+
 def _intelligent_workspace_bytes(file_info):
     """Estimate peak bytes while a source is prepared for Telegram."""
     source_bytes = max(0, int(file_info.get("size_bytes") or 0))
@@ -874,8 +890,19 @@ def _chain_index_lines(chain, files_by_session):
     title = str(chain[0].get("name") or "").strip() or re.sub(
         r"\s*\(part \d+/\d+\)$", "", chain[0]["title"]
     )
+    skipped_count = sum(
+        1
+        for session_doc in chain
+        for file_doc in files_by_session.get(session_doc["_id"], [])
+        if file_doc.get("status") == FILE_FAILED
+    )
+    heading = (
+        f"TeraBox upload finished with {skipped_count} skipped file(s)"
+        if skipped_count
+        else "TeraBox upload complete"
+    )
     lines = [
-        f"<b>TeraBox upload complete</b> — <code>{chain_id}</code>",
+        f"<b>{heading}</b> — <code>{chain_id}</code>",
         f"📁 <b>{html.escape(title)}</b>/",
     ]
 
@@ -962,10 +989,19 @@ def _chain_index_lines(chain, files_by_session):
                         f"{upload_name} (link missing)"
                     )
             else:
-                lines.append(
-                    f"{prefix}{branch} {item_index}. "
-                    f"{html.escape(name)} (upload missing)"
-                )
+                if file_doc.get("status") == FILE_FAILED:
+                    reason = html.escape(
+                        str(file_doc.get("error") or "download failed")[:240]
+                    )
+                    lines.append(
+                        f"{prefix}{branch} {item_index}. "
+                        f"{html.escape(name)} (skipped: {reason})"
+                    )
+                else:
+                    lines.append(
+                        f"{prefix}{branch} {item_index}. "
+                        f"{html.escape(name)} (upload missing)"
+                    )
 
     render_directory(root)
     return lines
@@ -1008,10 +1044,13 @@ async def _maybe_complete_terabox_session(client, message, session_id):
         if not session_doc or session_doc["state"] != SESSION_RUNNING:
             return False
         counts = await terabox_session_store.counts(session_id)
-        if counts.get(FILE_UPLOADED, 0) != session_doc["total_files"]:
+        finished_files = counts.get(FILE_UPLOADED, 0) + counts.get(FILE_FAILED, 0)
+        if finished_files != session_doc["total_files"]:
             return False
         completed = await terabox_session_store.set_state(
-            session_id, SESSION_COMPLETED
+            session_id,
+            SESSION_COMPLETED,
+            skipped_files=counts.get(FILE_FAILED, 0),
         )
         next_session = await terabox_session_store.activate_next_chain_part(
             session_id
@@ -1067,6 +1106,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
             counts = await terabox_session_store.counts(session_id)
             queued_or_uploaded = (
                 counts.get(FILE_DOWNLOADED, 0) + counts.get(FILE_UPLOADED, 0)
+                + counts.get(FILE_FAILED, 0)
             )
             if queued_or_uploaded != session_doc["total_files"]:
                 await _fail_terabox_session(
@@ -1191,16 +1231,21 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 suppress_upload_summary=True,
                 max_connections=max_connections,
                 segmented_total_length=segmented_total_length,
+                suppress_download_errors=True,
             )
             if result != "complete":
                 current_session = await terabox_session_store.get_session(session_id)
                 if not current_session or current_session["state"] != SESSION_RUNNING:
                     return
+                if result not in {"removed", "deferred"}:
+                    await _skip_terabox_file(
+                        current_session,
+                        file_doc,
+                        result or "download failed",
+                    )
+                    continue
                 await _fail_terabox_session(
-                    message,
-                    session_id,
-                    file_doc,
-                    result or "download failed",
+                    message, session_id, file_doc, result
                 )
                 return
         except asyncio.CancelledError:
@@ -1883,6 +1928,7 @@ async def terabox_session_cmd(client, message):
         f"{session_doc['total_files']}\n"
         f"<b>Uploaded:</b> {counts.get(FILE_UPLOADED, 0)}/"
         f"{session_doc['total_files']}\n"
+        f"<b>Skipped:</b> {counts.get(FILE_FAILED, 0)}\n"
         f"<b>Part size:</b> {_human_size(session_doc['part_bytes'])}"
     )
 

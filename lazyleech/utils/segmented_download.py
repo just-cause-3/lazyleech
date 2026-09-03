@@ -218,21 +218,62 @@ class _SegmentedDownload:
                     ) as response:
                         content_range = response.headers.get("Content-Range", "")
                         match = _CONTENT_RANGE_RE.fullmatch(content_range.strip())
-                        if response.status != 206 or not match:
+                        # Some TeraBox batch responses ignore Range for small
+                        # files and return the complete body with HTTP 200.  It
+                        # is safe to accept that only when this task consists
+                        # of one range covering the complete known file and
+                        # the declared body length is an exact match.  Never
+                        # treat HTTP 200 as a segment of a larger download.
+                        content_encoding = response.headers.get(
+                            "Content-Encoding", ""
+                        ).strip().lower()
+                        try:
+                            content_length = int(
+                                response.headers.get("Content-Length", "")
+                            )
+                        except (TypeError, ValueError):
+                            content_length = -1
+                        whole_body_response = (
+                            response.status == 200
+                            and not content_range.strip()
+                            and start == 0
+                            and end == self.total_length - 1
+                            and content_length == self.total_length
+                            and content_encoding in {"", "identity"}
+                        )
+                        if response.status == 206 and match:
+                            response_start, response_end, response_total = map(
+                                int, match.groups()
+                            )
+                            if (
+                                response_start != current
+                                or response_end != end
+                                or response_total != self.total_length
+                            ):
+                                raise IOError(
+                                    "Range server returned bytes outside the requested segment"
+                                )
+                        elif whole_body_response:
+                            # If a previous whole-body attempt disconnected,
+                            # the next HTTP 200 starts again at byte zero. Undo
+                            # its partial accounting and safely overwrite it.
+                            previously_written = current - start
+                            if previously_written:
+                                self.completed_length = max(
+                                    0, self.completed_length - previously_written
+                                )
+                                self._last_sample_bytes = min(
+                                    self._last_sample_bytes, self.completed_length
+                                )
+                                self._last_sample_at = time.monotonic()
+                                self.download_speed = 0
+                                current = start
+                                output.seek(start)
+                        else:
                             raise IOError(
                                 "Range server returned HTTP "
-                                f"{response.status} without a valid Content-Range"
-                            )
-                        response_start, response_end, response_total = map(
-                            int, match.groups()
-                        )
-                        if (
-                            response_start != current
-                            or response_end != end
-                            or response_total != self.total_length
-                        ):
-                            raise IOError(
-                                "Range server returned bytes outside the requested segment"
+                                f"{response.status} without a valid Content-Range "
+                                "or exact whole-file response"
                             )
                         before = current
                         async for block in response.content.iter_chunked(_READ_SIZE):

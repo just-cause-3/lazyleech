@@ -55,6 +55,46 @@ class FakeRangeSession:
         )
 
 
+class FakeWholeBodyResponse(FakeRangeResponse):
+    status = 200
+
+    def __init__(self, data, tracker, *, declared_length=None, body=None):
+        self.headers = {
+            "Content-Length": str(
+                len(data) if declared_length is None else declared_length
+            )
+        }
+        self.content = FakeContent(data if body is None else body, tracker)
+        self.tracker = tracker
+
+
+class WholeBodySession(FakeRangeSession):
+    def get(self, _url, *, headers, **_kwargs):
+        value = headers["Range"].removeprefix("bytes=")
+        start, end = map(int, value.split("-", 1))
+        self.ranges.append((start, end))
+        return FakeWholeBodyResponse(self.data, self.tracker)
+
+
+class FlakyWholeBodySession(WholeBodySession):
+    def get(self, _url, *, headers, **_kwargs):
+        value = headers["Range"].removeprefix("bytes=")
+        start, end = map(int, value.split("-", 1))
+        self.ranges.append((start, end))
+        body = self.data[: len(self.data) // 2] if len(self.ranges) == 1 else self.data
+        return FakeWholeBodyResponse(self.data, self.tracker, body=body)
+
+
+class InvalidWholeBodySession(WholeBodySession):
+    def get(self, _url, *, headers, **_kwargs):
+        value = headers["Range"].removeprefix("bytes=")
+        start, end = map(int, value.split("-", 1))
+        self.ranges.append((start, end))
+        return FakeWholeBodyResponse(
+            self.data, self.tracker, declared_length=len(self.data) + 1
+        )
+
+
 class FlakyRangeSession(FakeRangeSession):
     def get(self, _url, *, headers, **_kwargs):
         value = headers["Range"].removeprefix("bytes=")
@@ -126,6 +166,88 @@ class SegmentedDownloadTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             status = await segmented_download.segmented_tell_status(gid)
             self.assertEqual("removed", status["status"])
+
+    async def test_accepts_exact_whole_body_response_for_small_file(self):
+        data = bytes(range(251)) * 237 + b"x" * 45
+        self.assertEqual(59532, len(data))
+        session = WholeBodySession(data)
+        with tempfile.TemporaryDirectory() as directory:
+            gid = await segmented_download.add_segmented_download(
+                session,
+                "123abc0000000004",
+                "https://storage.example/file",
+                "small.zip",
+                total_length=len(data),
+                connections=16,
+                download_dir=directory,
+            )
+            for _attempt in range(100):
+                status = await segmented_download.segmented_tell_status(gid)
+                if status["status"] not in {"active", "waiting"}:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual("complete", status["status"])
+            self.assertEqual(str(len(data)), status["completedLength"])
+            self.assertEqual([(0, len(data) - 1)], session.ranges)
+            with open(os.path.join(directory, "small.zip"), "rb") as output:
+                self.assertEqual(data, output.read())
+
+    async def test_whole_body_retry_restarts_from_zero(self):
+        data = bytes(range(251)) * 17
+        session = FlakyWholeBodySession(data)
+        real_sleep = asyncio.sleep
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(segmented_download.asyncio, "sleep", return_value=None),
+        ):
+            gid = await segmented_download.add_segmented_download(
+                session,
+                "123abc0000000005",
+                "https://storage.example/file",
+                "small.zip",
+                total_length=len(data),
+                connections=16,
+                download_dir=directory,
+            )
+            for _attempt in range(100):
+                status = await segmented_download.segmented_tell_status(gid)
+                if status["status"] not in {"active", "waiting"}:
+                    break
+                await real_sleep(0)
+
+            self.assertEqual("complete", status["status"])
+            self.assertEqual(str(len(data)), status["completedLength"])
+            self.assertEqual(2, len(session.ranges))
+            self.assertGreater(session.ranges[1][0], 0)
+            with open(os.path.join(directory, "small.zip"), "rb") as output:
+                self.assertEqual(data, output.read())
+
+    async def test_rejects_whole_body_response_with_wrong_length(self):
+        data = b"small body"
+        session = InvalidWholeBodySession(data)
+        real_sleep = asyncio.sleep
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(segmented_download, "_MAX_RETRIES", 0),
+        ):
+            gid = await segmented_download.add_segmented_download(
+                session,
+                "123abc0000000006",
+                "https://storage.example/file",
+                "small.zip",
+                total_length=len(data),
+                connections=16,
+                download_dir=directory,
+            )
+            for _attempt in range(100):
+                status = await segmented_download.segmented_tell_status(gid)
+                if status["status"] not in {"active", "waiting"}:
+                    break
+                await real_sleep(0)
+
+            self.assertEqual("error", status["status"])
+            self.assertIn("exact whole-file response", status["errorMessage"])
 
     async def test_short_response_retries_from_exact_written_offset(self):
         data = bytes(range(251)) * 17

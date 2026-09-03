@@ -1773,6 +1773,7 @@ async def initiate_directdl(
     on_uploaded=None,
     suppress_upload_summary=False,
     segmented_total_length=None,
+    suppress_download_errors=False,
 ):
     user_id = message.from_user.id
     reply = _new_download_reference(message)
@@ -1803,12 +1804,14 @@ async def initiate_directdl(
             )
         gid = await asyncio.wait_for(add_download, MAGNET_TIMEOUT)
     except Aria2Error as ex:
-        await message.reply_text(
-            f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
-        )
+        if not suppress_download_errors:
+            await message.reply_text(
+                f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
+            )
         return f"Aria2 {ex.error_code}: {ex.error_message}"
     except asyncio.TimeoutError:
-        await message.reply_text("Connection timed out")
+        if not suppress_download_errors:
+            await message.reply_text("Connection timed out")
         return "Connection timed out"
     else:
         if on_gid is not None:
@@ -1833,6 +1836,7 @@ async def initiate_directdl(
             on_removed=on_removed,
             on_uploaded=on_uploaded,
             suppress_upload_summary=suppress_upload_summary,
+            suppress_download_errors=suppress_download_errors,
         )
 
 
@@ -1852,6 +1856,7 @@ async def handle_leech(
     on_removed=None,
     on_uploaded=None,
     suppress_upload_summary=False,
+    suppress_download_errors=False,
 ):
     torrent_info = await aria2_tell_status(session, gid)
     message_identifier = (reply.chat.id, reply.id)
@@ -1894,8 +1899,10 @@ async def handle_leech(
             text += (
                 "\n\nThis error may have been caused due to the torrent being too slow"
             )
-        await message.reply_text(text)
-        return "error"
+        if not suppress_download_errors:
+            await message.reply_text(text)
+            return "error"
+        return f"Aria2 {error_code}: {error_message}"
     elif torrent_info["status"] == "removed":
         leech_statuses.pop(message_identifier, None)
         if on_removed is not None and await on_removed():

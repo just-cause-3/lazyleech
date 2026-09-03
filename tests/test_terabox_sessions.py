@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import lazyleech.plugins.terabox as terabox
 from lazyleech.utils.terabox_sessions import (
     FILE_DOWNLOADED,
+    FILE_FAILED,
     FILE_PENDING,
     FILE_UPLOADED,
     SESSION_COMPLETED,
@@ -270,6 +271,31 @@ class TeraboxSizeSplitTests(unittest.TestCase):
 
         self.assertEqual(1, text.count("Shared Folder"))
         self.assertIn("one.zip", text)
+
+    def test_final_index_reports_skipped_file_and_reason(self):
+        chain = [
+            {
+                "chain_id": "abc123",
+                "title": "Share (part 1/1)",
+                "_id": "s1",
+            }
+        ]
+        files = {
+            "s1": [
+                {
+                    "filename": "tiny.zip",
+                    "status": FILE_FAILED,
+                    "error": "HTTP 200 did not match the expected body size",
+                    "telegram_files": [],
+                }
+            ]
+        }
+
+        text = "\n".join(terabox._chain_index_lines(chain, files))
+
+        self.assertIn("finished with 1 skipped file(s)", text)
+        self.assertIn("tiny.zip", text)
+        self.assertIn("skipped: HTTP 200", text)
 
 
 class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
@@ -743,6 +769,95 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(SESSION_COMPLETED, completed["state"])
             self.assertEqual(SESSION_RUNNING, activated["state"])
             self.assertEqual([second["_id"]], started)
+
+    async def test_runner_skips_failed_download_and_finishes_after_other_uploads(self):
+        store = TeraboxSessionStore(db_url="")
+        source_url = "https://terabox.com/s/1share"
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            title="Folder (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": source_url,
+                    "filename": "tiny.zip",
+                    "relative_path": "tiny.zip",
+                    "source_position": 1,
+                    "size_bytes": 59532,
+                },
+                {
+                    "page_url": source_url,
+                    "filename": "good.zip",
+                    "relative_path": "good.zip",
+                    "source_position": 2,
+                    "size_bytes": 100,
+                },
+            ],
+            session_fields={
+                "chain_id": "skipchain",
+                "part_index": 1,
+                "total_parts": 1,
+                "part_bytes": 59632,
+            },
+        )
+        resolved_files = [
+            {
+                "name": "tiny.zip",
+                "path": "tiny.zip",
+                "size": 59532,
+                "normal_dlink": "https://cdn.test/tiny.zip",
+            },
+            {
+                "name": "good.zip",
+                "path": "good.zip",
+                "size": 100,
+                "normal_dlink": "https://cdn.test/good.zip",
+            },
+        ]
+        message = SimpleNamespace(reply_text=AsyncMock())
+        upload_callbacks = []
+        calls = 0
+
+        async def download(*_args, **kwargs):
+            nonlocal calls
+            calls += 1
+            self.assertTrue(kwargs["suppress_download_errors"])
+            if calls == 1:
+                self.assertTrue(await kwargs["on_gid"]("failedgid"))
+                return "Aria2 24: range server ignored request"
+            self.assertTrue(await kwargs["on_gid"]("goodgid"))
+            await kwargs["on_downloaded"]()
+            upload_callbacks.append(kwargs["on_uploaded"])
+            return "complete"
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(terabox, "initiate_directdl", side_effect=download),
+        ):
+            await terabox._run_terabox_session(
+                object(), message, session["_id"], resolved=(None, resolved_files)
+            )
+            files = await store.list_files(session["_id"])
+            self.assertEqual(FILE_FAILED, files[0]["status"])
+            self.assertIn("ignored request", files[0]["error"])
+            self.assertEqual(FILE_DOWNLOADED, files[1]["status"])
+
+            await upload_callbacks[0]([
+                ("good.zip", "https://t.me/c/1/10")
+            ], None)
+
+        completed = await store.get_session(session["_id"])
+        self.assertEqual(SESSION_COMPLETED, completed["state"])
+        self.assertEqual(1, completed["skipped_files"])
+        final_text = "\n".join(
+            call.args[0] for call in message.reply_text.await_args_list
+        )
+        self.assertIn("finished with 1 skipped file(s)", final_text)
+        self.assertIn("tiny.zip", final_text)
 
     async def test_continue_redownloads_queued_but_not_uploaded_files(self):
         store = TeraboxSessionStore(db_url="")
