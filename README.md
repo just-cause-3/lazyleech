@@ -60,6 +60,11 @@ test 0004.mkv
 # What is this repo about?
 This is a telegram bot writen with pyrogram for leeching files on the internet to Telegram.
 
+On startup, the bot removes abandoned runtime download, session-download, and
+temporary split directories left by a previous process. Telegram thumbnails,
+watermarks, Pyrogram sessions, and database records are preserved. Set
+`CLEAR_DOWNLOADS_ON_STARTUP=0` to disable this cleanup.
+
 [Bot Demo](https://t.me/joinchat/HC7YmklXMSRPH3N2)
 
 # Features
@@ -162,12 +167,14 @@ Each session contains as many whole files as fit under the requested cumulative
 size; a single oversized file receives its own session. `/teraintelligent URL
 40GB` treats the size as available workspace instead: files above Telegram's
 upload boundary are budgeted at twice their source size because the original
-and complete set of numbered split parts coexist temporarily. Part 1 starts
-immediately, and each following part starts automatically only after all files
-in the previous part have uploaded successfully and their temporary files have
-been removed. If even one source-plus-splits peak cannot fit the requested
-workspace, the command reports the minimum safe limit and creates no partial
-chain. Large plans are displayed ten sessions per page with inline navigation.
+and complete set of numbered split parts coexist temporarily. Once every split
+part has been created successfully and queued, the original source is removed;
+each accepted part is then removed immediately after its own upload succeeds.
+Part 1 starts immediately, and each following part starts automatically only
+after all files in the previous part have uploaded successfully. If even one
+source-plus-splits peak cannot fit the requested workspace, the command reports
+the minimum safe limit and creates no partial chain. Large plans are displayed
+ten sessions per page with inline navigation.
 
 Per-file `Files:` summaries are suppressed for these session chains. After the
 entire chain uploads, the bot sends one folder-style, numbered index containing

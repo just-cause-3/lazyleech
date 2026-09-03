@@ -496,6 +496,16 @@ async def _upload_file(
             if upload_identifier in stop_uploads:
                 return UploadResult(sent_files, complete=False)
             if file_has_big:
+                # Every numbered part now exists and is ready to upload. Release
+                # the source before starting Telegram transfers so only the
+                # staged parts occupy workspace while they are queued/uploading.
+                # A failed split never reaches this point and retains its source.
+                if cleanup_source and download_root:
+                    await _remove_source_file(
+                        source_filepath,
+                        download_root,
+                        lifecycle="successfully split and queued",
+                    )
                 # The placeholder represents the split operation. Each part
                 # gets its own status/cancel ID once all parts are ready.
                 remove_upload_status(upload_identifier)
@@ -519,8 +529,6 @@ async def _upload_file(
                     len(sent_files) == len(to_upload)
                     and all(link for _, link in sent_files)
                 )
-                if upload_complete and cleanup_source and download_root:
-                    await _remove_completed_source(source_filepath, download_root)
                 return UploadResult(sent_files, complete=upload_complete)
             for a, (filepath, filename) in enumerate(to_upload):
                 while True:
@@ -640,7 +648,11 @@ async def _upload_file(
             and all(link for _, link in sent_files)
         )
         if upload_complete and cleanup_source and download_root:
-            await _remove_completed_source(source_filepath, download_root)
+            await _remove_source_file(
+                source_filepath,
+                download_root,
+                lifecycle="successfully uploaded",
+            )
         return UploadResult(sent_files, complete=upload_complete)
     finally:
         remove_upload_status(upload_identifier)
@@ -651,12 +663,12 @@ async def _upload_file(
             upload_waits.pop(upload_identifier, None)
 
 
-async def _remove_completed_source(filepath, download_root):
+async def _remove_source_file(filepath, download_root, *, lifecycle):
     removed = await asyncio.to_thread(remove_uploaded_source, filepath, download_root)
     if removed:
-        logging.info("Removed successfully uploaded source file: %s", filepath)
+        logging.info("Removed %s source file: %s", lifecycle, filepath)
     else:
-        logging.warning("Could not remove successfully uploaded source file: %s", filepath)
+        logging.warning("Could not remove %s source file: %s", lifecycle, filepath)
     return removed
 
 
@@ -710,8 +722,8 @@ async def _upload_split_part(
         if not response:
             return None
 
-        # The original source remains available until every part succeeds, but
-        # a successfully accepted temporary part no longer needs disk space.
+        # A successfully accepted temporary part no longer needs disk space.
+        # The source was already removed after the full split was staged.
         removed = await asyncio.to_thread(remove_uploaded_source, filepath, tempdir)
         if not removed:
             logging.warning("Could not remove uploaded split part: %s", filepath)

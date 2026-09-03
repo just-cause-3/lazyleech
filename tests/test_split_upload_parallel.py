@@ -116,6 +116,111 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
             remove_tree.assert_not_called()
             self.assertTrue(download_root.exists())
 
+    async def test_split_source_is_removed_before_parts_start_uploading(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            root = Path(workdir) / "download-root"
+            root.mkdir()
+            source = root / "archive.zip"
+            source.write_bytes(b"source")
+            user_dir = Path(workdir) / "user"
+            user_dir.mkdir()
+            message = SimpleNamespace(
+                from_user=SimpleNamespace(id=user_dir),
+                chat=SimpleNamespace(id=-1001),
+                reply_text=AsyncMock(),
+            )
+            reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
+
+            async def fake_split(_source, destination, _force_document):
+                parts = []
+                for number in (1, 2):
+                    part = Path(destination) / f"archive.zip.{number:04d}"
+                    part.write_bytes(b"part")
+                    parts.append(str(part))
+                return parts
+
+            async def assert_source_released(
+                _client,
+                _message,
+                _worker_identifier,
+                _user_id,
+                parts,
+                _thumbnail,
+                _tempdir,
+            ):
+                self.assertFalse(source.exists())
+                self.assertEqual(2, len(parts))
+                return [
+                    (name, f"https://t.me/c/1/{index}")
+                    for index, (_path, name) in enumerate(parts, 1)
+                ]
+
+            with (
+                patch.object(upload_worker, "TELEGRAM_SPLIT_SIZE", 1),
+                patch.object(upload_worker, "PROGRESS_UPDATE_DELAY", 0),
+                patch.object(upload_worker, "split_files", side_effect=fake_split),
+                patch.object(
+                    upload_worker,
+                    "_upload_split_parts",
+                    side_effect=assert_source_released,
+                ),
+            ):
+                result = await upload_worker._upload_file(
+                    object(),
+                    message,
+                    reply,
+                    source.name,
+                    str(source),
+                    True,
+                    None,
+                    1,
+                    cleanup_source=True,
+                    download_root=str(root),
+                )
+
+            self.assertTrue(result.complete)
+            self.assertFalse(source.exists())
+
+    async def test_failed_split_retains_its_source(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            root = Path(workdir) / "download-root"
+            root.mkdir()
+            source = root / "archive.zip"
+            source.write_bytes(b"source")
+            user_dir = Path(workdir) / "user"
+            user_dir.mkdir()
+            message = SimpleNamespace(
+                from_user=SimpleNamespace(id=user_dir),
+                chat=SimpleNamespace(id=-1001),
+                reply_text=AsyncMock(),
+            )
+            reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
+
+            with (
+                patch.object(upload_worker, "TELEGRAM_SPLIT_SIZE", 1),
+                patch.object(upload_worker, "PROGRESS_UPDATE_DELAY", 0),
+                patch.object(
+                    upload_worker,
+                    "split_files",
+                    AsyncMock(side_effect=OSError("No space left on device")),
+                ),
+            ):
+                result = await upload_worker._upload_file(
+                    object(),
+                    message,
+                    reply,
+                    source.name,
+                    str(source),
+                    True,
+                    None,
+                    1,
+                    cleanup_source=True,
+                    download_root=str(root),
+                )
+
+            self.assertFalse(result.complete)
+            self.assertTrue(source.exists())
+
     @staticmethod
     async def _return_result(result):
         return result

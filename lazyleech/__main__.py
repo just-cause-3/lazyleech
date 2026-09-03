@@ -23,12 +23,29 @@ from pyrogram import idle
 
 from . import ADMIN_CHATS, app, preserved_logs, session
 from .utils.bunkr_sessions import bunkr_session_store
+from .utils.file_cleanup import clear_abandoned_download_directories
 from .utils.status import status_worker
 from .utils.terabox_sessions import terabox_session_store
 from .utils.upload_worker import upload_worker
 
 
 async def main():
+    cleanup_enabled = os.environ.get(
+        "CLEAR_DOWNLOADS_ON_STARTUP", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if cleanup_enabled:
+        working_directory = os.getcwd()
+        removed = await asyncio.to_thread(
+            clear_abandoned_download_directories,
+            working_directory,
+            os.path.join(working_directory, "downloads"),
+        )
+        logging.info(
+            "Startup download cleanup removed %d abandoned job director%s",
+            len(removed),
+            "y" if len(removed) == 1 else "ies",
+        )
+
     async def _autorestart_worker():
         while True:
             try:
