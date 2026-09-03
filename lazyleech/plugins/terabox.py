@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 from natsort import natsorted
@@ -28,6 +29,13 @@ from ..utils.terabox import (
     TeraboxError,
     TeraboxResolver,
     extract_surl,
+)
+from ..utils.terabox_account import (
+    TeraboxAccountClient,
+    account_source_url,
+    is_account_directory,
+    normalize_account_path,
+    safe_archive_name,
 )
 from ..utils.terabox_config import TeraboxConfigStore
 from ..utils.terabox_sessions import (
@@ -59,6 +67,32 @@ terabox_tasks = set()
 terabox_chain_locks = {}
 TERABOX_CHAIN_PAGE_BYTES = 3300
 TERABOX_PLAN_PAGE_SIZE = 10
+
+
+def _bounded_env_int(name, default, minimum=1, maximum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    value = max(int(minimum), value)
+    return min(value, int(maximum)) if maximum is not None else value
+
+
+TERABOX_BATCH_MAX_ITEMS = _bounded_env_int(
+    "TERABOX_BATCH_MAX_ITEMS", 100, maximum=500
+)
+TERABOX_BATCH_ARCHIVE_OVERHEAD = (
+    _bounded_env_int("TERABOX_BATCH_ARCHIVE_OVERHEAD_MB", 8) * 1024 * 1024
+)
+TERABOX_BATCH_MAX_DIRECTORIES = _bounded_env_int(
+    "TERABOX_BATCH_MAX_DIRECTORIES", 5000
+)
+TERABOX_BATCH_MAX_SOURCE_FILES = _bounded_env_int(
+    "TERABOX_BATCH_MAX_SOURCE_FILES", 100000
+)
+TERABOX_BATCH_CONNECTIONS = _bounded_env_int(
+    "TERABOX_BATCH_CONNECTIONS", 8, maximum=16
+)
 
 
 def _reported_size_bytes(value):
@@ -502,6 +536,201 @@ def _intelligent_limit_violations(files, max_bytes):
     ]
 
 
+def _batch_archive_size(source_bytes):
+    """Conservatively estimate the generated ZIP size for workspace planning."""
+    return max(0, int(source_bytes or 0)) + TERABOX_BATCH_ARCHIVE_OVERHEAD
+
+
+def _batch_archive_workspace(source_bytes):
+    return _intelligent_workspace_bytes(
+        {"size_bytes": _batch_archive_size(source_bytes)}
+    )
+
+
+def _account_file_size(item):
+    try:
+        return max(0, int(item.get("size") or 0))
+    except (TypeError, ValueError) as error:
+        raise TeraboxError(
+            f"TeraBox returned an invalid size for "
+            f"{item.get('server_filename') or item.get('path') or 'a file'}"
+        ) from error
+
+
+def _partition_account_batch_items(items, max_bytes):
+    """Group file IDs so each generated archive fits the workspace budget."""
+    groups = []
+    current = []
+    current_bytes = 0
+    for item in items:
+        item_bytes = _account_file_size(item)
+        required = _batch_archive_workspace(item_bytes)
+        if required > int(max_bytes):
+            name = item.get("server_filename") or item.get("path") or "file"
+            raise TeraboxError(
+                f"{name} cannot fit the requested workspace. It needs about "
+                f"{_human_size(required)} for its batch ZIP and Telegram parts"
+            )
+        candidate_bytes = current_bytes + item_bytes
+        if current and (
+            len(current) >= TERABOX_BATCH_MAX_ITEMS
+            or _batch_archive_workspace(candidate_bytes) > int(max_bytes)
+        ):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += item_bytes
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _account_archive_relative_path(root_path, directory_path, archive_name):
+    root = PurePosixPath(normalize_account_path(root_path))
+    directory = PurePosixPath(normalize_account_path(directory_path))
+    anchor = root.parent if str(root) != "/" else root
+    try:
+        relative_directory = directory.relative_to(anchor)
+    except ValueError as error:
+        raise TeraboxError("TeraBox returned a folder outside the requested root") from error
+    parent = relative_directory.parent
+    return str(parent / archive_name) if str(parent) != "." else archive_name
+
+
+def _account_batch_archive(
+    *,
+    root_path,
+    directory_path,
+    archive_name,
+    fs_ids,
+    source_files,
+    batch_kind,
+):
+    source_bytes = sum(_account_file_size(item) for item in source_files)
+    filename = safe_archive_name(archive_name)
+    normalized_ids = []
+    for value in fs_ids:
+        try:
+            normalized_ids.append(int(value))
+        except (TypeError, ValueError) as error:
+            raise TeraboxError(
+                f"TeraBox did not return a file ID for {filename}"
+            ) from error
+    if not normalized_ids:
+        raise TeraboxError(f"TeraBox returned no batch items for {filename}")
+    return {
+        "page_url": account_source_url(root_path),
+        "filename": filename,
+        "relative_path": _account_archive_relative_path(
+            root_path, directory_path, filename
+        ),
+        "size_bytes": _batch_archive_size(source_bytes),
+        "batch_source_bytes": source_bytes,
+        "batch_source_count": len(source_files),
+        "batch_fs_ids": normalized_ids,
+        "batch_kind": batch_kind,
+        "account_directory": normalize_account_path(directory_path),
+    }
+
+
+async def _scan_account_batch_archives(account, root_path, max_bytes):
+    """Create non-overlapping batch ZIP jobs for a recursive account tree."""
+    root_path = normalize_account_path(root_path)
+    root_entry = await account.get_directory(root_path)
+    root_name = (
+        str(root_entry.get("server_filename") or "").strip()
+        or (PurePosixPath(root_path).name if root_path != "/" else "TeraBox Root")
+    )
+    archives = []
+    source_file_count = 0
+    source_bytes = 0
+    visited = set()
+
+    async def visit(directory_entry):
+        nonlocal source_file_count, source_bytes
+        directory_path = normalize_account_path(directory_entry.get("path") or "/")
+        if directory_path in visited:
+            raise TeraboxError(f"TeraBox returned a directory cycle at {directory_path}")
+        visited.add(directory_path)
+        if len(visited) > TERABOX_BATCH_MAX_DIRECTORIES:
+            raise TeraboxError(
+                "The account folder exceeds the recursive directory safety limit"
+            )
+
+        children = natsorted(
+            await account.list_directory(directory_path),
+            key=lambda item: str(item.get("server_filename") or item.get("path") or ""),
+        )
+        directories = [item for item in children if is_account_directory(item)]
+        files = [item for item in children if not is_account_directory(item)]
+        source_file_count += len(files)
+        source_bytes += sum(_account_file_size(item) for item in files)
+        if source_file_count > TERABOX_BATCH_MAX_SOURCE_FILES:
+            raise TeraboxError(
+                "The account folder exceeds the recursive source-file safety limit"
+            )
+
+        directory_name = (
+            str(directory_entry.get("server_filename") or "").strip()
+            or PurePosixPath(directory_path).name
+            or "TeraBox Root"
+        )
+        direct_bytes = sum(_account_file_size(item) for item in files)
+        directory_id = directory_entry.get("fs_id")
+
+        if files and not directories and directory_id is not None and (
+            _batch_archive_workspace(direct_bytes) <= int(max_bytes)
+        ):
+            archives.append(
+                _account_batch_archive(
+                    root_path=root_path,
+                    directory_path=directory_path,
+                    archive_name=directory_name,
+                    fs_ids=[directory_id],
+                    source_files=files,
+                    batch_kind="leaf_folder",
+                )
+            )
+        elif files:
+            file_groups = _partition_account_batch_items(files, max_bytes)
+            for index, group in enumerate(file_groups, 1):
+                if not directories:
+                    stem = directory_name
+                    kind = "leaf_files"
+                else:
+                    stem = f"{directory_name}.files"
+                    kind = "direct_files"
+                if len(file_groups) > 1:
+                    stem += f".part{index:03d}"
+                archives.append(
+                    _account_batch_archive(
+                        root_path=root_path,
+                        directory_path=directory_path,
+                        archive_name=stem,
+                        fs_ids=[item.get("fs_id") for item in group],
+                        source_files=group,
+                        batch_kind=kind,
+                    )
+                )
+
+        for child in directories:
+            await visit(child)
+
+    await visit(root_entry)
+    if not archives:
+        raise TeraboxError("No files were found below that TeraBox account folder")
+    for position, archive in enumerate(archives, 1):
+        archive["source_position"] = position
+    return {
+        "root_path": root_path,
+        "name": root_name,
+        "archives": archives,
+        "source_file_count": source_file_count,
+        "source_bytes": source_bytes,
+    }
+
+
 def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=True):
     """Render one bounded page of a newly created split-chain plan."""
     total_parts = len(session_docs)
@@ -511,13 +740,24 @@ def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=Tru
     page = min(max(1, int(requested_page)), total_pages)
     start = (page - 1) * TERABOX_PLAN_PAGE_SIZE
     visible = session_docs[start : start + TERABOX_PLAN_PAGE_SIZE]
-    intelligent = chain_doc.get("planning_mode") == "intelligent_workspace"
+    planning_mode = chain_doc.get("planning_mode")
+    account_batch = planning_mode == "account_batch_workspace"
+    intelligent = planning_mode in {
+        "intelligent_workspace",
+        "account_batch_workspace",
+    }
     limit_label = "Workspace" if intelligent else "Source"
+    file_summary = f"<b>Files:</b> {int(chain_doc.get('total_files') or 0)}"
+    if account_batch:
+        file_summary = (
+            f"<b>Source files:</b> "
+            f"{int(chain_doc.get('total_source_files') or 0)} | "
+            f"<b>Batch archives:</b> {int(chain_doc.get('total_files') or 0)}"
+        )
     lines = [
         f"<b>Name:</b> {html.escape(str(chain_doc.get('name') or 'TeraBox'))}",
         f"<b>TeraBox chain:</b> <code>{chain_doc['_id']}</code>",
-        f"<b>Files:</b> {int(chain_doc.get('total_files') or 0)} | "
-        f"<b>{limit_label} limit:</b> "
+        f"{file_summary} | <b>{limit_label} limit:</b> "
         f"{_human_size(int(chain_doc.get('max_bytes') or 0))}",
         f"<b>Parts:</b> {total_parts} (automatic, sequential)",
         f"<b>Page:</b> {page}/{total_pages}",
@@ -538,17 +778,25 @@ def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=Tru
                 f"{_human_size(int(session_doc.get('workspace_bytes') or 0))} "
                 "peak workspace"
             )
+        item_label = "archive(s)" if account_batch else "file(s)"
+        source_count = ""
+        if account_batch:
+            source_count = (
+                f", {int(session_doc.get('source_file_count') or 0)} source file(s)"
+            )
         lines.append(
             f"<b>Part {session_doc.get('part_index')}/{total_parts}</b> - "
-            f"{int(session_doc.get('total_files') or 0)} file(s), {size_text} - "
-            f"<code>{session_doc['_id']}</code> ({html.escape(state_text)})"
+            f"{int(session_doc.get('total_files') or 0)} {item_label}{source_count}, "
+            f"{size_text} - <code>{session_doc['_id']}</code> "
+            f"({html.escape(state_text)})"
         )
     if intelligent:
         lines.extend(
             [
                 "",
                 f"<b>Telegram splitting:</b> "
-                f"{int(chain_doc.get('split_file_count') or 0)} file(s) over "
+                f"{int(chain_doc.get('split_file_count') or 0)} "
+                f"{'archive(s)' if account_batch else 'file(s)'} over "
                 f"{_human_size(TELEGRAM_SPLIT_SIZE)}",
             ]
         )
@@ -788,10 +1036,24 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
     session_doc = await terabox_session_store.get_session(session_id)
     if not session_doc or session_doc["state"] != SESSION_RUNNING:
         return
+    provider = session_doc.get("provider") or "terabox"
     try:
-        resolver, file_list = resolved or await _resolve_terabox_share(
-            session_doc["source_url"]
-        )
+        if provider == "terabox_account_batch":
+            cookie = await TERABOX_CONFIG.get_cookie()
+            if not cookie:
+                raise TeraboxError(
+                    "TeraBox is not configured. Set a valid ndus cookie first"
+                )
+            resolver = (
+                resolved[0]
+                if resolved and isinstance(resolved[0], TeraboxAccountClient)
+                else TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
+            )
+            file_list = None
+        else:
+            resolver, file_list = resolved or await _resolve_terabox_share(
+                session_doc["source_url"]
+            )
     except Exception as error:
         await _fail_terabox_session(message, session_id, None, error)
         return
@@ -819,10 +1081,21 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
             return
 
         try:
-            file_info = _resolved_file_for_session(
-                file_doc, file_list, session_doc["source_url"]
-            )
-            if resolver is not None:
+            if provider == "terabox_account_batch":
+                batch_download = await resolver.authorize_batch_download(
+                    file_doc.get("batch_fs_ids") or [],
+                    file_doc["filename"],
+                    preferred_connections=TERABOX_BATCH_CONNECTIONS,
+                )
+                download_url = batch_download.url
+                request_headers = batch_download.headers
+                max_connections = batch_download.max_connections
+            else:
+                file_info = _resolved_file_for_session(
+                    file_doc, file_list, session_doc["source_url"]
+                )
+                max_connections = 8
+            if provider != "terabox_account_batch" and resolver is not None:
                 item = file_info["terabox_file"]
                 download_url = await resolver.authorize_download_url(
                     item.download_url
@@ -831,7 +1104,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     f"User-Agent: {TERABOX_USER_AGENT}",
                     f"Referer: {TERABOX_BASE_URL}",
                 ]
-            else:
+            elif provider != "terabox_account_batch":
                 download_url = file_info.get("normal_dlink") or file_info.get(
                     "zip_dlink"
                 )
@@ -910,6 +1183,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 resume=True,
                 on_uploaded=on_uploaded,
                 suppress_upload_summary=True,
+                max_connections=max_connections,
             )
             if result != "complete":
                 current_session = await terabox_session_store.get_session(session_id)
@@ -1122,6 +1396,164 @@ async def _create_split_terabox_sessions(
     return session_docs
 
 
+def _batch_terabox_request_from_message(message):
+    args = list(message.command[1:])
+    if len(args) < 2:
+        return None
+    max_width = min(2, len(args) - 1)
+    for width in range(1, max_width + 1):
+        try:
+            max_bytes = parse_size_limit("".join(args[-width:]))
+        except ValueError:
+            continue
+        raw_path = " ".join(args[:-width]).strip()
+        if not raw_path:
+            continue
+        try:
+            return normalize_account_path(raw_path), max_bytes
+        except TeraboxError:
+            return None
+    return None
+
+
+async def _create_account_batch_sessions(
+    client,
+    message,
+    folder_path,
+    max_bytes,
+    reply,
+):
+    cookie = await TERABOX_CONFIG.get_cookie()
+    if not cookie:
+        await reply.edit_text(
+            "TeraBox is not configured. Save a valid account cookie with "
+            "<code>/setteraboxcookie</code> first."
+        )
+        return []
+
+    try:
+        account = TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
+        scan = await _scan_account_batch_archives(
+            account, folder_path, max_bytes
+        )
+        archives = scan["archives"]
+        groups = split_by_cumulative_size(
+            archives,
+            max_bytes,
+            size_getter=_intelligent_workspace_bytes,
+        )
+    except Exception as error:
+        await reply.edit_text(
+            f"TeraBox account scan failed: {html.escape(str(error))[:500]}"
+        )
+        return []
+
+    chain_id = new_session_id()
+    total_parts = len(groups)
+    source_url = account_source_url(scan["root_path"])
+    session_name = scan["name"]
+    session_docs = []
+    chain_doc = None
+    try:
+        for part_index, group in enumerate(groups, 1):
+            source_bytes = sum(
+                int(item.get("batch_source_bytes") or 0) for item in group
+            )
+            workspace_bytes = sum(
+                _intelligent_workspace_bytes(item) for item in group
+            )
+            source_file_count = sum(
+                int(item.get("batch_source_count") or 0) for item in group
+            )
+            session_docs.append(
+                await terabox_session_store.create_session(
+                    owner_id=message.from_user.id,
+                    chat_id=message.chat.id,
+                    source_message_id=message.id,
+                    source_url=source_url,
+                    title=f"{session_name} (part {part_index}/{total_parts})",
+                    mode="normal",
+                    custom_filename=None,
+                    files=group,
+                    initial_state=(
+                        SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "provider": "terabox_account_batch",
+                        "name": session_name,
+                        "account_path": scan["root_path"],
+                        "chain_id": chain_id,
+                        "part_index": part_index,
+                        "total_parts": total_parts,
+                        "max_bytes": max_bytes,
+                        "part_bytes": source_bytes,
+                        "workspace_bytes": workspace_bytes,
+                        "source_file_count": source_file_count,
+                        "planning_mode": "account_batch_workspace",
+                        "auto_continue": True,
+                    },
+                )
+            )
+        chain_doc = await terabox_session_store.create_chain(
+            chain_id=chain_id,
+            owner_id=message.from_user.id,
+            chat_id=message.chat.id,
+            source_message_id=message.id,
+            source_url=source_url,
+            name=session_name,
+            mode="normal",
+            total_parts=total_parts,
+            total_files=len(archives),
+            session_ids=[doc["_id"] for doc in session_docs],
+            chain_fields={
+                "provider": "terabox_account_batch",
+                "account_path": scan["root_path"],
+                "max_bytes": max_bytes,
+                "total_bytes": scan["source_bytes"],
+                "total_source_files": scan["source_file_count"],
+                "workspace_bytes": sum(
+                    _intelligent_workspace_bytes(item) for item in archives
+                ),
+                "planning_mode": "account_batch_workspace",
+                "split_file_count": sum(
+                    1
+                    for item in archives
+                    if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
+                ),
+                "auto_continue": True,
+            },
+        )
+    except Exception as error:
+        for session_doc in session_docs:
+            await terabox_session_store.delete_session(session_doc["_id"])
+        if chain_doc is not None:
+            await terabox_session_store.delete_chain(chain_id)
+        await reply.edit_text(
+            "Could not store the TeraBox batch sessions; partial records were "
+            f"removed. Error: {html.escape(str(error))[:500]}"
+        )
+        return []
+
+    text, reply_markup = _terabox_plan_page(
+        chain_doc,
+        session_docs,
+        requested_page=1,
+        persistent=terabox_session_store.persistent,
+    )
+    await reply.edit_text(
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+    _start_terabox_session(
+        client,
+        message,
+        session_docs[0]["_id"],
+        resolved=(account, None),
+    )
+    return session_docs
+
+
 @Client.on_callback_query(
     filters.regex(r"^terachain_page:\d+:[A-Za-z0-9_-]+:\d+$")
 )
@@ -1212,6 +1644,40 @@ async def intelligent_terabox_cmd(client, message):
         max_bytes,
         reply,
         intelligent=True,
+    )
+
+
+@Client.on_message(
+    filters.command(["batchdltera", "terabatchdl"])
+    & filters.chat(ALL_CHATS)
+)
+async def batch_download_terabox_cmd(client, message):
+    if not await _is_cookie_admin(client, message):
+        await message.reply_text(
+            "Only a configured chat administrator can access the TeraBox account."
+        )
+        return
+    request = _batch_terabox_request_from_message(message)
+    if request is None:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/batchdltera &lt;My Cloud folder path&gt; "
+            "&lt;available workspace&gt;</code>\n"
+            "Example: <code>/batchdltera /Anime/Completed 15GB</code>\n"
+            "Quote paths containing spaces: "
+            "<code>/batchdltera \"/My Folder/Completed\" 15GB</code>"
+        )
+        return
+    folder_path, max_bytes = request
+    reply = await message.reply_text(
+        "Scanning the authenticated TeraBox folder and planning batch sessions..."
+    )
+    await _create_account_batch_sessions(
+        client,
+        message,
+        folder_path,
+        max_bytes,
+        reply,
     )
 
 
@@ -1488,7 +1954,8 @@ help_dict["terabox"] = (
 /splittera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - Size-based sequential sessions
 /splitziptera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - Zip mode
 /splitfiletera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - File mode
-/teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Account for original + split-part disk usage
+/teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Plan for source + split-part disk usage
+/batchdltera <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively batch-download an account folder (admins only)
 /terasessions <i>[page]</i> - List persistent parent chains and child sessions
 /terasession <i>[session ID]</i> - Show one part or the only running part
 /continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part

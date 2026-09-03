@@ -8,7 +8,6 @@ out of scope.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -42,10 +41,20 @@ _COOKIE_SITE_SUFFIXES = (
     "terabox.com",
     "terabox.app",
 )
+_VERIFICATION_ERRNOS = frozenset({4000020, 4000023, 400141, 400210, 450016})
 
 
 class TeraboxError(RuntimeError):
     """Raised when a TeraBox share cannot be resolved safely."""
+
+
+def _needs_verification(data: dict[str, Any]) -> bool:
+    try:
+        errno = int(data.get("errno"))
+    except (TypeError, ValueError):
+        errno = None
+    message = str(data.get("show_msg") or data.get("errmsg") or "").lower()
+    return errno in _VERIFICATION_ERRNOS or "need verify" in message
 
 
 @dataclass(frozen=True)
@@ -138,26 +147,30 @@ class TeraboxResolver:
         self.origin, self.bootstrap_path = normalize_endpoint(endpoint)
         self.timeout = aiohttp.ClientTimeout(total=max(5, int(timeout)))
         self.js_token = ""
+        self._share_authenticated = True
 
     @property
     def headers(self) -> dict[str, str]:
-        return {
+        return self._request_headers(authenticated=True)
+
+    def _request_headers(self, *, authenticated: bool) -> dict[str, str]:
+        headers = {
             "User-Agent": TERABOX_USER_AGENT,
-            "Cookie": f"lang=en; ndus={self.ndus}",
             "Referer": self.origin + self.bootstrap_path,
             "Accept": "application/json, text/plain, */*",
         }
+        if authenticated:
+            headers["Cookie"] = f"lang=en; ndus={self.ndus}"
+        return headers
 
     async def _json_get(
         self,
         path: str,
         params: dict[str, Any],
         *,
-        browser_id: bool = False,
+        authenticated: bool = True,
     ) -> dict[str, Any]:
-        headers = self.headers
-        if browser_id:
-            headers["Cookie"] += "; browserid=" + base64.b64encode(os.urandom(44)).decode()
+        headers = self._request_headers(authenticated=authenticated)
         async with self.session.get(
             self.origin + path,
             params=params,
@@ -176,26 +189,47 @@ class TeraboxResolver:
         return data
 
     async def _bootstrap(self) -> None:
-        async with self.session.get(
-            self.origin + self.bootstrap_path,
-            headers=self.headers,
-            timeout=self.timeout,
-            allow_redirects=False,
-        ) as response:
-            if response.status in {301, 302, 303, 307, 308}:
-                location = response.headers.get("Location", "")
-                redirect = urlparse(location)
-                if (
-                    redirect.hostname
-                    and redirect.hostname.lower() != urlparse(self.origin).hostname
-                ):
+        body = ""
+        for _redirect_count in range(4):
+            bootstrap_url = self.origin + self.bootstrap_path
+            async with self.session.get(
+                bootstrap_url,
+                headers=self._request_headers(
+                    authenticated=self._share_authenticated
+                ),
+                timeout=self.timeout,
+                allow_redirects=False,
+            ) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location", "")
+                    target = urljoin(bootstrap_url, location)
+                    redirect = urlparse(target)
+                    current_host = urlparse(self.origin).hostname or ""
+                    if (
+                        redirect.scheme != "https"
+                        or not redirect.hostname
+                        or redirect.username
+                        or redirect.password
+                        or redirect.port not in (None, 443)
+                        or _cookie_site(redirect.hostname) != _cookie_site(current_host)
+                    ):
+                        raise TeraboxError(
+                            "TeraBox attempted to redirect authentication outside its "
+                            "approved site"
+                        )
+                    self.origin = f"https://{redirect.hostname.lower()}"
+                    self.bootstrap_path = redirect.path or "/main"
+                    if redirect.query:
+                        self.bootstrap_path += "?" + redirect.query
+                    continue
+                if response.status != 200:
                     raise TeraboxError(
-                        "TeraBox attempted to redirect authentication to another host"
+                        f"TeraBox bootstrap returned HTTP {response.status}"
                     )
-                raise TeraboxError(f"TeraBox bootstrap redirected to {location or 'another page'}")
-            if response.status != 200:
-                raise TeraboxError(f"TeraBox bootstrap returned HTTP {response.status}")
-            body = await response.text()
+                body = await response.text()
+                break
+        else:
+            raise TeraboxError("TeraBox bootstrap exceeded the redirect limit")
 
         match = _TEMPLATE_DATA_RE.search(body)
         if match:
@@ -225,23 +259,49 @@ class TeraboxResolver:
         }
         if not remote_dir:
             params["root"] = "1"
-        data = await self._json_get("/share/list", params)
+        data = await self._json_get(
+            "/share/list",
+            params,
+            authenticated=self._share_authenticated,
+        )
         if data.get("errno") == 4000020:
             self.js_token = ""
             await self._bootstrap()
             params["jsToken"] = self.js_token
-            data = await self._json_get("/share/list", params)
+            data = await self._json_get(
+                "/share/list",
+                params,
+                authenticated=self._share_authenticated,
+            )
         return data
 
     async def resolve(self, share_url: str) -> list[TeraboxFile]:
         surl = extract_surl(share_url)
+        self._share_authenticated = True
         info = await self._json_get(
             "/api/shorturlinfo",
             {"shorturl": "1" + surl, "root": "1"},
-            browser_id=True,
         )
+        if _needs_verification(info):
+            # Public shares can be rejected specifically because an otherwise
+            # valid account session has been challenged. Retry the complete
+            # share-resolution flow anonymously once instead of fabricating a
+            # new browser fingerprint for the account cookie.
+            self._share_authenticated = False
+            self.js_token = ""
+            info = await self._json_get(
+                "/api/shorturlinfo",
+                {"shorturl": "1" + surl, "root": "1"},
+                authenticated=False,
+            )
         if info.get("errno") != 0:
             message = info.get("show_msg") or info.get("errmsg") or "share lookup failed"
+            if _needs_verification(info):
+                raise TeraboxError(
+                    "TeraBox requires browser/account verification (need verify_v2). "
+                    "Complete verification in the official app or website, then save a "
+                    "fresh ndus cookie and retry later"
+                )
             raise TeraboxError(f"TeraBox rejected the share: {message}")
 
         files: list[TeraboxFile] = []
@@ -272,7 +332,9 @@ class TeraboxResolver:
                 "Refusing to send the TeraBox cookie to a different site"
             )
 
-        headers = self.headers
+        headers = self._request_headers(
+            authenticated=self._share_authenticated
+        )
         headers["Range"] = "bytes=0-0"
         async with self.session.get(
             download_url,

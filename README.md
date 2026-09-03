@@ -176,6 +176,25 @@ source-plus-splits peak cannot fit the requested workspace, the command reports
 the minimum safe limit and creates no partial chain. Large plans are displayed
 ten sessions per page with inline navigation.
 
+`/batchdltera "/My Cloud/Folder" 15GB` is the authenticated-account variant
+and is restricted to configured chat administrators. It recursively scans the
+named account folder and creates non-overlapping server-side ZIP jobs. A leaf
+folder becomes one ZIP when it fits; files directly inside a folder that also
+contains subfolders are packed separately; an oversized leaf is divided into
+bounded file-ID batches. The generated ZIPs are then grouped using the same
+peak-workspace planner, persistent session chain, upload queue, Telegram
+splitting, cleanup, resume, pagination, and final linked index as
+`/teraintelligent`. Batch URLs are authorized immediately before each download
+and are never stored in MongoDB. A one-byte preflight detects byte-range support;
+range-capable generated ZIPs use 8 Aria2 connections by default for premium
+throughput, while streams that ignore ranges safely fall back to one connection.
+The scan defaults to at most 100 file IDs per generated ZIP, 5,000 directories,
+and 100,000 source files; tune these safety limits with
+`TERABOX_BATCH_MAX_ITEMS`, `TERABOX_BATCH_MAX_DIRECTORIES`, and
+`TERABOX_BATCH_MAX_SOURCE_FILES`. `TERABOX_BATCH_ARCHIVE_OVERHEAD_MB` reserves
+extra workspace per generated ZIP (8 MiB by default). Override the ranged-stream
+connection count with `TERABOX_BATCH_CONNECTIONS` (1-16).
+
 Per-file `Files:` summaries are suppressed for these session chains. After the
 entire chain uploads, the bot sends one folder-style, numbered index containing
 the Telegram links for normal files and every `.0001`, `.0002`, ... split part.
