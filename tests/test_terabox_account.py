@@ -79,7 +79,13 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorizes_batch_with_fresh_home_metadata(self):
         class StreamResponse:
             status = 206
-            headers = {"Content-Type": "application/octet-stream"}
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Accept-Ranges": "bytes",
+                # This mirrors TeraBox's non-standard live response.  It
+                # omits the RFC ``bytes`` unit that Aria2 expects.
+                "Content-Range": "0-0/123456",
+            }
             url = "https://dm-data.1024terabox.com/rest/2.0/pcs/file"
             content = SimpleNamespace(read=AsyncMock(return_value=b"P"))
 
@@ -138,6 +144,8 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("method=batchdownload", download.url)
         self.assertEqual(16, download.max_connections)
+        self.assertEqual(123456, download.total_size)
+        self.assertTrue(download.range_supported)
         self.assertTrue(any(header.startswith("Cookie:") for header in download.headers))
         download_call = resolver._json_get.await_args_list[1]
         params = download_call.args[1]
@@ -196,7 +204,11 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
 
         class StorageResponse:
             status = 206
-            headers = {"Content-Type": "application/zip"}
+            headers = {
+                "Content-Type": "application/zip",
+                "Accept-Ranges": "bytes",
+                "Content-Range": "bytes 0-0/654321",
+            }
             url = "https://storage.example/signed.zip"
             content = SimpleNamespace(read=AsyncMock(return_value=b"P"))
 
@@ -254,13 +266,15 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("https://storage.example/signed.zip", download.url)
         self.assertEqual(16, download.max_connections)
+        self.assertEqual(654321, download.total_size)
+        self.assertTrue(download.range_supported)
         self.assertFalse(
             any(header.lower().startswith("cookie:") for header in download.headers)
         )
         second_headers = http_session.get.call_args_list[1].kwargs["headers"]
         self.assertNotIn("Cookie", second_headers)
 
-    async def test_keeps_requested_connections_when_preflight_returns_200(self):
+    async def test_disables_segmentation_when_preflight_returns_200(self):
         class StreamResponse:
             status = 200
             headers = {"Content-Type": "application/zip"}
@@ -310,7 +324,9 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
             [11], "Folder.zip", preferred_connections=8
         )
 
-        self.assertEqual(8, download.max_connections)
+        self.assertEqual(1, download.max_connections)
+        self.assertEqual(0, download.total_size)
+        self.assertFalse(download.range_supported)
 
 
 class FakeAccountTree:
@@ -488,11 +504,14 @@ class TeraboxAccountPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "https://dm-data.1024terabox.com/batch",
                 ["User-Agent: test", "Cookie: lang=en; ndus=disposable"],
                 8,
+                10,
+                True,
             )
         )
 
         async def complete_download(*_args, **kwargs):
             self.assertEqual(8, kwargs["max_connections"])
+            self.assertEqual(10, kwargs["segmented_total_length"])
             self.assertEqual(
                 ["User-Agent: test", "Cookie: lang=en; ndus=disposable"],
                 kwargs["headers"],

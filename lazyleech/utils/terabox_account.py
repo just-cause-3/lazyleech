@@ -33,6 +33,8 @@ class TeraboxBatchDownload:
     url: str
     headers: list[str]
     max_connections: int = 1
+    total_size: int = 0
+    range_supported: bool = False
 
 
 def normalize_account_path(value: str) -> str:
@@ -291,6 +293,7 @@ class TeraboxAccountClient:
                 authenticated=same_cookie_site
             )
             request_headers["Referer"] = f"{self.origin}/main"
+            request_headers["Accept-Encoding"] = "identity"
             request_headers["Range"] = "bytes=0-0"
             async with self.resolver.session.get(
                 current_url,
@@ -333,11 +336,25 @@ class TeraboxAccountClient:
                     download_headers = [
                         f"User-Agent: {TERABOX_USER_AGENT}",
                         f"Referer: {self.origin}/main",
+                        "Accept: */*",
+                        "Accept-Encoding: identity",
                     ]
                     if same_cookie_site:
                         download_headers.append(f"Cookie: lang=en; ndus={self.cookie}")
+                    content_range = response.headers.get("Content-Range", "")
+                    range_match = re.fullmatch(
+                        r"(?:bytes\s+)?0-0/(\d+)",
+                        content_range.strip(),
+                        re.IGNORECASE,
+                    )
+                    total_size = int(range_match.group(1)) if range_match else 0
+                    range_supported = response.status == 206 and total_size > 0
                     return TeraboxBatchDownload(
-                        current_url, download_headers, preferred_connections
+                        current_url,
+                        download_headers,
+                        preferred_connections if range_supported else 1,
+                        total_size,
+                        range_supported,
                     )
                 raise TeraboxError(
                     "TeraBox batch download authorization returned HTTP "

@@ -1090,11 +1090,17 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 download_url = batch_download.url
                 request_headers = batch_download.headers
                 max_connections = batch_download.max_connections
+                segmented_total_length = (
+                    batch_download.total_size
+                    if batch_download.range_supported
+                    else None
+                )
             else:
                 file_info = _resolved_file_for_session(
                     file_doc, file_list, session_doc["source_url"]
                 )
                 max_connections = 8
+                segmented_total_length = None
             if provider != "terabox_account_batch" and resolver is not None:
                 item = file_info["terabox_file"]
                 download_url = await resolver.authorize_download_url(
@@ -1184,6 +1190,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 on_uploaded=on_uploaded,
                 suppress_upload_summary=True,
                 max_connections=max_connections,
+                segmented_total_length=segmented_total_length,
             )
             if result != "complete":
                 current_session = await terabox_session_store.get_session(session_id)

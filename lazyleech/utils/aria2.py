@@ -23,6 +23,12 @@ import tempfile
 import time
 
 from .. import ARIA2_SECRET
+from .segmented_download import (
+    add_segmented_download,
+    segmented_remove,
+    segmented_tell_active,
+    segmented_tell_status,
+)
 
 HEX_CHARACTERS = "abcdef"
 HEXNUMERIC_CHARACTERS = HEX_CHARACTERS + "0123456789"
@@ -59,7 +65,10 @@ async def aria2_request(session, method, params=None):
 
 
 async def aria2_tell_active(session):
-    return _raise_or_return(await aria2_request(session, "aria2.tellActive"))
+    aria_downloads = _raise_or_return(
+        await aria2_request(session, "aria2.tellActive")
+    )
+    return aria_downloads + await segmented_tell_active()
 
 
 async def aria2_tell_waiting(session, offset=0, num=1000):
@@ -78,6 +87,9 @@ async def aria2_pause(session, gid):
 
 
 async def aria2_tell_status(session, gid):
+    segmented = await segmented_tell_status(gid)
+    if segmented is not None:
+        return segmented
     return _raise_or_return(await aria2_request(session, "aria2.tellStatus", [gid]))
 
 
@@ -88,6 +100,8 @@ async def aria2_change_option(session, gid, options):
 
 
 async def aria2_remove(session, gid):
+    if await segmented_remove(gid):
+        return str(gid)
     return _raise_or_return(await aria2_request(session, "aria2.remove", [gid]))
 
 
@@ -245,4 +259,31 @@ async def aria2_add_directdl(
         options["out"] = filename
     return _raise_or_return(
         await aria2_request(session, "aria2.addUri", [[link], options])
+    )
+
+
+async def aria2_add_segmented_directdl(
+    session,
+    user_id,
+    link,
+    filename,
+    *,
+    total_length,
+    timeout=300,
+    headers=None,
+    max_connections=8,
+    download_dir,
+):
+    """Start a validated fixed-range HTTP download with Aria-compatible status."""
+    gid = await generate_gid(session, user_id)
+    return await add_segmented_download(
+        session,
+        gid,
+        link,
+        filename,
+        total_length=total_length,
+        headers=headers,
+        connections=max_connections,
+        download_dir=download_dir,
+        timeout=timeout,
     )

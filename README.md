@@ -186,8 +186,12 @@ peak-workspace planner, persistent session chain, upload queue, Telegram
 splitting, cleanup, resume, pagination, and final linked index as
 `/teraintelligent`. Batch URLs are authorized immediately before each download
 and are never stored in MongoDB. A one-byte preflight verifies the authorized
-stream before Aria2 starts. Generated ZIPs request 16 Aria2 connections by
-default for premium throughput; Aria2 handles servers that cannot serve ranges.
+stream and its exact length. TeraBox currently omits the standard `bytes` unit
+from batch `Content-Range` responses, which makes Aria2 discard its extra
+connections. Range-capable account ZIPs therefore use a validated internal
+downloader with rolling 8 MiB ranges and up to 16 workers by default; every
+response offset and total is checked before it is written. Non-range streams
+fall back to one Aria2 connection.
 The scan defaults to at most 100 file IDs per generated ZIP, 5,000 directories,
 and 100,000 source files; tune these safety limits with
 `TERABOX_BATCH_MAX_ITEMS`, `TERABOX_BATCH_MAX_DIRECTORIES`, and

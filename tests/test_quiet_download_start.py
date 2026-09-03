@@ -29,6 +29,39 @@ class QuietDownloadStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(reference.id, 0)
         self.assertFalse(hasattr(reference, "delete"))
 
+    async def test_segmented_direct_download_uses_range_engine(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+
+        with (
+            patch.object(
+                leech,
+                "aria2_add_segmented_directdl",
+                AsyncMock(return_value="gid3"),
+            ) as add_segmented,
+            patch.object(leech, "aria2_add_directdl", AsyncMock()) as add_aria,
+            patch.object(leech, "handle_leech", AsyncMock(return_value="complete")),
+        ):
+            result = await leech.initiate_directdl(
+                None,
+                message,
+                "https://example.test/file",
+                "file.bin",
+                (),
+                segmented_total_length=123456,
+                download_dir="stable-dir",
+                max_connections=8,
+            )
+
+        self.assertEqual("complete", result)
+        add_aria.assert_not_awaited()
+        add_segmented.assert_awaited_once()
+        self.assertEqual(123456, add_segmented.await_args.kwargs["total_length"])
+        self.assertEqual(8, add_segmented.await_args.kwargs["max_connections"])
+
     async def test_torrent_uses_internal_reference_without_reply(self):
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=123),

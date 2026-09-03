@@ -45,6 +45,7 @@ from .. import (
 from ..utils.aria2 import (
     Aria2Error,
     aria2_add_directdl,
+    aria2_add_segmented_directdl,
     aria2_add_magnet,
     aria2_add_torrent,
     aria2_change_option,
@@ -1771,12 +1772,25 @@ async def initiate_directdl(
     resume=False,
     on_uploaded=None,
     suppress_upload_summary=False,
+    segmented_total_length=None,
 ):
     user_id = message.from_user.id
     reply = _new_download_reference(message)
     try:
-        gid = await asyncio.wait_for(
-            aria2_add_directdl(
+        if segmented_total_length:
+            add_download = aria2_add_segmented_directdl(
+                session,
+                user_id,
+                link,
+                filename,
+                total_length=segmented_total_length,
+                timeout=LEECH_TIMEOUT,
+                headers=headers,
+                max_connections=max_connections,
+                download_dir=download_dir,
+            )
+        else:
+            add_download = aria2_add_directdl(
                 session,
                 user_id,
                 link,
@@ -1786,9 +1800,8 @@ async def initiate_directdl(
                 max_connections=max_connections,
                 download_dir=download_dir,
                 resume=resume,
-            ),
-            MAGNET_TIMEOUT,
-        )
+            )
+        gid = await asyncio.wait_for(add_download, MAGNET_TIMEOUT)
     except Aria2Error as ex:
         await message.reply_text(
             f"Aria2 Error Occured!\n{ex.error_code}: {html.escape(ex.error_message)}"
