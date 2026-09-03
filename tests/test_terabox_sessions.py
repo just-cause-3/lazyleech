@@ -11,12 +11,34 @@ from lazyleech.utils.terabox_sessions import (
     SESSION_PAUSED,
     SESSION_RUNNING,
     TeraboxSessionStore,
+    infer_shared_folder_name,
     parse_size_limit,
     split_by_cumulative_size,
 )
 
 
 class TeraboxSizeSplitTests(unittest.TestCase):
+    def test_infers_shared_top_level_folder_name(self):
+        files = [
+            {"relative_path": "Visual Novel/one.zip"},
+            {"relative_path": "Visual Novel/sub/two.zip"},
+        ]
+
+        self.assertEqual(
+            "Visual Novel", infer_shared_folder_name(files, fallback="share-code")
+        )
+
+    def test_folder_name_falls_back_for_root_level_files(self):
+        files = [
+            {"relative_path": "one.zip"},
+            {"relative_path": "two.zip"},
+        ]
+
+        self.assertEqual(
+            "TeraBox share-code",
+            infer_shared_folder_name(files, fallback="TeraBox share-code"),
+        )
+
     def test_parses_common_size_spellings_with_binary_units(self):
         self.assertEqual(40 * 1024**3, parse_size_limit("40GB"))
         self.assertEqual(40 * 1024**3, parse_size_limit("40 GiB"))
@@ -128,8 +150,379 @@ class TeraboxSizeSplitTests(unittest.TestCase):
         self.assertIn("1.1 large.zip.0001", text)
         self.assertIn('href="https://t.me/c/1/2"', text)
 
+    def test_final_index_sorts_out_of_order_uploads_by_part_number(self):
+        chain = [{"chain_id": "abc123", "title": "Share (part 1/1)", "_id": "s1"}]
+        files = {
+            "s1": [
+                {
+                    "filename": "large.zip",
+                    "telegram_files": [
+                        {"name": "large.zip.0010", "link": "https://t.me/c/1/10"},
+                        {"name": "large.zip.0002", "link": "https://t.me/c/1/2"},
+                        {"name": "large.zip.0001", "link": "https://t.me/c/1/1"},
+                    ],
+                }
+            ]
+        }
+
+        text = "\n".join(terabox._chain_index_lines(chain, files))
+
+        self.assertLess(text.index("large.zip.0001"), text.index("large.zip.0002"))
+        self.assertLess(text.index("large.zip.0002"), text.index("large.zip.0010"))
+        self.assertIn('href="https://t.me/c/1/10"', text)
+
+    def test_upload_records_require_real_telegram_message_links(self):
+        records = terabox._ordered_telegram_files(
+            [
+                ("archive.zip.0002", "https://t.me/c/1397057473/26112"),
+                ("archive.zip.0001", "not-a-link"),
+            ]
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "name": "archive.zip.0002",
+                    "link": "https://t.me/c/1397057473/26112",
+                }
+            ],
+            records,
+        )
+
+    def test_final_index_does_not_repeat_named_root_folder(self):
+        chain = [
+            {
+                "chain_id": "abc123",
+                "name": "Shared Folder",
+                "title": "Shared Folder (part 1/1)",
+                "_id": "s1",
+            }
+        ]
+        files = {
+            "s1": [
+                {
+                    "filename": "one.zip",
+                    "relative_path": "Shared Folder/one.zip",
+                    "telegram_files": [
+                        {"name": "one.zip", "link": "https://t.me/c/1/1"}
+                    ],
+                }
+            ]
+        }
+
+        text = "\n".join(terabox._chain_index_lines(chain, files))
+
+        self.assertEqual(1, text.count("Shared Folder"))
+        self.assertIn("one.zip", text)
+
 
 class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_split_creation_persists_parent_and_folder_name(self):
+        store = TeraboxSessionStore(db_url="")
+        files = [
+            {
+                "name": "one.bin",
+                "path": "Shared Folder/one.bin",
+                "size": 10,
+                "normal_dlink": "https://cdn.test/one.bin",
+            },
+            {
+                "name": "two.bin",
+                "path": "Shared Folder/two.bin",
+                "size": 10,
+                "normal_dlink": "https://cdn.test/two.bin",
+            },
+        ]
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=55,
+        )
+        reply = SimpleNamespace(edit_text=AsyncMock())
+        client = object()
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox,
+                "_resolve_terabox_share",
+                AsyncMock(return_value=(None, files)),
+            ),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            sessions = await terabox._create_split_terabox_sessions(
+                client,
+                message,
+                "https://terabox.com/s/1share",
+                10,
+                reply,
+            )
+
+        self.assertEqual(2, len(sessions))
+        chains = await store.list_chains(owner_id=123, limit=0)
+        self.assertEqual(1, len(chains))
+        self.assertEqual("Shared Folder", chains[0]["name"])
+        self.assertEqual(
+            [session["_id"] for session in sessions], chains[0]["session_ids"]
+        )
+        self.assertTrue(
+            all(session["name"] == "Shared Folder" for session in sessions)
+        )
+        start.assert_called_once_with(
+            client, message, sessions[0]["_id"], resolved=(None, files)
+        )
+
+    async def test_parent_chain_and_child_names_are_persistent_records(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        first = await store.create_session(
+            **common,
+            title="Folder Name (part 1/2)",
+            files=[
+                {
+                    "page_url": common["source_url"],
+                    "filename": "one.bin",
+                    "relative_path": "Folder Name/one.bin",
+                }
+            ],
+            session_fields={
+                "chain_id": "chain123",
+                "name": "Folder Name",
+                "part_index": 1,
+                "total_parts": 2,
+            },
+        )
+        second = await store.create_session(
+            **common,
+            title="Folder Name (part 2/2)",
+            files=[
+                {
+                    "page_url": common["source_url"],
+                    "filename": "two.bin",
+                    "relative_path": "Folder Name/two.bin",
+                }
+            ],
+            initial_state=SESSION_PAUSED,
+            session_fields={
+                "chain_id": "chain123",
+                "name": "Folder Name",
+                "part_index": 2,
+                "total_parts": 2,
+            },
+        )
+        await store.create_chain(
+            chain_id="chain123",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=common["source_url"],
+            name="Folder Name",
+            mode="normal",
+            total_parts=2,
+            total_files=2,
+            session_ids=[first["_id"], second["_id"]],
+        )
+
+        chains = await store.list_chains(owner_id=123, limit=0)
+        children = await store.list_chain("chain123")
+
+        self.assertEqual(1, len(chains))
+        self.assertEqual("Folder Name", chains[0]["name"])
+        self.assertEqual([first["_id"], second["_id"]], chains[0]["session_ids"])
+        self.assertEqual(["Folder Name", "Folder Name"], [
+            child["name"] for child in children
+        ])
+
+    async def test_older_sessions_are_backfilled_into_named_parent_chain(self):
+        store = TeraboxSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://terabox.com/s/1old",
+            title="TeraBox old-code (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": "https://terabox.com/s/1old",
+                    "filename": "one.bin",
+                    "relative_path": "Recovered Folder/one.bin",
+                }
+            ],
+            session_fields={
+                "chain_id": "oldchain",
+                "part_index": 1,
+                "total_parts": 1,
+            },
+        )
+
+        chains = await store.list_chains(owner_id=123, limit=0)
+        migrated = await store.get_session(session["_id"])
+
+        self.assertEqual("Recovered Folder", chains[0]["name"])
+        self.assertEqual([session["_id"]], chains[0]["session_ids"])
+        self.assertEqual("Recovered Folder", migrated["name"])
+
+    async def test_chain_list_visually_contains_every_child_session(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        children = []
+        for part in (1, 2):
+            children.append(
+                await store.create_session(
+                    **common,
+                    title=f"Parent Folder (part {part}/2)",
+                    files=[
+                        {
+                            "page_url": common["source_url"],
+                            "filename": f"{part}.bin",
+                            "relative_path": f"Parent Folder/{part}.bin",
+                        }
+                    ],
+                    initial_state=(
+                        SESSION_RUNNING if part == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "chain_id": "visualchain",
+                        "name": "Parent Folder",
+                        "part_index": part,
+                        "total_parts": 2,
+                        "part_bytes": part * 1024,
+                    },
+                )
+            )
+        await store.create_chain(
+            chain_id="visualchain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=common["source_url"],
+            name="Parent Folder",
+            mode="normal",
+            total_parts=2,
+            total_files=2,
+            session_ids=[child["_id"] for child in children],
+        )
+
+        with patch.object(terabox, "terabox_session_store", store):
+            pages = await terabox._terabox_sessions_pages(123)
+
+        text = "\n".join(pages)
+        self.assertIn("📁 <b>Parent Folder</b>", text)
+        self.assertIn("Chain: <code>visualchain</code>", text)
+        self.assertIn(children[0]["_id"], text)
+        self.assertIn(children[1]["_id"], text)
+        self.assertIn("Part 1/2", text)
+        self.assertIn("Part 2/2", text)
+
+    async def test_no_argument_selects_the_only_running_session(self):
+        store = TeraboxSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://terabox.com/s/1share",
+            title="part 1",
+            mode="normal",
+            custom_filename=None,
+            files=[{"page_url": "https://terabox.com/s/1share", "filename": "one"}],
+            session_fields={"chain_id": "chain", "part_index": 1, "total_parts": 1},
+        )
+        message = SimpleNamespace(
+            command=["terasession"],
+            reply_to_message=SimpleNamespace(empty=True),
+            from_user=SimpleNamespace(id=123),
+        )
+
+        with patch.object(terabox, "terabox_session_store", store):
+            selected = await terabox._owned_terabox_session(
+                message, default_states=(SESSION_RUNNING,)
+            )
+
+        self.assertEqual(session["_id"], selected["_id"])
+
+    async def test_continue_accepts_parent_chain_id(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        first = await store.create_session(
+            **common,
+            title="Folder (part 1/2)",
+            files=[{"page_url": common["source_url"], "filename": "one"}],
+            session_fields={
+                "chain_id": "resumechain",
+                "name": "Folder",
+                "part_index": 1,
+                "total_parts": 2,
+            },
+        )
+        await store.set_state(first["_id"], SESSION_COMPLETED)
+        second = await store.create_session(
+            **common,
+            title="Folder (part 2/2)",
+            files=[{"page_url": common["source_url"], "filename": "two"}],
+            initial_state=SESSION_PAUSED,
+            session_fields={
+                "chain_id": "resumechain",
+                "name": "Folder",
+                "part_index": 2,
+                "total_parts": 2,
+            },
+        )
+        await store.create_chain(
+            chain_id="resumechain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=common["source_url"],
+            name="Folder",
+            mode="normal",
+            total_parts=2,
+            total_files=2,
+            session_ids=[first["_id"], second["_id"]],
+        )
+        message = SimpleNamespace(
+            command=["continuetera", "resumechain"],
+            reply_to_message=SimpleNamespace(empty=True),
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=99,
+            reply_text=AsyncMock(),
+        )
+        client = object()
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            await terabox.continue_terabox_session_cmd(client, message)
+
+        resumed = await store.get_session(second["_id"])
+        self.assertEqual(SESSION_RUNNING, resumed["state"])
+        start.assert_called_once_with(client, message, second["_id"])
+        self.assertIn(second["_id"], message.reply_text.await_args.args[0])
+
     async def test_next_part_activates_only_after_current_part_completes(self):
         store = TeraboxSessionStore(db_url="")
         common = {

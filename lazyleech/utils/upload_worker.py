@@ -26,6 +26,7 @@ import traceback
 import unicodedata
 import zipfile
 from collections import defaultdict
+from itertools import count
 
 from natsort import natsorted
 from pyrogram import StopTransmission
@@ -69,6 +70,20 @@ from .status import (
 upload_queue = asyncio.Queue()
 upload_statuses = dict()
 upload_tamper_lock = asyncio.Lock()
+_upload_id_sequence = count(int(time.time() * 1_000_000))
+
+
+def _new_upload_identifier(chat_id):
+    """Return a process-unique status/cancellation identifier."""
+    return chat_id, next(_upload_id_sequence)
+
+
+class UploadResult(list):
+    """Uploaded file links plus whether the complete job succeeded."""
+
+    def __init__(self, values=(), *, complete=False):
+        super().__init__(values)
+        self.complete = bool(complete)
 
 
 def _truncate_utf8_filename(filename, max_bytes=250):
@@ -200,7 +215,8 @@ async def cleanup_upload(
             remove_upload_status(message_identifier)
 
     # Clean up the actual download directory completely
-    if not TESTMODE and torrent_info and "dir" in torrent_info:
+    upload_complete = bool(getattr(sent_files, "complete", False))
+    if upload_complete and not TESTMODE and torrent_info and "dir" in torrent_info:
         try:
             dir_path = torrent_info["dir"]
             if os.path.exists(dir_path):
@@ -240,6 +256,7 @@ async def _upload_worker(
 ):
     files = dict()
     sent_files = []
+    upload_complete = True
 
     with tempfile.TemporaryDirectory(dir=str(user_id)) as zip_tempdir:
         if SendAsZipFlag in flags:
@@ -304,22 +321,22 @@ async def _upload_worker(
         for filepath in natsorted(files):
             fcount += 1
             remove_upload_status((reply.chat.id, reply.id))
-            sent_files.extend(
-                await _upload_file(
-                    client,
-                    message,
-                    reply,
-                    files[filepath],
-                    filepath,
-                    ForceDocumentFlag in flags,
-                    newFile,
-                    fcount,
-                    cleanup_source=SendAsZipFlag not in flags,
-                    download_root=torrent_info.get("dir"),
-                )
+            uploaded = await _upload_file(
+                client,
+                message,
+                reply,
+                files[filepath],
+                filepath,
+                ForceDocumentFlag in flags,
+                newFile,
+                fcount,
+                cleanup_source=SendAsZipFlag not in flags,
+                download_root=torrent_info.get("dir"),
             )
+            sent_files.extend(uploaded)
+            upload_complete = upload_complete and uploaded.complete
     if bool((upload_options or {}).get("suppress_summary")):
-        return sent_files
+        return UploadResult(sent_files, complete=upload_complete)
 
     text = "Files:\n"
     parser = pyrogram_html.HTML(client)
@@ -357,7 +374,7 @@ async def _upload_worker(
     ):
         await message.reply_text(text, quote=quote, disable_web_page_preview=True)
 
-    return sent_files
+    return UploadResult(sent_files, complete=upload_complete)
 
 
 async def _upload_file(
@@ -373,7 +390,7 @@ async def _upload_file(
     download_root=None,
 ):
     if not os.path.getsize(filepath):
-        return [(os.path.basename(filename), None)]
+        return UploadResult([(os.path.basename(filename), None)], complete=False)
     worker_identifier = (reply.chat.id, reply.id)
     user_id = message.from_user.id
     user_thumbnail = os.path.join(str(user_id), "thumbnail.jpg")
@@ -392,7 +409,7 @@ async def _upload_file(
         except Exception as e:
             logging.error(f"Failed to sanitize filename path: {e}")
 
-    upload_identifier = (message.chat.id, int(time.time() * 1000))
+    upload_identifier = _new_upload_identifier(message.chat.id)
     async with upload_tamper_lock:
         upload_waits[upload_identifier] = user_id, worker_identifier
 
@@ -439,10 +456,10 @@ async def _upload_file(
                 to_upload.append((filepath, filename))
             for _ in range(PROGRESS_UPDATE_DELAY):
                 if upload_identifier in stop_uploads:
-                    return sent_files
+                    return UploadResult(sent_files, complete=False)
                 await asyncio.sleep(1)
             if upload_identifier in stop_uploads:
-                return sent_files
+                return UploadResult(sent_files, complete=False)
             if split_task and not split_task.done():
                 await update_upload_status_state(
                     upload_identifier[0],
@@ -454,7 +471,7 @@ async def _upload_file(
                 )
                 while not split_task.done():
                     if upload_identifier in stop_uploads:
-                        return sent_files
+                        return UploadResult(sent_files, complete=False)
                     await asyncio.sleep(1)
             if split_task:
                 try:
@@ -468,32 +485,58 @@ async def _upload_file(
                         f"<code>{html.escape(str(filename))}</code> for upload: "
                         f"{html.escape(str(error))}"
                     )
-                    return sent_files
+                    return UploadResult(sent_files, complete=False)
                 if not to_upload:
                     await message.reply_text(
                         "Could not split "
                         f"<code>{html.escape(str(filename))}</code>: "
                         "no parts were created."
                     )
-                    return sent_files
+                    return UploadResult(sent_files, complete=False)
             if upload_identifier in stop_uploads:
-                return sent_files
+                return UploadResult(sent_files, complete=False)
+            if file_has_big:
+                # The placeholder represents the split operation. Each part
+                # gets its own status/cancel ID once all parts are ready.
+                remove_upload_status(upload_identifier)
+                async with upload_tamper_lock:
+                    upload_waits.pop(upload_identifier, None)
+                thumbnail = None
+                for candidate in (user_thumbnail, user_watermarked_thumbnail):
+                    thumbnail = candidate if os.path.isfile(candidate) else thumbnail
+                sent_files.extend(
+                    await _upload_split_parts(
+                        client,
+                        message,
+                        worker_identifier,
+                        user_id,
+                        to_upload,
+                        thumbnail,
+                        tempdir,
+                    )
+                )
+                upload_complete = (
+                    len(sent_files) == len(to_upload)
+                    and all(link for _, link in sent_files)
+                )
+                if upload_complete and cleanup_source and download_root:
+                    await _remove_completed_source(source_filepath, download_root)
+                return UploadResult(sent_files, complete=upload_complete)
             for a, (filepath, filename) in enumerate(to_upload):
                 while True:
                     if a:
                         async with upload_tamper_lock:
                             upload_waits.pop(upload_identifier, None)
-                            upload_identifier = (
-                                message.chat.id,
-                                int(time.time() * 1000),
+                            upload_identifier = _new_upload_identifier(
+                                message.chat.id
                             )
                             upload_waits[upload_identifier] = user_id, worker_identifier
                         for _ in range(PROGRESS_UPDATE_DELAY):
                             if upload_identifier in stop_uploads:
-                                return sent_files
+                                return UploadResult(sent_files, complete=False)
                             await asyncio.sleep(1)
                         if upload_identifier in stop_uploads:
-                            return sent_files
+                            return UploadResult(sent_files, complete=False)
                     thumbnail = None
                     for i in (user_thumbnail, user_watermarked_thumbnail):
                         thumbnail = i if os.path.isfile(i) else thumbnail
@@ -589,24 +632,16 @@ async def _upload_file(
                         break
 
                     remove_upload_status(upload_identifier)
-                    return sent_files
+                    return UploadResult(sent_files, complete=False)
                 remove_upload_status(upload_identifier)
-        upload_complete = bool(to_upload) and len(sent_files) == len(to_upload)
+        upload_complete = (
+            bool(to_upload)
+            and len(sent_files) == len(to_upload)
+            and all(link for _, link in sent_files)
+        )
         if upload_complete and cleanup_source and download_root:
-            removed = await asyncio.to_thread(
-                remove_uploaded_source, source_filepath, download_root
-            )
-            if removed:
-                logging.info(
-                    "Removed successfully uploaded source file: %s",
-                    source_filepath,
-                )
-            else:
-                logging.warning(
-                    "Could not remove successfully uploaded source file: %s",
-                    source_filepath,
-                )
-        return sent_files
+            await _remove_completed_source(source_filepath, download_root)
+        return UploadResult(sent_files, complete=upload_complete)
     finally:
         remove_upload_status(upload_identifier)
         stop_uploads.discard(upload_identifier)
@@ -614,6 +649,115 @@ async def _upload_file(
             split_task.cancel()
         async with upload_tamper_lock:
             upload_waits.pop(upload_identifier, None)
+
+
+async def _remove_completed_source(filepath, download_root):
+    removed = await asyncio.to_thread(remove_uploaded_source, filepath, download_root)
+    if removed:
+        logging.info("Removed successfully uploaded source file: %s", filepath)
+    else:
+        logging.warning("Could not remove successfully uploaded source file: %s", filepath)
+    return removed
+
+
+async def _upload_split_part(
+    client,
+    message,
+    worker_identifier,
+    user_id,
+    filepath,
+    filename,
+    thumbnail,
+    tempdir,
+):
+    """Upload one numbered part and free that part as soon as Telegram accepts it."""
+    upload_identifier = _new_upload_identifier(message.chat.id)
+    async with upload_tamper_lock:
+        upload_waits[upload_identifier] = user_id, worker_identifier
+    await update_upload_status_state(
+        upload_identifier[0],
+        upload_identifier[1],
+        filename,
+        "Waiting",
+        0,
+        os.path.getsize(filepath),
+    )
+    try:
+        if upload_identifier in stop_uploads:
+            return None
+        try:
+            response = await message.reply_document(
+                filepath,
+                thumb=thumbnail,
+                caption=filename,
+                parse_mode=None,
+                progress=progress_callback,
+                progress_args=(
+                    client,
+                    message,
+                    upload_identifier,
+                    filename,
+                    user_id,
+                ),
+            )
+        except StopTransmission:
+            return None
+        except Exception:
+            logging.exception("Failed to upload split part %s", filepath)
+            await message.reply_text(traceback.format_exc(), parse_mode=None)
+            return None
+
+        if not response:
+            return None
+
+        # The original source remains available until every part succeeds, but
+        # a successfully accepted temporary part no longer needs disk space.
+        removed = await asyncio.to_thread(remove_uploaded_source, filepath, tempdir)
+        if not removed:
+            logging.warning("Could not remove uploaded split part: %s", filepath)
+        return os.path.basename(filename), response.link
+    finally:
+        remove_upload_status(upload_identifier)
+        stop_uploads.discard(upload_identifier)
+        async with upload_tamper_lock:
+            upload_waits.pop(upload_identifier, None)
+
+
+async def _upload_split_parts(
+    client,
+    message,
+    worker_identifier,
+    user_id,
+    to_upload,
+    thumbnail,
+    tempdir,
+):
+    """Make every split part eligible together and return links in part order."""
+
+    async def upload_indexed(part_index, part_path, part_name):
+        result = await _upload_split_part(
+            client,
+            message,
+            worker_identifier,
+            user_id,
+            part_path,
+            part_name,
+            thumbnail,
+            tempdir,
+        )
+        return part_index, result
+
+    results = await asyncio.gather(
+        *(
+            upload_indexed(part_index, part_path, part_name)
+            for part_index, (part_path, part_name) in enumerate(to_upload)
+        )
+    )
+    return [
+        result
+        for _, result in sorted(results, key=lambda item: item[0])
+        if result is not None
+    ]
 
 
 progress_callback_data = dict()

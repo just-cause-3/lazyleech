@@ -92,6 +92,13 @@ filedirect <Direct URL> or as reply to a Direct URL | optional custom file name 
 tera <TeraBox share URL> - Download a TeraBox share and upload it
 ziptera <TeraBox share URL> - Download and upload as ZIP
 filetera <TeraBox share URL> - Send videos as files
+splittera <TeraBox share URL> <size> - Create sequential size-based sessions
+splitziptera <TeraBox share URL> <size> - Create ZIP-mode sessions
+splitfiletera <TeraBox share URL> <size> - Create force-file sessions
+teraintelligent <TeraBox share URL> <workspace> - Plan for source plus split copies
+terasessions [page] - List persistent parent chains and child sessions
+terasession [session ID] - Show one part or the only running part
+continuetera <chain or session ID> - Resume the next unfinished part
 setteraboxcookie <ndus value> - Validate and persist a replacement cookie (chat admin)
 teraboxcookiestatus - Show cookie source without revealing it (chat admin)
 clearteraboxcookie - Remove the database override (chat admin)
@@ -163,10 +170,21 @@ been removed.
 Per-file `Files:` summaries are suppressed for these session chains. After the
 entire chain uploads, the bot sends one folder-style, numbered index containing
 the Telegram links for normal files and every `.0001`, `.0002`, ... split part.
-The chain is stored in MongoDB collections `TERABOX_SESSIONS` and
-`TERABOX_SESSION_FILES` when `DB_URL` is configured. Use `/terasession ID` to
-inspect a part and `/continuetera ID` to retry a stopped part. `GB` and `GiB`
-both use 1024-based units.
+Numbered parts from the same source become eligible for upload together and may
+finish in any order, subject to `MAX_CONCURRENT_UPLOADS`. Each accepted part is
+deleted immediately; the original is deleted only after every part succeeds.
+The final index is always sorted into numeric part order even if Telegram
+accepted `.0002` before `.0001`.
+Each parent chain is stored in `TERABOX_CHAINS`, each child part in
+`TERABOX_SESSIONS`, and every source file in `TERABOX_SESSION_FILES` when
+`DB_URL` is configured. Parent and child records include a `name` derived from
+the shared top-level folder, falling back to the share code for root-level
+files. `/terasessions [page]` shows the persistent parent/child hierarchy. Use
+`/terasession [ID]` to inspect a part; without an ID it selects the only running
+part. `/continuetera ID` accepts either a chain ID or a child session ID, so a
+stopped chain can be resumed after a restart. Older stored TeraBox sessions are
+backfilled into parent chain records when listed. `GB` and `GiB` both use
+1024-based units.
 
 An administrator can replace an expired cookie in a configured admin chat with
 `/setteraboxcookie VALUE`. In groups, the sender must be a Telegram owner or

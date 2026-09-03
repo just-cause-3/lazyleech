@@ -5,9 +5,13 @@ import html
 import json
 import os
 import re
+from urllib.parse import urlparse
 
+from natsort import natsorted
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import MessageNotModified
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import (
     ADMIN_CHATS,
@@ -37,6 +41,7 @@ from ..utils.terabox_sessions import (
     SESSION_FAILED,
     SESSION_PAUSED,
     SESSION_RUNNING,
+    infer_shared_folder_name,
     new_session_id,
     parse_size_limit,
     split_by_cumulative_size,
@@ -52,6 +57,7 @@ TERABOX_CONFIG = TeraboxConfigStore()
 terabox_session_tasks = {}
 terabox_tasks = set()
 terabox_chain_locks = {}
+TERABOX_CHAIN_PAGE_BYTES = 3300
 
 
 def _reported_size_bytes(value):
@@ -486,9 +492,38 @@ def _intelligent_workspace_bytes(file_info):
     return source_bytes
 
 
+def _valid_telegram_message_link(value):
+    """Return a normalized Telegram message link, or None for unusable links."""
+    link = str(value or "").strip()
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in {"t.me", "telegram.me"}
+        or len(path_parts) < 2
+    ):
+        return None
+    return link
+
+
+def _ordered_telegram_files(sent_files):
+    """Normalize successful upload records into stable numeric part order."""
+    records = []
+    for name, link in sent_files:
+        valid_link = _valid_telegram_message_link(link)
+        if valid_link:
+            records.append({"name": str(name), "link": valid_link})
+    return natsorted(records, key=lambda item: item["name"])
+
+
 def _chain_index_lines(chain, files_by_session):
     chain_id = chain[0]["chain_id"]
-    title = re.sub(r"\s*\(part \d+/\d+\)$", "", chain[0]["title"])
+    title = str(chain[0].get("name") or "").strip() or re.sub(
+        r"\s*\(part \d+/\d+\)$", "", chain[0]["title"]
+    )
     lines = [
         f"<b>TeraBox upload complete</b> — <code>{chain_id}</code>",
         f"📁 <b>{html.escape(title)}</b>/",
@@ -504,6 +539,10 @@ def _chain_index_lines(chain, files_by_session):
                 file_doc.get("relative_path") or file_doc["filename"]
             ).replace("\\", "/").strip("/")
             parts = [part for part in relative_path.split("/") if part]
+            if len(parts) > 1 and parts[0] == title:
+                # The chain heading already represents the shared root folder.
+                # Do not render that directory twice in the final index.
+                parts = parts[1:]
             source_name = parts.pop() if parts else file_doc["filename"]
             directory = root
             for part in parts:
@@ -531,7 +570,10 @@ def _chain_index_lines(chain, files_by_session):
                 continue
 
             file_doc = value
-            uploads = file_doc.get("telegram_files") or []
+            uploads = natsorted(
+                file_doc.get("telegram_files") or [],
+                key=lambda upload: str(upload.get("name") or ""),
+            )
             item_index += 1
             if len(uploads) > 1:
                 lines.append(
@@ -542,19 +584,33 @@ def _chain_index_lines(chain, files_by_session):
                 for part_index, upload in enumerate(uploads, 1):
                     part_branch = "└──" if part_index == len(uploads) else "├──"
                     upload_name = html.escape(str(upload.get("name") or "part"))
-                    link = html.escape(str(upload.get("link") or ""), quote=True)
-                    lines.append(
-                        f'{part_prefix}{part_branch} <a href="{link}">'
-                        f"{item_index}.{part_index} {upload_name}</a>"
-                    )
+                    link = _valid_telegram_message_link(upload.get("link"))
+                    if link:
+                        escaped_link = html.escape(link, quote=True)
+                        lines.append(
+                            f'{part_prefix}{part_branch} <a href="{escaped_link}">'
+                            f"{item_index}.{part_index} {upload_name}</a>"
+                        )
+                    else:
+                        lines.append(
+                            f"{part_prefix}{part_branch} "
+                            f"{item_index}.{part_index} {upload_name} (link missing)"
+                        )
             elif uploads:
                 upload = uploads[0]
                 upload_name = html.escape(str(upload.get("name") or name))
-                link = html.escape(str(upload.get("link") or ""), quote=True)
-                lines.append(
-                    f'{prefix}{branch} {item_index}. '
-                    f'<a href="{link}">{upload_name}</a>'
-                )
+                link = _valid_telegram_message_link(upload.get("link"))
+                if link:
+                    escaped_link = html.escape(link, quote=True)
+                    lines.append(
+                        f'{prefix}{branch} {item_index}. '
+                        f'<a href="{escaped_link}">{upload_name}</a>'
+                    )
+                else:
+                    lines.append(
+                        f"{prefix}{branch} {item_index}. "
+                        f"{upload_name} (link missing)"
+                    )
             else:
                 lines.append(
                     f"{prefix}{branch} {item_index}. "
@@ -706,19 +762,26 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     (source_size + TELEGRAM_SPLIT_SIZE - 1)
                     // TELEGRAM_SPLIT_SIZE,
                 )
-                successful = len(sent_files) >= expected_uploads and all(
-                    link for _, link in sent_files
+                telegram_files = _ordered_telegram_files(sent_files)
+                uploader_complete = getattr(
+                    sent_files,
+                    "complete",
+                    len(sent_files) == expected_uploads,
+                )
+                successful = (
+                    uploader_complete
+                    and bool(telegram_files)
+                    and len(telegram_files) == len(sent_files)
                 )
                 if upload_error or not successful:
-                    reason = upload_error or "Telegram upload did not return a link"
+                    reason = upload_error or (
+                        "Telegram upload did not return a valid message link "
+                        f"for every part ({len(telegram_files)} valid link(s))"
+                    )
                     await _fail_terabox_session(
                         message, session_id, current_file, reason
                     )
                     return
-                telegram_files = [
-                    {"name": name, "link": link}
-                    for name, link in sent_files
-                ]
                 updated = await terabox_session_store.update_file_if_status(
                     current_file["_id"],
                     FILE_DOWNLOADED,
@@ -831,7 +894,11 @@ async def _create_split_terabox_sessions(
     chain_id = new_session_id()
     total_parts = len(groups)
     share_name = extract_surl(source_url)[:24]
+    session_name = infer_shared_folder_name(
+        normalized, fallback=f"TeraBox {share_name}"
+    )
     session_docs = []
+    chain_doc = None
     try:
         for part_index, group in enumerate(groups, 1):
             part_bytes = sum(item["size_bytes"] for item in group)
@@ -844,7 +911,7 @@ async def _create_split_terabox_sessions(
                     chat_id=message.chat.id,
                     source_message_id=message.id,
                     source_url=source_url,
-                    title=f"TeraBox {share_name} (part {part_index}/{total_parts})",
+                    title=f"{session_name} (part {part_index}/{total_parts})",
                     mode=mode,
                     custom_filename=None,
                     files=group,
@@ -853,6 +920,7 @@ async def _create_split_terabox_sessions(
                     ),
                     session_fields={
                         "provider": "terabox",
+                        "name": session_name,
                         "chain_id": chain_id,
                         "part_index": part_index,
                         "total_parts": total_parts,
@@ -866,9 +934,34 @@ async def _create_split_terabox_sessions(
                     },
                 )
             )
+        chain_doc = await terabox_session_store.create_chain(
+            chain_id=chain_id,
+            owner_id=message.from_user.id,
+            chat_id=message.chat.id,
+            source_message_id=message.id,
+            source_url=source_url,
+            name=session_name,
+            mode=mode,
+            total_parts=total_parts,
+            total_files=len(normalized),
+            session_ids=[doc["_id"] for doc in session_docs],
+            chain_fields={
+                "max_bytes": max_bytes,
+                "total_bytes": sum(item["size_bytes"] for item in normalized),
+                "workspace_bytes": sum(
+                    _intelligent_workspace_bytes(item) for item in normalized
+                ),
+                "planning_mode": (
+                    "intelligent_workspace" if intelligent else "source_size"
+                ),
+                "auto_continue": True,
+            },
+        )
     except Exception as error:
         for session_doc in session_docs:
             await terabox_session_store.delete_session(session_doc["_id"])
+        if chain_doc is not None:
+            await terabox_session_store.delete_chain(chain_id)
         await reply.edit_text(
             "Could not store the TeraBox sessions; partial records were removed. "
             f"Error: {html.escape(str(error))[:500]}"
@@ -876,6 +969,7 @@ async def _create_split_terabox_sessions(
         return []
 
     lines = [
+        f"<b>Name:</b> {html.escape(session_name)}",
         f"<b>TeraBox chain:</b> <code>{chain_id}</code>",
         f"<b>Files:</b> {len(normalized)} | "
         f"<b>{'Workspace' if intelligent else 'Source'} limit:</b> "
@@ -1010,23 +1104,179 @@ def _terabox_session_id_from_message(message):
     return None
 
 
+async def _owned_terabox_session(message, default_states=None):
+    session_id = _terabox_session_id_from_message(message)
+    if session_id:
+        return await terabox_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+    sessions = await terabox_session_store.list_sessions(
+        owner_id=message.from_user.id,
+        states=default_states,
+        limit=2,
+    )
+    return sessions[0] if len(sessions) == 1 else None
+
+
+def _chain_session_line(session_doc, *, is_last=False):
+    branch = "└──" if is_last else "├──"
+    part_index = int(session_doc.get("part_index") or 1)
+    total_parts = int(session_doc.get("total_parts") or 1)
+    state = html.escape(str(session_doc.get("state") or "unknown"))
+    total_files = int(session_doc.get("total_files") or 0)
+    size = _human_size(int(session_doc.get("part_bytes") or 0))
+    return (
+        f"{branch} <b>Part {part_index}/{total_parts}</b> · {state} · "
+        f"{total_files} file(s) · {size} · "
+        f"<code>{session_doc['_id']}</code>"
+    )
+
+
+def _chain_page_header(chain_doc, sessions, continued=False):
+    name = html.escape(str(chain_doc.get("name") or "TeraBox"))
+    completed = sum(
+        1 for doc in sessions if doc.get("state") == SESSION_COMPLETED
+    )
+    suffix = " <i>(continued)</i>" if continued else ""
+    return [
+        f"📁 <b>{name}</b>{suffix}",
+        f"Chain: <code>{chain_doc['_id']}</code>",
+        f"Progress: {completed}/{len(sessions)} session(s) completed",
+    ]
+
+
+async def _terabox_chain_segments(chain_doc):
+    """Render one parent chain, splitting very large child lists safely."""
+    sessions = await terabox_session_store.list_chain(chain_doc["_id"])
+    if not sessions:
+        return ["\n".join(_chain_page_header(chain_doc, sessions) + ["└── No sessions"])]
+
+    entries = [
+        _chain_session_line(doc, is_last=index == len(sessions) - 1)
+        for index, doc in enumerate(sessions)
+    ]
+    segments = []
+    current_entries = []
+    for entry in entries:
+        header = _chain_page_header(
+            chain_doc, sessions, continued=bool(segments)
+        )
+        candidate = "\n".join(header + current_entries + [entry])
+        if current_entries and len(candidate.encode("utf-8")) > TERABOX_CHAIN_PAGE_BYTES:
+            segments.append("\n".join(header + current_entries))
+            current_entries = [entry]
+        else:
+            current_entries.append(entry)
+    if current_entries:
+        header = _chain_page_header(
+            chain_doc, sessions, continued=bool(segments)
+        )
+        segments.append("\n".join(header + current_entries))
+    return segments
+
+
+async def _terabox_sessions_pages(owner_id):
+    chains = await terabox_session_store.list_chains(owner_id=owner_id, limit=0)
+    pages = []
+    for chain_doc in chains:
+        pages.extend(await _terabox_chain_segments(chain_doc))
+    return pages
+
+
+async def _terabox_sessions_page(owner_id, requested_page=1):
+    pages = await _terabox_sessions_pages(owner_id)
+    if not pages:
+        return "You do not have any persistent TeraBox sessions.", None
+    total_pages = len(pages)
+    page = min(max(1, int(requested_page)), total_pages)
+    text = (
+        f"<b>Your TeraBox chains</b> — Page {page}/{total_pages}\n\n"
+        f"{pages[page - 1]}\n\n"
+        "Inspect: <code>/terasession SESSION_ID</code>\n"
+        "Resume: <code>/continuetera CHAIN_OR_SESSION_ID</code>"
+    )
+    if not terabox_session_store.persistent:
+        text += "\n\nDB_URL is not configured; these records are memory-only."
+
+    buttons = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                "Previous",
+                callback_data=f"terasessions_page:{int(owner_id)}:{page - 1}",
+            )
+        )
+    buttons.append(
+        InlineKeyboardButton(
+            f"{page}/{total_pages}",
+            callback_data=f"terasessions_page:{int(owner_id)}:{page}",
+        )
+    )
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton(
+                "Next",
+                callback_data=f"terasessions_page:{int(owner_id)}:{page + 1}",
+            )
+        )
+    return text, InlineKeyboardMarkup([buttons])
+
+
+@Client.on_message(
+    filters.command(["terasessions", "tsessions"]) & filters.chat(ALL_CHATS)
+)
+async def terabox_sessions_cmd(client, message):
+    page = 1
+    if len(message.command) > 1:
+        try:
+            page = int(message.command[1])
+        except (TypeError, ValueError):
+            await message.reply_text("Usage: <code>/terasessions [page]</code>")
+            return
+    text, reply_markup = await _terabox_sessions_page(
+        message.from_user.id, page
+    )
+    await message.reply_text(text, reply_markup=reply_markup)
+
+
+@Client.on_callback_query(filters.regex(r"^terasessions_page:\d+:\d+$"))
+async def terabox_sessions_page_callback(client, callback_query):
+    _, owner_text, page_text = callback_query.data.split(":", 2)
+    owner_id = int(owner_text)
+    if callback_query.from_user.id != owner_id:
+        await callback_query.answer(
+            "Only the user who opened this list can change its page.",
+            show_alert=True,
+        )
+        return
+    text, reply_markup = await _terabox_sessions_page(
+        owner_id, int(page_text)
+    )
+    try:
+        await callback_query.message.edit_text(text, reply_markup=reply_markup)
+    except MessageNotModified:
+        pass
+    await callback_query.answer()
+
+
 @Client.on_message(
     filters.command(["terasession", "tsession"]) & filters.chat(ALL_CHATS)
 )
 async def terabox_session_cmd(client, message):
-    session_id = _terabox_session_id_from_message(message)
-    session_doc = (
-        await terabox_session_store.get_session(
-            session_id, owner_id=message.from_user.id
-        )
-        if session_id
-        else None
+    session_doc = await _owned_terabox_session(
+        message, default_states=(SESSION_RUNNING,)
     )
     if session_doc is None:
-        await message.reply_text("TeraBox session not found.")
+        await message.reply_text(
+            "TeraBox session not found or more than one session is running. "
+            "Use <code>/terasessions</code> and then "
+            "<code>/terasession SESSION_ID</code>."
+        )
         return
+    session_id = session_doc["_id"]
     counts = await terabox_session_store.counts(session_id)
     await message.reply_text(
+        f"<b>Name:</b> {html.escape(str(session_doc.get('name') or 'TeraBox'))}\n"
         f"<b>TeraBox session:</b> <code>{session_id}</code>\n"
         f"<b>Chain:</b> <code>{session_doc['chain_id']}</code>\n"
         f"<b>Part:</b> {session_doc['part_index']}/{session_doc['total_parts']}\n"
@@ -1044,19 +1294,40 @@ async def terabox_session_cmd(client, message):
     filters.command(["continuetera", "resumetera"]) & filters.chat(ALL_CHATS)
 )
 async def continue_terabox_session_cmd(client, message):
-    session_id = _terabox_session_id_from_message(message)
+    requested_id = _terabox_session_id_from_message(message)
     session_doc = (
         await terabox_session_store.get_session(
-            session_id, owner_id=message.from_user.id
+            requested_id, owner_id=message.from_user.id
         )
-        if session_id
+        if requested_id
         else None
     )
+    chain_doc = None
+    if session_doc is None and requested_id:
+        chain_doc = await terabox_session_store.get_chain(
+            requested_id, owner_id=message.from_user.id
+        )
+        if chain_doc is not None:
+            chain_sessions = await terabox_session_store.list_chain(
+                chain_doc["_id"]
+            )
+            session_doc = next(
+                (
+                    item
+                    for item in chain_sessions
+                    if item["state"] != SESSION_COMPLETED
+                ),
+                None,
+            )
+            if session_doc is None:
+                await message.reply_text("That TeraBox chain is already complete.")
+                return
     if session_doc is None:
         await message.reply_text(
-            "Usage: <code>/continuetera &lt;TeraBox session ID&gt;</code>"
+            "Usage: <code>/continuetera &lt;chain or session ID&gt;</code>"
         )
         return
+    session_id = session_doc["_id"]
     chain = await terabox_session_store.list_chain(session_doc["chain_id"])
     blockers = [
         item
@@ -1094,8 +1365,9 @@ help_dict["terabox"] = (
 /splitziptera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - Zip mode
 /splitfiletera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - File mode
 /teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Account for original + split-part disk usage
-/terasession <i>&lt;session ID&gt;</i> - Show part status
-/continuetera <i>&lt;session ID&gt;</i> - Resume a stopped part
+/terasessions <i>[page]</i> - List persistent parent chains and child sessions
+/terasession <i>[session ID]</i> - Show one part or the only running part
+/continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part
 
 Downloads files from TeraBox shares and uploads them to Telegram.""",
 )
