@@ -168,11 +168,13 @@ async def update_status_message(client, chat_id):
             pass
 
 
-async def send_status_message(client, message, refresh_existing=True):
+async def send_status_message(
+    client, message, refresh_existing=True, force_new=False
+):
     chat_id = message.chat.id
     lock = status_message_locks.setdefault(chat_id, asyncio.Lock())
     async with lock:
-        if chat_id in status_messages:
+        if chat_id in status_messages and not force_new:
             if refresh_existing:
                 await update_status_message(client, chat_id)
             if chat_id in status_messages:

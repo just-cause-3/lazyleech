@@ -165,7 +165,9 @@ upload boundary are budgeted at twice their source size because the original
 and complete set of numbered split parts coexist temporarily. Part 1 starts
 immediately, and each following part starts automatically only after all files
 in the previous part have uploaded successfully and their temporary files have
-been removed.
+been removed. If even one source-plus-splits peak cannot fit the requested
+workspace, the command reports the minimum safe limit and creates no partial
+chain. Large plans are displayed ten sessions per page with inline navigation.
 
 Per-file `Files:` summaries are suppressed for these session chains. After the
 entire chain uploads, the bot sends one folder-style, numbered index containing

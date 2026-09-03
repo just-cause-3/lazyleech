@@ -89,6 +89,38 @@ class StatusMessageReuseTests(unittest.IsolatedAsyncioTestCase):
         existing.edit_text.assert_not_awaited()
         client.send_message.assert_not_awaited()
 
+    async def test_manual_status_creates_a_fresh_tracked_message(self):
+        existing = SimpleNamespace(
+            text="old", reply_markup=None, edit_text=AsyncMock(), delete=AsyncMock()
+        )
+        fresh = SimpleNamespace(text=None, reply_markup=None)
+        status.status_messages[-1001] = existing
+        client_tool = SimpleNamespace(send_message=AsyncMock(return_value=fresh))
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1001))
+
+        with patch.object(
+            status, "get_status_text", AsyncMock(return_value=("current", None))
+        ):
+            returned = await status.send_status_message(
+                client_tool, message, force_new=True
+            )
+
+        self.assertIs(fresh, returned)
+        client_tool.send_message.assert_awaited_once_with(
+            -1001, "current", reply_markup=None
+        )
+        existing.edit_text.assert_not_awaited()
+        self.assertIs(fresh, status.status_messages[-1001])
+
+    async def test_status_command_requests_a_fresh_message(self):
+        client_tool = object()
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1001))
+
+        with patch.object(leech, "send_status_message", AsyncMock()) as sender:
+            await leech.list_leeches(client_tool, message)
+
+        sender.assert_awaited_once_with(client_tool, message, force_new=True)
+
 
 if __name__ == "__main__":
     unittest.main()

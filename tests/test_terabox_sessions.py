@@ -128,6 +128,62 @@ class TeraboxSizeSplitTests(unittest.TestCase):
             [[item["name"] for item in group] for group in groups],
         )
 
+    def test_intelligent_limit_detects_a_single_file_that_cannot_fit(self):
+        gib = 1024**3
+        files = [
+            {"name": "fits.bin", "size_bytes": 2 * gib},
+            {"name": "too-large.bin", "size_bytes": 4 * gib},
+        ]
+
+        violations = terabox._intelligent_limit_violations(files, 6 * gib)
+
+        self.assertEqual(["too-large.bin"], [item["name"] for item in violations])
+
+    def test_large_chain_plan_is_paginated_without_truncation(self):
+        gib = 1024**3
+        chain = {
+            "_id": "chain123",
+            "owner_id": 123,
+            "name": "Large Folder",
+            "total_files": 223,
+            "max_bytes": 6 * gib,
+            "planning_mode": "intelligent_workspace",
+            "split_file_count": 50,
+        }
+        sessions = [
+            {
+                "_id": f"session{part:03d}",
+                "part_index": part,
+                "total_parts": 91,
+                "total_files": 2,
+                "part_bytes": gib,
+                "workspace_bytes": 2 * gib,
+                "state": SESSION_RUNNING if part == 1 else SESSION_PAUSED,
+            }
+            for part in range(1, 92)
+        ]
+
+        first_text, first_markup = terabox._terabox_plan_page(
+            chain, sessions, requested_page=1
+        )
+        last_text, _ = terabox._terabox_plan_page(
+            chain, sessions, requested_page=10
+        )
+
+        self.assertIn("Page:</b> 1/10", first_text)
+        self.assertIn("Part 1/91", first_text)
+        self.assertIn("Part 10/91", first_text)
+        self.assertNotIn("Part 11/91", first_text)
+        self.assertIn("Page:</b> 10/10", last_text)
+        self.assertIn("Part 91/91", last_text)
+        self.assertLess(len(first_text.encode("utf-8")), 4096)
+        callback_values = [
+            button.callback_data
+            for row in first_markup.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("terachain_page:123:chain123:2", callback_values)
+
     def test_final_index_is_hierarchical_and_numbers_split_parts(self):
         chain = [{"chain_id": "abc123", "title": "Share (part 1/1)", "_id": "s1"}]
         files = {
@@ -217,6 +273,47 @@ class TeraboxSizeSplitTests(unittest.TestCase):
 
 
 class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_intelligent_creation_rejects_an_unsafe_workspace_limit(self):
+        gib = 1024**3
+        store = TeraboxSessionStore(db_url="")
+        files = [
+            {
+                "name": "large.bin",
+                "path": "Folder/large.bin",
+                "size": 4 * gib,
+                "normal_dlink": "https://cdn.test/large.bin",
+            }
+        ]
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=55,
+        )
+        reply = SimpleNamespace(edit_text=AsyncMock())
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox,
+                "_resolve_terabox_share",
+                AsyncMock(return_value=(None, files)),
+            ),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            sessions = await terabox._create_split_terabox_sessions(
+                object(),
+                message,
+                "https://terabox.com/s/1share",
+                6 * gib,
+                reply,
+                intelligent=True,
+            )
+
+        self.assertEqual([], sessions)
+        self.assertEqual([], await store.list_sessions(owner_id=123, limit=0))
+        self.assertIn("Minimum for this share", reply.edit_text.await_args.args[0])
+        start.assert_not_called()
+
     async def test_split_creation_persists_parent_and_folder_name(self):
         store = TeraboxSessionStore(db_url="")
         files = [

@@ -58,6 +58,7 @@ terabox_session_tasks = {}
 terabox_tasks = set()
 terabox_chain_locks = {}
 TERABOX_CHAIN_PAGE_BYTES = 3300
+TERABOX_PLAN_PAGE_SIZE = 10
 
 
 def _reported_size_bytes(value):
@@ -492,6 +493,107 @@ def _intelligent_workspace_bytes(file_info):
     return source_bytes
 
 
+def _intelligent_limit_violations(files, max_bytes):
+    """Files that cannot fit while retaining the source and all split parts."""
+    return [
+        item
+        for item in files
+        if _intelligent_workspace_bytes(item) > int(max_bytes)
+    ]
+
+
+def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=True):
+    """Render one bounded page of a newly created split-chain plan."""
+    total_parts = len(session_docs)
+    total_pages = max(
+        1, (total_parts + TERABOX_PLAN_PAGE_SIZE - 1) // TERABOX_PLAN_PAGE_SIZE
+    )
+    page = min(max(1, int(requested_page)), total_pages)
+    start = (page - 1) * TERABOX_PLAN_PAGE_SIZE
+    visible = session_docs[start : start + TERABOX_PLAN_PAGE_SIZE]
+    intelligent = chain_doc.get("planning_mode") == "intelligent_workspace"
+    limit_label = "Workspace" if intelligent else "Source"
+    lines = [
+        f"<b>Name:</b> {html.escape(str(chain_doc.get('name') or 'TeraBox'))}",
+        f"<b>TeraBox chain:</b> <code>{chain_doc['_id']}</code>",
+        f"<b>Files:</b> {int(chain_doc.get('total_files') or 0)} | "
+        f"<b>{limit_label} limit:</b> "
+        f"{_human_size(int(chain_doc.get('max_bytes') or 0))}",
+        f"<b>Parts:</b> {total_parts} (automatic, sequential)",
+        f"<b>Page:</b> {page}/{total_pages}",
+        "",
+    ]
+    for session_doc in visible:
+        state = session_doc.get("state")
+        state_text = {
+            SESSION_RUNNING: "running now",
+            SESSION_PAUSED: "queued",
+            SESSION_COMPLETED: "completed",
+            SESSION_FAILED: "stopped",
+        }.get(state, str(state or "unknown"))
+        size_text = _human_size(int(session_doc.get("part_bytes") or 0))
+        if intelligent:
+            size_text += (
+                " source, "
+                f"{_human_size(int(session_doc.get('workspace_bytes') or 0))} "
+                "peak workspace"
+            )
+        lines.append(
+            f"<b>Part {session_doc.get('part_index')}/{total_parts}</b> - "
+            f"{int(session_doc.get('total_files') or 0)} file(s), {size_text} - "
+            f"<code>{session_doc['_id']}</code> ({html.escape(state_text)})"
+        )
+    if intelligent:
+        lines.extend(
+            [
+                "",
+                f"<b>Telegram splitting:</b> "
+                f"{int(chain_doc.get('split_file_count') or 0)} file(s) over "
+                f"{_human_size(TELEGRAM_SPLIT_SIZE)}",
+            ]
+        )
+    storage = "MongoDB" if persistent else "memory only; configure DB_URL"
+    lines.extend(["", f"<b>Storage:</b> {storage}"])
+
+    owner_id = int(chain_doc["owner_id"])
+    chain_id = str(chain_doc["_id"])
+    buttons = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                "Previous",
+                callback_data=f"terachain_page:{owner_id}:{chain_id}:{page - 1}",
+            )
+        )
+    buttons.append(
+        InlineKeyboardButton(
+            f"{page}/{total_pages}",
+            callback_data=f"terachain_page:{owner_id}:{chain_id}:{page}",
+        )
+    )
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton(
+                "Next",
+                callback_data=f"terachain_page:{owner_id}:{chain_id}:{page + 1}",
+            )
+        )
+    return "\n".join(lines), InlineKeyboardMarkup([buttons])
+
+
+async def _stored_terabox_plan_page(owner_id, chain_id, requested_page):
+    chain_doc = await terabox_session_store.get_chain(chain_id, owner_id=owner_id)
+    if chain_doc is None:
+        return None, None
+    sessions = await terabox_session_store.list_chain(chain_id)
+    return _terabox_plan_page(
+        chain_doc,
+        sessions,
+        requested_page=requested_page,
+        persistent=terabox_session_store.persistent,
+    )
+
+
 def _valid_telegram_message_link(value):
     """Return a normalized Telegram message link, or None for unusable links."""
     link = str(value or "").strip()
@@ -878,6 +980,33 @@ async def _create_split_terabox_sessions(
     try:
         resolver, file_list = await _resolve_terabox_share(source_url)
         normalized = _normalize_file_list(file_list, source_url)
+        violations = (
+            _intelligent_limit_violations(normalized, max_bytes)
+            if intelligent
+            else []
+        )
+        if violations:
+            required = max(
+                _intelligent_workspace_bytes(item) for item in violations
+            )
+            examples = ", ".join(
+                html.escape(str(item.get("name") or "unnamed"))
+                for item in violations[:3]
+            )
+            more = (
+                f" and {len(violations) - 3} more"
+                if len(violations) > 3
+                else ""
+            )
+            await reply.edit_text(
+                "The requested intelligent workspace limit is too small. "
+                "The original must remain until every numbered part uploads, "
+                "so a split file needs roughly twice its source size.\n\n"
+                f"<b>Requested:</b> {_human_size(max_bytes)}\n"
+                f"<b>Minimum for this share:</b> {_human_size(required)}\n"
+                f"<b>Files that do not fit:</b> {examples}{more}"
+            )
+            return []
         size_getter = _intelligent_workspace_bytes if intelligent else None
         groups = split_by_cumulative_size(
             normalized, max_bytes, size_getter=size_getter
@@ -954,6 +1083,11 @@ async def _create_split_terabox_sessions(
                 "planning_mode": (
                     "intelligent_workspace" if intelligent else "source_size"
                 ),
+                "split_file_count": sum(
+                    1
+                    for item in normalized
+                    if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
+                ),
                 "auto_continue": True,
             },
         )
@@ -968,58 +1102,17 @@ async def _create_split_terabox_sessions(
         )
         return []
 
-    lines = [
-        f"<b>Name:</b> {html.escape(session_name)}",
-        f"<b>TeraBox chain:</b> <code>{chain_id}</code>",
-        f"<b>Files:</b> {len(normalized)} | "
-        f"<b>{'Workspace' if intelligent else 'Source'} limit:</b> "
-        f"{_human_size(max_bytes)}",
-        f"<b>Parts:</b> {total_parts} (automatic, sequential)",
-        "",
-    ]
-    for session_doc, group in zip(session_docs, groups):
-        part_size = sum(item["size_bytes"] for item in group)
-        workspace_size = sum(_intelligent_workspace_bytes(item) for item in group)
-        state = "running now" if session_doc["part_index"] == 1 else "queued"
-        size_text = _human_size(part_size)
-        if intelligent:
-            size_text += f" source, {_human_size(workspace_size)} peak workspace"
-        lines.append(
-            f"<b>Part {session_doc['part_index']}/{total_parts}</b> - "
-            f"{len(group)} file(s), {size_text} - "
-            f"<code>{session_doc['_id']}</code> ({state})"
-        )
-    if intelligent:
-        split_count = sum(
-            1 for item in normalized if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
-        )
-        oversized = sum(
-            1
-            for item in normalized
-            if _intelligent_workspace_bytes(item) > max_bytes
-        )
-        lines.extend(
-            [
-                "",
-                f"<b>Telegram splitting:</b> {split_count} file(s) over "
-                f"{_human_size(TELEGRAM_SPLIT_SIZE)}",
-            ]
-        )
-        if oversized:
-            lines.append(
-                f"⚠️ {oversized} file(s) individually need more than the "
-                "requested workspace limit and were placed alone."
-            )
-    persistence_note = (
-        "MongoDB"
-        if terabox_session_store.persistent
-        else "memory only; configure DB_URL for restart persistence"
+    text, reply_markup = _terabox_plan_page(
+        chain_doc,
+        session_docs,
+        requested_page=1,
+        persistent=terabox_session_store.persistent,
     )
-    lines.extend(["", f"<b>Storage:</b> {persistence_note}"])
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3990] + "\n..."
-    await reply.edit_text(text, disable_web_page_preview=True)
+    await reply.edit_text(
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
     _start_terabox_session(
         client,
         message,
@@ -1027,6 +1120,37 @@ async def _create_split_terabox_sessions(
         resolved=(resolver, file_list),
     )
     return session_docs
+
+
+@Client.on_callback_query(
+    filters.regex(r"^terachain_page:\d+:[A-Za-z0-9_-]+:\d+$")
+)
+async def terabox_chain_plan_page_callback(client, callback_query):
+    _, owner_text, chain_id, page_text = callback_query.data.split(":", 3)
+    owner_id = int(owner_text)
+    if callback_query.from_user.id != owner_id:
+        await callback_query.answer(
+            "Only the user who created this chain can change its page.",
+            show_alert=True,
+        )
+        return
+    text, reply_markup = await _stored_terabox_plan_page(
+        owner_id, chain_id, int(page_text)
+    )
+    if text is None:
+        await callback_query.answer(
+            "This TeraBox chain is no longer available.", show_alert=True
+        )
+        return
+    try:
+        await callback_query.message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except MessageNotModified:
+        pass
+    await callback_query.answer()
 
 
 @Client.on_message(

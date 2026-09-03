@@ -2109,7 +2109,9 @@ async def file_selection_reply(client, message):
 
 @Client.on_message(filters.command(["list", "status"]) & filters.chat(ALL_CHATS))
 async def list_leeches(client, message):
-    await send_status_message(client, message)
+    # A manual command must produce a visible response next to the command.
+    # Automatic task starts still reuse the tracked board without extra spam.
+    await send_status_message(client, message, force_new=True)
 
 
 @Client.on_message(filters.command("cancelall") & filters.chat(ALL_CHATS))
