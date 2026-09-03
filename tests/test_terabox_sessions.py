@@ -1,14 +1,17 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import lazyleech.plugins.terabox as terabox
+from lazyleech.utils.terabox import TeraboxFile, TeraboxMetadataStaleError
 from lazyleech.utils.terabox_sessions import (
     FILE_DOWNLOADED,
     FILE_FAILED,
     FILE_PENDING,
     FILE_UPLOADED,
     SESSION_COMPLETED,
+    SESSION_FAILED,
     SESSION_PAUSED,
     SESSION_RUNNING,
     TeraboxSessionStore,
@@ -299,6 +302,70 @@ class TeraboxSizeSplitTests(unittest.TestCase):
 
 
 class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_scan_metadata_is_persisted_in_child_sessions(self):
+        store = TeraboxSessionStore(db_url="")
+        source_url = "https://terabox.com/s/1share"
+        native_files = [
+            {
+                "name": "one.bin",
+                "size_formatted": "10 B",
+                "terabox_file": TeraboxFile(
+                    name="one.bin",
+                    relative_path="Folder/one.bin",
+                    size=10,
+                    download_url="https://dm-d.1024terabox.com/file/one",
+                    fs_id="101",
+                ),
+            },
+            {
+                "name": "two.bin",
+                "size_formatted": "10 B",
+                "terabox_file": TeraboxFile(
+                    name="two.bin",
+                    relative_path="Folder/two.bin",
+                    size=10,
+                    download_url="https://dm-d.1024terabox.com/file/two",
+                    fs_id="102",
+                ),
+            },
+        ]
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=55,
+        )
+        reply = SimpleNamespace(edit_text=AsyncMock())
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox,
+                "_resolve_terabox_share",
+                AsyncMock(return_value=(object(), native_files)),
+            ) as scan,
+            patch.object(terabox, "_start_terabox_session"),
+        ):
+            sessions = await terabox._create_split_terabox_sessions(
+                object(), message, source_url, 10, reply
+            )
+            persisted = await store.list_chain_files(sessions[0]["chain_id"])
+
+        scan.assert_awaited_once_with(source_url)
+        self.assertEqual(["101", "102"], [doc["fs_id"] for doc in persisted])
+        self.assertEqual(
+            [
+                "https://dm-d.1024terabox.com/file/one",
+                "https://dm-d.1024terabox.com/file/two",
+            ],
+            [doc["source_dlink"] for doc in persisted],
+        )
+        self.assertEqual(
+            ["Folder/one.bin", "Folder/two.bin"],
+            [doc["relative_path"] for doc in persisted],
+        )
+        chain = await store.get_chain(sessions[0]["chain_id"])
+        self.assertEqual(1, chain["metadata_revision"])
+
     async def test_intelligent_creation_rejects_an_unsafe_workspace_limit(self):
         gib = 1024**3
         store = TeraboxSessionStore(db_url="")
@@ -579,6 +646,176 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session["_id"], selected["_id"])
 
+    async def test_no_argument_selects_latest_when_multiple_sessions_run(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        await store.create_session(
+            **common,
+            title="older",
+            files=[{"page_url": common["source_url"], "filename": "one"}],
+            session_fields={"chain_id": "old", "part_index": 1, "total_parts": 1},
+        )
+        # MongoDB stores datetimes at millisecond precision, so keep the
+        # intended newest-first ordering unambiguous in both store backends.
+        await asyncio.sleep(0.002)
+        latest = await store.create_session(
+            **common,
+            title="latest",
+            files=[{"page_url": common["source_url"], "filename": "two"}],
+            session_fields={"chain_id": "new", "part_index": 1, "total_parts": 1},
+        )
+        message = SimpleNamespace(
+            command=["terasession"],
+            reply_to_message=SimpleNamespace(empty=True),
+            from_user=SimpleNamespace(id=123),
+        )
+
+        with patch.object(terabox, "terabox_session_store", store):
+            selected = await terabox._owned_terabox_session(
+                message, default_states=(SESSION_RUNNING,)
+            )
+
+        self.assertEqual(latest["_id"], selected["_id"])
+
+    async def test_no_argument_falls_back_to_latest_non_running_session(self):
+        store = TeraboxSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://terabox.com/s/1share",
+            title="failed",
+            mode="normal",
+            custom_filename=None,
+            files=[{"page_url": "https://terabox.com/s/1share", "filename": "one"}],
+            session_fields={"chain_id": "chain", "part_index": 1, "total_parts": 1},
+        )
+        await store.set_state(session["_id"], SESSION_FAILED)
+        message = SimpleNamespace(
+            command=["terasession"],
+            reply_to_message=SimpleNamespace(empty=True),
+            from_user=SimpleNamespace(id=123),
+        )
+
+        with patch.object(terabox, "terabox_session_store", store):
+            selected = await terabox._owned_terabox_session(
+                message, default_states=(SESSION_RUNNING,)
+            )
+
+        self.assertEqual(session["_id"], selected["_id"])
+
+    async def test_deleting_child_reindexes_remaining_chain(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        children = []
+        for part in (1, 2, 3):
+            children.append(
+                await store.create_session(
+                    **common,
+                    title=f"Folder (part {part}/3)",
+                    files=[
+                        {
+                            "page_url": common["source_url"],
+                            "filename": f"{part}.bin",
+                        }
+                    ],
+                    initial_state=(
+                        SESSION_RUNNING if part == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "chain_id": "deletechain",
+                        "name": "Folder",
+                        "part_index": part,
+                        "total_parts": 3,
+                    },
+                )
+            )
+        await store.create_chain(
+            chain_id="deletechain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=common["source_url"],
+            name="Folder",
+            mode="normal",
+            total_parts=3,
+            total_files=3,
+            session_ids=[doc["_id"] for doc in children],
+        )
+
+        result = await store.delete_session_from_chain(children[1]["_id"], 123)
+        remaining = await store.list_chain("deletechain")
+        chain = await store.get_chain("deletechain", owner_id=123)
+
+        self.assertEqual(2, result["remaining_sessions"])
+        self.assertEqual([1, 2], [doc["part_index"] for doc in remaining])
+        self.assertEqual([2, 2], [doc["total_parts"] for doc in remaining])
+        self.assertEqual("Folder (part 2/2)", remaining[1]["title"])
+        self.assertEqual([children[0]["_id"], children[2]["_id"]], chain["session_ids"])
+        self.assertEqual(2, chain["total_files"])
+        self.assertIsNone(await store.get_session(children[1]["_id"]))
+
+    async def test_delete_chain_tree_is_owner_scoped(self):
+        store = TeraboxSessionStore(db_url="")
+
+        async def create_owned_chain(owner_id, chain_id):
+            source_url = f"https://terabox.com/s/{chain_id}"
+            child = await store.create_session(
+                owner_id=owner_id,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=source_url,
+                title=f"{chain_id} (part 1/1)",
+                mode="normal",
+                custom_filename=None,
+                files=[{"page_url": source_url, "filename": "one.bin"}],
+                session_fields={
+                    "chain_id": chain_id,
+                    "name": chain_id,
+                    "part_index": 1,
+                    "total_parts": 1,
+                },
+            )
+            await store.create_chain(
+                chain_id=chain_id,
+                owner_id=owner_id,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=source_url,
+                name=chain_id,
+                mode="normal",
+                total_parts=1,
+                total_files=1,
+                session_ids=[child["_id"]],
+            )
+            return child
+
+        owned = await create_owned_chain(123, "ownedchain")
+        foreign = await create_owned_chain(456, "foreignchain")
+
+        self.assertIsNone(await store.delete_chain_tree("foreignchain", 123))
+        result = await store.delete_chain_tree("ownedchain", 123)
+
+        self.assertEqual(1, result["deleted_sessions"])
+        self.assertIsNone(await store.get_chain("ownedchain", owner_id=123))
+        self.assertIsNone(await store.get_session(owned["_id"]))
+        self.assertIsNotNone(await store.get_chain("foreignchain", owner_id=456))
+        self.assertIsNotNone(await store.get_session(foreign["_id"]))
+
     async def test_continue_accepts_parent_chain_id(self):
         store = TeraboxSessionStore(db_url="")
         common = {
@@ -769,6 +1006,319 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(SESSION_COMPLETED, completed["state"])
             self.assertEqual(SESSION_RUNNING, activated["state"])
             self.assertEqual([second["_id"]], started)
+
+    async def test_restarted_runner_uses_mongodb_metadata_without_share_scan(self):
+        store = TeraboxSessionStore(db_url="")
+        source_url = "https://terabox.com/s/1share"
+        child = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            title="Folder (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": source_url,
+                    "filename": "one.bin",
+                    "relative_path": "Folder/one.bin",
+                    "source_position": 1,
+                    "size_bytes": 10,
+                    "fs_id": "101",
+                    "source_dlink": "https://dm-d.1024terabox.com/file/old",
+                    "metadata_revision": 1,
+                }
+            ],
+            session_fields={
+                "chain_id": "durablechain",
+                "part_index": 1,
+                "total_parts": 1,
+                "part_bytes": 10,
+            },
+        )
+        await store.create_chain(
+            chain_id="durablechain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            name="Folder",
+            mode="normal",
+            total_parts=1,
+            total_files=1,
+            session_ids=[child["_id"]],
+            chain_fields={"metadata_revision": 1},
+        )
+        message = SimpleNamespace(reply_text=AsyncMock())
+
+        async def complete_download(*_args, **kwargs):
+            self.assertTrue(await kwargs["on_gid"]("gid"))
+            await kwargs["on_downloaded"]()
+            return "complete"
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox,
+                "_resolve_terabox_share",
+                AsyncMock(side_effect=AssertionError("unexpected complete scan")),
+            ) as scan,
+            patch.object(
+                terabox,
+                "_authorize_stored_terabox_file",
+                AsyncMock(return_value=("https://storage.test/file", [])),
+            ) as authorize,
+            patch.object(
+                terabox, "initiate_directdl", side_effect=complete_download
+            ),
+        ):
+            await terabox._run_terabox_session(
+                object(), message, child["_id"]
+            )
+
+        scan.assert_not_awaited()
+        authorize.assert_awaited_once()
+
+    async def test_stale_metadata_refreshes_whole_chain_once_by_fs_id(self):
+        store = TeraboxSessionStore(db_url="")
+        source_url = "https://terabox.com/s/1share"
+        children = []
+        for part, fs_id in ((1, "101"), (2, "102")):
+            children.append(
+                await store.create_session(
+                    owner_id=123,
+                    chat_id=-1001,
+                    source_message_id=55,
+                    source_url=source_url,
+                    title=f"Folder (part {part}/2)",
+                    mode="normal",
+                    custom_filename=None,
+                    files=[
+                        {
+                            "page_url": source_url,
+                            "filename": f"old-{part}.bin",
+                            "relative_path": f"Folder/old-{part}.bin",
+                            "source_position": part,
+                            "size_bytes": part * 10,
+                            "fs_id": fs_id,
+                            "source_dlink": (
+                                f"https://dm-d.1024terabox.com/file/old-{part}"
+                            ),
+                            "metadata_revision": 1,
+                        }
+                    ],
+                    initial_state=(
+                        SESSION_RUNNING if part == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "chain_id": "refreshchain",
+                        "part_index": part,
+                        "total_parts": 2,
+                    },
+                )
+            )
+        await store.create_chain(
+            chain_id="refreshchain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            name="Folder",
+            mode="normal",
+            total_parts=2,
+            total_files=2,
+            session_ids=[doc["_id"] for doc in children],
+            chain_fields={"metadata_revision": 1},
+        )
+        stale = (await store.list_files(children[0]["_id"]))[0]
+        refreshed_files = [
+            {
+                "name": "renamed-one.bin",
+                "terabox_file": TeraboxFile(
+                    name="renamed-one.bin",
+                    relative_path="Folder/renamed-one.bin",
+                    size=11,
+                    download_url="https://dm-d.1024terabox.com/file/new-1",
+                    fs_id="101",
+                ),
+            },
+            {
+                "name": "renamed-two.bin",
+                "terabox_file": TeraboxFile(
+                    name="renamed-two.bin",
+                    relative_path="Folder/renamed-two.bin",
+                    size=22,
+                    download_url="https://dm-d.1024terabox.com/file/new-2",
+                    fs_id="102",
+                ),
+            },
+        ]
+
+        async def scan_once(_source_url, _cookie):
+            await asyncio.sleep(0.01)
+            return object(), refreshed_files
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="current-cookie"),
+            ),
+            patch.object(
+                terabox, "_resolve_with_cookie", AsyncMock(side_effect=scan_once)
+            ) as scan,
+        ):
+            first, second = await asyncio.gather(
+                terabox._refresh_terabox_chain_metadata(children[0], stale),
+                terabox._refresh_terabox_chain_metadata(children[0], stale),
+            )
+            persisted = await store.list_chain_files("refreshchain")
+
+        scan.assert_awaited_once_with(source_url, "current-cookie")
+        self.assertEqual("https://dm-d.1024terabox.com/file/new-1", first["source_dlink"])
+        self.assertEqual("https://dm-d.1024terabox.com/file/new-1", second["source_dlink"])
+        self.assertEqual(["101", "102"], [doc["fs_id"] for doc in persisted])
+        self.assertEqual(
+            ["renamed-one.bin", "renamed-two.bin"],
+            [doc["filename"] for doc in persisted],
+        )
+        self.assertEqual([2, 2], [doc["metadata_revision"] for doc in persisted])
+
+    async def test_authorization_uses_cookie_current_at_download_time(self):
+        store = TeraboxSessionStore(db_url="")
+        source_url = "https://terabox.com/s/1share"
+        child = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            title="Folder (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": source_url,
+                    "filename": "one.bin",
+                    "relative_path": "Folder/one.bin",
+                    "source_position": 1,
+                    "size_bytes": 10,
+                    "fs_id": "101",
+                    "source_dlink": "https://dm-d.1024terabox.com/file/source",
+                    "metadata_revision": 1,
+                }
+            ],
+            session_fields={
+                "chain_id": "cookiechain",
+                "part_index": 1,
+                "total_parts": 1,
+            },
+        )
+        await store.create_chain(
+            chain_id="cookiechain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url=source_url,
+            name="Folder",
+            mode="normal",
+            total_parts=1,
+            total_files=1,
+            session_ids=[child["_id"]],
+            chain_fields={"metadata_revision": 1},
+        )
+        file_doc = (await store.list_files(child["_id"]))[0]
+        fake_resolver = SimpleNamespace(
+            authorize_download_url=AsyncMock(
+                return_value="https://storage.test/authorized"
+            )
+        )
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="newest-cookie"),
+            ),
+            patch.object(
+                terabox, "TeraboxResolver", return_value=fake_resolver
+            ) as resolver_type,
+        ):
+            url, headers = await terabox._authorize_stored_terabox_file(
+                child, file_doc
+            )
+
+        resolver_type.assert_called_once_with(
+            terabox.session, "newest-cookie", terabox.TERABOX_BASE_URL
+        )
+        fake_resolver.authorize_download_url.assert_awaited_once_with(
+            "https://dm-d.1024terabox.com/file/source"
+        )
+        self.assertEqual("https://storage.test/authorized", url)
+        self.assertFalse(any(header.startswith("Cookie:") for header in headers))
+
+    async def test_stale_authorization_refreshes_and_retries_once(self):
+        session_doc = {
+            "_id": "session",
+            "chain_id": "chain",
+            "source_url": "https://terabox.com/s/1share",
+        }
+        stale = {
+            "_id": "session:1",
+            "filename": "one.bin",
+            "fs_id": "101",
+            "source_dlink": "https://dm-d.1024terabox.com/file/old",
+            "metadata_revision": 1,
+        }
+        refreshed = {
+            **stale,
+            "source_dlink": "https://dm-d.1024terabox.com/file/new",
+            "metadata_revision": 2,
+        }
+        old_resolver = SimpleNamespace(
+            authorize_download_url=AsyncMock(
+                side_effect=TeraboxMetadataStaleError("expired")
+            )
+        )
+        new_resolver = SimpleNamespace(
+            authorize_download_url=AsyncMock(
+                return_value="https://storage.test/authorized"
+            )
+        )
+
+        with (
+            patch.object(
+                terabox,
+                "_cached_terabox_file",
+                AsyncMock(return_value=stale),
+            ),
+            patch.object(
+                terabox,
+                "_refresh_terabox_chain_metadata",
+                AsyncMock(return_value=refreshed),
+            ) as refresh,
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(side_effect=["cookie-one", "cookie-two"]),
+            ),
+            patch.object(
+                terabox,
+                "TeraboxResolver",
+                side_effect=[old_resolver, new_resolver],
+            ),
+        ):
+            url, _headers = await terabox._authorize_stored_terabox_file(
+                session_doc, stale
+            )
+
+        refresh.assert_awaited_once_with(session_doc, stale)
+        new_resolver.authorize_download_url.assert_awaited_once_with(
+            refreshed["source_dlink"]
+        )
+        self.assertEqual("https://storage.test/authorized", url)
 
     async def test_runner_skips_failed_download_and_finishes_after_other_uploads(self):
         store = TeraboxSessionStore(db_url="")

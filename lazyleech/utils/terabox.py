@@ -48,6 +48,10 @@ class TeraboxError(RuntimeError):
     """Raised when a TeraBox share cannot be resolved safely."""
 
 
+class TeraboxMetadataStaleError(TeraboxError):
+    """Raised when a previously stored TeraBox source dlink has expired."""
+
+
 def _needs_verification(data: dict[str, Any]) -> bool:
     try:
         errno = int(data.get("errno"))
@@ -124,6 +128,22 @@ def _cookie_site(hostname: str) -> str:
         if hostname == suffix or hostname.endswith("." + suffix):
             return suffix
     return hostname
+
+
+def is_same_site_source_dlink(value: str, origin: str) -> bool:
+    """Return whether a source dlink may safely receive the account cookie."""
+
+    parsed = urlparse(value or "")
+    origin_host = urlparse(origin or "").hostname or ""
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and origin_host
+        and not parsed.username
+        and not parsed.password
+        and parsed.port in (None, 443)
+        and _cookie_site(parsed.hostname) == _cookie_site(origin_host)
+    )
 
 
 class TeraboxResolver:
@@ -323,11 +343,7 @@ class TeraboxResolver:
         host.
         """
 
-        parsed = urlparse(download_url)
-        origin_host = urlparse(self.origin).hostname or ""
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise TeraboxError("TeraBox returned an insecure download URL")
-        if _cookie_site(parsed.hostname) != _cookie_site(origin_host):
+        if not is_same_site_source_dlink(download_url, self.origin):
             raise TeraboxError(
                 "Refusing to send the TeraBox cookie to a different site"
             )
@@ -342,17 +358,32 @@ class TeraboxResolver:
             timeout=self.timeout,
             allow_redirects=False,
         ) as response:
-            await response.content.read(512)
+            response_prefix = await response.content.read(512)
+            response_text = response_prefix.decode("utf-8", errors="ignore")
+            if "need verify" in response_text.lower():
+                raise TeraboxError(
+                    "TeraBox requires browser/account verification. Complete "
+                    "verification in the official app or website, save a fresh "
+                    "ndus cookie, and retry later"
+                )
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location", "")
+                if not location:
+                    raise TeraboxMetadataStaleError(
+                        "The stored TeraBox download metadata is stale"
+                    )
                 target = urljoin(str(response.url), location)
                 target_parts = urlparse(target)
                 if target_parts.scheme != "https" or not target_parts.hostname:
                     raise TeraboxError("TeraBox returned an insecure CDN redirect")
                 return target
             if response.status in {200, 206}:
-                raise TeraboxError(
-                    "TeraBox did not provide a cookie-free CDN redirect"
+                raise TeraboxMetadataStaleError(
+                    "The stored TeraBox dlink no longer produces a CDN redirect"
+                )
+            if response.status in {400, 403, 404, 410}:
+                raise TeraboxMetadataStaleError(
+                    f"The stored TeraBox dlink returned HTTP {response.status}"
                 )
             raise TeraboxError(
                 f"TeraBox download authorization returned HTTP {response.status}"
@@ -381,14 +412,24 @@ class TeraboxResolver:
             dlink = str(item.get("dlink") or "")
             if not dlink:
                 continue
+            fs_id = str(item.get("fs_id") or "").strip()
+            if not fs_id:
+                raise TeraboxError(
+                    f"TeraBox did not provide a stable fs_id for {name}"
+                )
+            source_dlink = _download_url(dlink)
+            if not is_same_site_source_dlink(source_dlink, self.origin):
+                raise TeraboxError(
+                    f"TeraBox returned an unsafe cross-site source dlink for {name}"
+                )
             relative_path = "/".join(part for part in (relative_dir, name) if part)
             output.append(
                 TeraboxFile(
                     name=name,
                     relative_path=relative_path,
                     size=int(item.get("size") or 0),
-                    download_url=_download_url(dlink),
-                    fs_id=str(item.get("fs_id") or ""),
+                    download_url=source_dlink,
+                    fs_id=fs_id,
                 )
             )
 

@@ -23,12 +23,14 @@ from .. import (
     help_dict,
     session,
 )
+from ..utils.aria2 import Aria2Error, aria2_remove
 from ..utils.file_split import TELEGRAM_SPLIT_SIZE
 from ..utils.terabox import (
     DEFAULT_TERABOX_ENDPOINT,
     TERABOX_USER_AGENT,
     TeraboxError,
     TeraboxResolver,
+    TeraboxMetadataStaleError,
     extract_surl,
 )
 from ..utils.terabox_account import (
@@ -66,8 +68,20 @@ TERABOX_CONFIG = TeraboxConfigStore()
 terabox_session_tasks = {}
 terabox_tasks = set()
 terabox_chain_locks = {}
+terabox_chain_refresh_locks = {}
+terabox_chain_cache = {}
 TERABOX_CHAIN_PAGE_BYTES = 3300
 TERABOX_PLAN_PAGE_SIZE = 10
+_TERABOX_METADATA_FIELDS = (
+    "fs_id",
+    "source_dlink",
+    "relative_path",
+    "filename",
+    "size_bytes",
+    "source_position",
+    "metadata_revision",
+    "metadata_updated_at",
+)
 
 
 def _bounded_env_int(name, default, minimum=1, maximum=None):
@@ -133,9 +147,13 @@ def _normalized_file(file_info, position, source_url):
         name = item.name
         relative_path = item.relative_path or item.name
         size_bytes = int(item.size or 0)
+        fs_id = str(item.fs_id or "").strip()
+        source_dlink = str(item.download_url or "").strip()
     else:
         name = str(file_info.get("name") or f"terabox-file-{position}")
         relative_path = str(file_info.get("path") or name)
+        fs_id = str(file_info.get("fs_id") or "").strip()
+        source_dlink = str(file_info.get("source_dlink") or "").strip()
         size_bytes = None
         for key in ("size_bytes", "size", "size_formatted"):
             size_bytes = _reported_size_bytes(file_info.get(key))
@@ -145,13 +163,24 @@ def _normalized_file(file_info, position, source_url):
             raise TeraboxError(
                 f"TeraBox did not report a size for {name}; it cannot be size-split"
             )
-    return {
+    normalized = {
         "page_url": source_url,
         "filename": name,
         "relative_path": relative_path,
         "source_position": int(position),
         "size_bytes": max(0, int(size_bytes)),
     }
+    if fs_id:
+        normalized["fs_id"] = fs_id
+    if source_dlink:
+        normalized["source_dlink"] = source_dlink
+        normalized["metadata_revision"] = 1
+    # Preserve legacy API results too. They do not receive an account cookie
+    # and are not considered durable native TeraBox metadata.
+    for key in ("normal_dlink", "zip_dlink"):
+        if file_info.get(key):
+            normalized[key] = str(file_info[key])
+    return normalized
 
 
 def _normalize_file_list(file_list, source_url):
@@ -440,6 +469,136 @@ async def _resolve_terabox_share(link):
     )
 
 
+def _terabox_chain_cache_key(chain_id):
+    # Tests and hot-reload deployments can replace the store object. Including
+    # its identity prevents metadata from another store leaking into this one.
+    return id(terabox_session_store), str(chain_id)
+
+
+async def _load_terabox_chain_cache(chain_id, *, force=False):
+    """Hydrate one chain's durable metadata from MongoDB/memory once."""
+    cache_key = _terabox_chain_cache_key(chain_id)
+    if not force and cache_key in terabox_chain_cache:
+        return terabox_chain_cache[cache_key]
+    files = await terabox_session_store.list_chain_files(str(chain_id))
+    entry = {
+        "files": {str(doc["_id"]): doc for doc in files},
+        "by_fs_id": {
+            str(doc["fs_id"]): doc
+            for doc in files
+            if str(doc.get("fs_id") or "").strip()
+        },
+    }
+    terabox_chain_cache[cache_key] = entry
+    return entry
+
+
+def _evict_terabox_chain_cache(chain_id):
+    cache_key = _terabox_chain_cache_key(chain_id)
+    terabox_chain_cache.pop(cache_key, None)
+    terabox_chain_refresh_locks.pop(cache_key, None)
+
+
+async def _cached_terabox_file(session_doc, file_doc):
+    chain_id = session_doc.get("chain_id") or session_doc["_id"]
+    cache = await _load_terabox_chain_cache(chain_id)
+    cached = cache["files"].get(str(file_doc["_id"]))
+    if cached is None:
+        return file_doc
+    merged = dict(file_doc)
+    for key in _TERABOX_METADATA_FIELDS:
+        if key in cached:
+            merged[key] = cached[key]
+    return merged
+
+
+async def _refresh_terabox_chain_metadata(session_doc, stale_file):
+    """Refresh a share once and reconcile every child by stable fs_id."""
+    chain_id = str(session_doc.get("chain_id") or session_doc["_id"])
+    cache_key = _terabox_chain_cache_key(chain_id)
+    lock = terabox_chain_refresh_locks.setdefault(cache_key, asyncio.Lock())
+    stale_revision = int(stale_file.get("metadata_revision") or 0)
+    stale_dlink = str(stale_file.get("source_dlink") or "")
+
+    async with lock:
+        # Another downloader may have refreshed while this coroutine waited.
+        current = await terabox_session_store.get_file(stale_file["_id"])
+        if current is None:
+            raise TeraboxError("The TeraBox session file was deleted")
+        current_revision = int(current.get("metadata_revision") or 0)
+        current_dlink = str(current.get("source_dlink") or "")
+        if current_dlink and (
+            current_revision > stale_revision
+            or (stale_dlink and current_dlink != stale_dlink)
+        ):
+            await _load_terabox_chain_cache(chain_id, force=True)
+            return current
+
+        cookie = await TERABOX_CONFIG.get_cookie()
+        if not cookie:
+            raise TeraboxError(
+                "TeraBox is not configured. Set a valid ndus cookie first"
+            )
+        _, refreshed_files = await _resolve_with_cookie(
+            session_doc["source_url"], cookie
+        )
+        normalized = _normalize_file_list(
+            refreshed_files, session_doc["source_url"]
+        )
+        result = await terabox_session_store.replace_chain_file_metadata(
+            chain_id, normalized
+        )
+        await _load_terabox_chain_cache(chain_id, force=True)
+        refreshed = next(
+            (
+                doc
+                for doc in result["files"]
+                if doc["_id"] == stale_file["_id"]
+            ),
+            None,
+        )
+        if (
+            refreshed is None
+            or stale_file["_id"] in result["unmatched_file_ids"]
+            or not refreshed.get("source_dlink")
+        ):
+            raise TeraboxError(
+                f"The refreshed share no longer contains fs_id "
+                f"{stale_file.get('fs_id') or 'for ' + stale_file['filename']}"
+            )
+        return refreshed
+
+
+async def _authorize_stored_terabox_file(session_doc, file_doc):
+    """Authorize durable metadata using the cookie current at download time."""
+    metadata = await _cached_terabox_file(session_doc, file_doc)
+    if not metadata.get("source_dlink") or not metadata.get("fs_id"):
+        metadata = await _refresh_terabox_chain_metadata(session_doc, metadata)
+
+    for attempt in range(2):
+        cookie = await TERABOX_CONFIG.get_cookie()
+        if not cookie:
+            raise TeraboxError(
+                "TeraBox is not configured. Set a valid ndus cookie first"
+            )
+        resolver = TeraboxResolver(session, cookie, TERABOX_BASE_URL)
+        try:
+            download_url = await resolver.authorize_download_url(
+                metadata["source_dlink"]
+            )
+            return download_url, [
+                f"User-Agent: {TERABOX_USER_AGENT}",
+                f"Referer: {TERABOX_BASE_URL}",
+            ]
+        except TeraboxMetadataStaleError:
+            if attempt:
+                raise
+            metadata = await _refresh_terabox_chain_metadata(
+                session_doc, metadata
+            )
+    raise TeraboxError("TeraBox download authorization failed")
+
+
 def _terabox_flags_from_mode(mode):
     if mode == "zip":
         return (SendAsZipFlag,)
@@ -490,6 +649,32 @@ def _start_terabox_session(client, message, session_id, resolved=None):
 
     task.add_done_callback(_discard)
     return task
+
+
+async def _stop_terabox_session_runtime(session_doc):
+    """Stop active downloading while leaving accepted Telegram uploads alone."""
+    session_id = session_doc["_id"]
+    task = terabox_session_tasks.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    file_docs = await terabox_session_store.list_files(session_id)
+    for file_doc in file_docs:
+        gid = file_doc.get("gid")
+        if gid:
+            try:
+                await aria2_remove(session, gid)
+            except Aria2Error:
+                pass
+        # FILE_DOWNLOADED means the upload worker may still be reading this
+        # path. Everything else is inactive or an abandoned partial download.
+        if file_doc.get("status") != FILE_DOWNLOADED:
+            await asyncio.to_thread(
+                shutil.rmtree,
+                _terabox_download_dir(session_doc, file_doc),
+                True,
+            )
 
 
 async def _record_terabox_session_crash(message, session_id, error):
@@ -1090,8 +1275,13 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
             )
             file_list = None
         else:
-            resolver, file_list = resolved or await _resolve_terabox_share(
-                session_doc["source_url"]
+            # Native share sessions carry fs_id + source dlink in MongoDB.
+            # ``resolved`` remains only as a compatibility path for old/XAPI
+            # sessions which did not have durable native metadata.
+            resolver = resolved[0] if resolved else None
+            file_list = resolved[1] if resolved else None
+            await _load_terabox_chain_cache(
+                session_doc.get("chain_id") or session_id
             )
     except Exception as error:
         await _fail_terabox_session(message, session_id, None, error)
@@ -1135,13 +1325,48 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     if batch_download.range_supported
                     else None
                 )
-            else:
+            elif file_doc.get("source_dlink") and file_doc.get("fs_id"):
+                download_url, request_headers = (
+                    await _authorize_stored_terabox_file(session_doc, file_doc)
+                )
+                max_connections = 8
+                segmented_total_length = None
+                file_info = None
+            elif file_doc.get("normal_dlink") or file_doc.get("zip_dlink"):
+                # Legacy third-party resolver URLs are cookie-free and cannot
+                # participate in native fs_id metadata refreshes.
+                download_url = file_doc.get("normal_dlink") or file_doc.get(
+                    "zip_dlink"
+                )
+                request_headers = None
+                max_connections = 8
+                segmented_total_length = None
+                file_info = None
+            elif file_list is not None:
                 file_info = _resolved_file_for_session(
                     file_doc, file_list, session_doc["source_url"]
                 )
                 max_connections = 8
                 segmented_total_length = None
-            if provider != "terabox_account_batch" and resolver is not None:
+            else:
+                # This is a pre-metadata session loaded after a restart. A full
+                # scan is now justified and migrates every child in its chain.
+                refreshed = await _refresh_terabox_chain_metadata(
+                    session_doc, file_doc
+                )
+                download_url, request_headers = (
+                    await _authorize_stored_terabox_file(
+                        session_doc, refreshed
+                    )
+                )
+                max_connections = 8
+                segmented_total_length = None
+                file_info = None
+            if (
+                provider != "terabox_account_batch"
+                and file_info is not None
+                and resolver is not None
+            ):
                 item = file_info["terabox_file"]
                 download_url = await resolver.authorize_download_url(
                     item.download_url
@@ -1150,7 +1375,10 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     f"User-Agent: {TERABOX_USER_AGENT}",
                     f"Referer: {TERABOX_BASE_URL}",
                 ]
-            elif provider != "terabox_account_batch":
+            elif (
+                provider != "terabox_account_batch"
+                and file_info is not None
+            ):
                 download_url = file_info.get("normal_dlink") or file_info.get(
                     "zip_dlink"
                 )
@@ -1348,6 +1576,9 @@ async def _create_split_terabox_sessions(
 
     chain_id = new_session_id()
     total_parts = len(groups)
+    durable_metadata = all(
+        item.get("fs_id") and item.get("source_dlink") for item in normalized
+    )
     share_name = extract_surl(source_url)[:24]
     session_name = infer_shared_folder_name(
         normalized, fallback=f"TeraBox {share_name}"
@@ -1415,6 +1646,8 @@ async def _create_split_terabox_sessions(
                     if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
                 ),
                 "auto_continue": True,
+                "metadata_revision": 1 if durable_metadata else 0,
+                "metadata_file_count": len(normalized) if durable_metadata else 0,
             },
         )
     except Exception as error:
@@ -1427,6 +1660,8 @@ async def _create_split_terabox_sessions(
             f"Error: {html.escape(str(error))[:500]}"
         )
         return []
+
+    await _load_terabox_chain_cache(chain_id, force=True)
 
     text, reply_markup = _terabox_plan_page(
         chain_doc,
@@ -1752,12 +1987,19 @@ async def _owned_terabox_session(message, default_states=None):
         return await terabox_session_store.get_session(
             session_id, owner_id=message.from_user.id
         )
+    if default_states:
+        sessions = await terabox_session_store.list_sessions(
+            owner_id=message.from_user.id,
+            states=default_states,
+            limit=1,
+        )
+        if sessions:
+            return sessions[0]
     sessions = await terabox_session_store.list_sessions(
         owner_id=message.from_user.id,
-        states=default_states,
-        limit=2,
+        limit=1,
     )
-    return sessions[0] if len(sessions) == 1 else None
+    return sessions[0] if sessions else None
 
 
 def _chain_session_line(session_doc, *, is_last=False):
@@ -1835,7 +2077,8 @@ async def _terabox_sessions_page(owner_id, requested_page=1):
         f"<b>Your TeraBox chains</b> — Page {page}/{total_pages}\n\n"
         f"{pages[page - 1]}\n\n"
         "Inspect: <code>/terasession SESSION_ID</code>\n"
-        "Resume: <code>/continuetera CHAIN_OR_SESSION_ID</code>"
+        "Resume: <code>/continuetera CHAIN_OR_SESSION_ID</code>\n"
+        "Delete: <code>/deleteterachain CHAIN_ID</code>"
     )
     if not terabox_session_store.persistent:
         text += "\n\nDB_URL is not configured; these records are memory-only."
@@ -1910,8 +2153,7 @@ async def terabox_session_cmd(client, message):
     )
     if session_doc is None:
         await message.reply_text(
-            "TeraBox session not found or more than one session is running. "
-            "Use <code>/terasessions</code> and then "
+            "TeraBox session not found. Use <code>/terasessions</code> and then "
             "<code>/terasession SESSION_ID</code>."
         )
         return
@@ -1999,6 +2241,112 @@ async def continue_terabox_session_cmd(client, message):
     )
 
 
+@Client.on_message(
+    filters.command(["deleteterasession", "delterasession"])
+    & filters.chat(ALL_CHATS)
+)
+async def delete_terabox_session_cmd(client, message):
+    session_id = _terabox_session_id_from_message(message)
+    session_doc = (
+        await terabox_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+        if session_id
+        else None
+    )
+    if session_doc is None:
+        await message.reply_text(
+            "Session not found. Use "
+            "<code>/deleteterasession &lt;session ID&gt;</code>."
+        )
+        return
+    await _stop_terabox_session_runtime(session_doc)
+    result = await terabox_session_store.delete_session_from_chain(
+        session_doc["_id"], message.from_user.id
+    )
+    if result is None:
+        await message.reply_text("That TeraBox session was already deleted.")
+        return
+    _evict_terabox_chain_cache(result["chain_id"])
+    if result["remaining_sessions"]:
+        await _load_terabox_chain_cache(result["chain_id"], force=True)
+    remaining = int(result["remaining_sessions"])
+    suffix = (
+        f" The remaining {remaining} part(s) were renumbered and can still be resumed."
+        if remaining
+        else " Its now-empty parent chain was also deleted."
+    )
+    await message.reply_text(
+        f"Deleted TeraBox session <code>{session_doc['_id']}</code> and its file "
+        f"history from the database.{suffix} Already queued Telegram uploads "
+        "were not cancelled."
+    )
+
+
+@Client.on_message(
+    filters.command(["deleteterachain", "delterachain"])
+    & filters.chat(ALL_CHATS)
+)
+async def delete_terabox_chain_cmd(client, message):
+    chain_id = _terabox_session_id_from_message(message)
+    chain_doc = (
+        await terabox_session_store.get_chain(
+            chain_id, owner_id=message.from_user.id
+        )
+        if chain_id
+        else None
+    )
+    if chain_doc is None:
+        await message.reply_text(
+            "Chain not found. Use "
+            "<code>/deleteterachain &lt;chain ID&gt;</code>."
+        )
+        return
+    children = await terabox_session_store.list_chain(chain_doc["_id"])
+    for session_doc in children:
+        if session_doc["owner_id"] == message.from_user.id:
+            await _stop_terabox_session_runtime(session_doc)
+    result = await terabox_session_store.delete_chain_tree(
+        chain_doc["_id"], message.from_user.id
+    )
+    _evict_terabox_chain_cache(chain_doc["_id"])
+    await message.reply_text(
+        f"Deleted TeraBox chain <code>{chain_doc['_id']}</code>, "
+        f"{result['deleted_sessions']} child session(s), and their file history "
+        "from the database. Already queued Telegram uploads were not cancelled."
+    )
+
+
+@Client.on_message(
+    filters.command(["deleteallterasessions", "deletealltera"])
+    & filters.chat(ALL_CHATS)
+)
+async def delete_all_terabox_sessions_cmd(client, message):
+    sessions = await terabox_session_store.list_sessions(
+        owner_id=message.from_user.id, limit=0
+    )
+    chains = await terabox_session_store.list_chains(
+        owner_id=message.from_user.id, limit=0
+    )
+    if not sessions and not chains:
+        await message.reply_text(
+            "You do not have any TeraBox sessions or chains to delete."
+        )
+        return
+    for session_doc in sessions:
+        await _stop_terabox_session_runtime(session_doc)
+    for chain_doc in chains:
+        _evict_terabox_chain_cache(chain_doc["_id"])
+    result = await terabox_session_store.delete_all_for_owner(
+        message.from_user.id
+    )
+    await message.reply_text(
+        f"Deleted {result['deleted_chains']} TeraBox chain(s), "
+        f"{result['deleted_sessions']} child session(s), and their file history "
+        "from the database. Already queued Telegram uploads were not cancelled."
+    )
+
+
 help_dict["terabox"] = (
     "TeraBox",
     """/tera <i>&lt;TeraBox URL&gt;</i>
@@ -2010,8 +2358,11 @@ help_dict["terabox"] = (
 /teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Plan for source + split-part disk usage
 /batchdltera <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively batch-download an account folder (admins only)
 /terasessions <i>[page]</i> - List persistent parent chains and child sessions
-/terasession <i>[session ID]</i> - Show one part or the only running part
+/terasession <i>[session ID]</i> - Show one part or the latest active/recent part
 /continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part
+/deleteterasession <i>&lt;session ID&gt;</i> - Delete one child session and reindex its chain
+/deleteterachain <i>&lt;chain ID&gt;</i> - Delete a chain and all child histories
+/deleteallterasessions - Delete all your TeraBox chain/session histories
 
 Downloads files from TeraBox shares and uploads them to Telegram.""",
 )

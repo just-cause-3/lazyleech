@@ -102,8 +102,11 @@ splitziptera <TeraBox share URL> <size> - Create ZIP-mode sessions
 splitfiletera <TeraBox share URL> <size> - Create force-file sessions
 teraintelligent <TeraBox share URL> <workspace> - Plan for source plus split copies
 terasessions [page] - List persistent parent chains and child sessions
-terasession [session ID] - Show one part or the only running part
+terasession [session ID] - Show one part or the latest active/recent part
 continuetera <chain or session ID> - Resume the next unfinished part
+deleteterasession <session ID> - Delete one child session and reindex its chain
+deleteterachain <chain ID> - Delete a chain and all child histories
+deleteallterasessions - Delete all of your TeraBox histories
 setteraboxcookie <ndus value> - Validate and persist a replacement cookie (chat admin)
 teraboxcookiestatus - Show cookie source without revealing it (chat admin)
 clearteraboxcookie - Remove the database override (chat admin)
@@ -212,11 +215,28 @@ Each parent chain is stored in `TERABOX_CHAINS`, each child part in
 `DB_URL` is configured. Parent and child records include a `name` derived from
 the shared top-level folder, falling back to the share code for root-level
 files. `/terasessions [page]` shows the persistent parent/child hierarchy. Use
-`/terasession [ID]` to inspect a part; without an ID it selects the only running
-part. `/continuetera ID` accepts either a chain ID or a child session ID, so a
-stopped chain can be resumed after a restart. Older stored TeraBox sessions are
-backfilled into parent chain records when listed. `GB` and `GiB` both use
-1024-based units.
+`/terasession [ID]` to inspect a part; without an ID it selects the most recently
+updated running part, falling back to the most recently updated session when no
+part is active. `/continuetera ID` accepts either a chain ID or a child session
+ID, so a stopped chain can be resumed after a restart. `/deleteterasession ID`
+removes one child and closes the part-number gap, `/deleteterachain ID` removes a
+parent and all of its children, and `/deleteallterasessions` removes every
+TeraBox chain/session owned by the caller. Deletion removes MongoDB history and
+abandoned partial downloads but does not interrupt files already queued for
+Telegram upload. Older stored TeraBox sessions are backfilled into parent chain
+records when listed. `GB` and `GiB` both use 1024-based units.
+
+Native share chains scan the complete share once when they are created. Every
+file's stable `fs_id`, relative path, byte size, source position, and same-site
+TeraBox dlink are stored in `TERABOX_SESSION_FILES` and cached in memory for the
+life of the bot process. Each download exchanges that stored dlink using the
+currently configured cookie, so later parts and post-restart resumes normally
+read MongoDB without listing the share again. If TeraBox specifically rejects a
+stored dlink as stale, one coroutine refreshes the complete manifest under a
+per-chain lock, reconciles all child-session records by `fs_id`, and retries the
+authorization once. Account verification errors are not treated as stale
+metadata and therefore do not trigger repeated share scans. Legacy records
+without an `fs_id` are migrated once by a unique relative-path match.
 
 An administrator can replace an expired cookie in a configured admin chat with
 `/setteraboxcookie VALUE`. In groups, the sender must be a Telegram owner or

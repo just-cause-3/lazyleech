@@ -23,6 +23,7 @@ _SPEC.loader.exec_module(_MODULE)
 DEFAULT_TERABOX_ENDPOINT = _MODULE.DEFAULT_TERABOX_ENDPOINT
 TERABOX_USER_AGENT = _MODULE.TERABOX_USER_AGENT
 TeraboxError = _MODULE.TeraboxError
+TeraboxMetadataStaleError = _MODULE.TeraboxMetadataStaleError
 TeraboxFile = _MODULE.TeraboxFile
 TeraboxResolver = _MODULE.TeraboxResolver
 configured_resolver = _MODULE.configured_resolver
@@ -35,6 +36,7 @@ __all__ = [
     "DEFAULT_TERABOX_ENDPOINT",
     "TERABOX_USER_AGENT",
     "TeraboxError",
+    "TeraboxMetadataStaleError",
     "TeraboxFile",
     "TeraboxResolver",
     "configured_resolver",

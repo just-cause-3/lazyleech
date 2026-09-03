@@ -4,7 +4,7 @@ import asyncio
 import copy
 import re
 
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING, UpdateOne
 
 from .bunkr_sessions import (
     FILE_CANCELLED,
@@ -235,7 +235,13 @@ class TeraboxSessionStore(BunkrSessionStore):
         query = {"owner_id": int(owner_id)} if owner_id is not None else {}
         skip = max(0, int(skip))
         if self.persistent:
-            cursor = self.chains.find(query).sort("updated_at", -1)
+            cursor = self.chains.find(query).sort(
+                [
+                    ("updated_at", DESCENDING),
+                    ("created_at", DESCENDING),
+                    ("_id", DESCENDING),
+                ]
+            )
             if skip:
                 cursor = cursor.skip(skip)
             if limit:
@@ -247,17 +253,295 @@ class TeraboxSessionStore(BunkrSessionStore):
                 for doc in self._memory_chains.values()
                 if owner_id is None or doc["owner_id"] == int(owner_id)
             ]
-            docs.sort(key=lambda doc: doc["updated_at"], reverse=True)
+            docs.sort(
+                key=lambda doc: (
+                    doc["updated_at"],
+                    doc.get("created_at") or doc["updated_at"],
+                    str(doc["_id"]),
+                ),
+                reverse=True,
+            )
             docs = docs[skip:]
             return copy.deepcopy(docs[:limit] if limit else docs)
 
-    async def delete_chain(self, chain_id):
+    async def delete_chain(self, chain_id, owner_id=None):
+        query = {"_id": str(chain_id)}
+        if owner_id is not None:
+            query["owner_id"] = int(owner_id)
         if self.persistent:
             await self._ensure_indexes()
-            result = await self.chains.delete_one({"_id": str(chain_id)})
+            result = await self.chains.delete_one(query)
             return bool(result.deleted_count)
         async with self._memory_lock:
-            return self._memory_chains.pop(str(chain_id), None) is not None
+            doc = self._memory_chains.get(str(chain_id))
+            if doc is None or (
+                owner_id is not None and doc["owner_id"] != int(owner_id)
+            ):
+                return False
+            self._memory_chains.pop(str(chain_id), None)
+            return True
+
+    async def _reindex_chain(self, chain_id, owner_id):
+        """Close part-number gaps after deleting one child session."""
+        sessions = await self.list_chain(str(chain_id))
+        sessions = [
+            doc for doc in sessions if doc["owner_id"] == int(owner_id)
+        ]
+        if not sessions:
+            await self.delete_chain(chain_id, owner_id=owner_id)
+            return []
+
+        now = utcnow()
+        total_parts = len(sessions)
+        for part_index, session_doc in enumerate(sessions, 1):
+            title_base = re.sub(
+                r"\s*\(part\s+\d+/\d+\)\s*$",
+                "",
+                str(session_doc.get("title") or session_doc.get("name") or "TeraBox"),
+                flags=re.IGNORECASE,
+            ).strip()
+            fields = {
+                "part_index": part_index,
+                "total_parts": total_parts,
+                "title": f"{title_base or 'TeraBox'} (part {part_index}/{total_parts})",
+                "updated_at": now,
+            }
+            if self.persistent:
+                await self.sessions.update_one(
+                    {"_id": session_doc["_id"], "owner_id": int(owner_id)},
+                    {"$set": fields},
+                )
+            else:
+                async with self._memory_lock:
+                    current = self._memory_sessions.get(session_doc["_id"])
+                    if current is not None and current["owner_id"] == int(owner_id):
+                        current.update(copy.deepcopy(fields))
+            session_doc.update(copy.deepcopy(fields))
+
+        chain_fields = {
+            "session_ids": [doc["_id"] for doc in sessions],
+            "total_parts": total_parts,
+            "total_files": sum(int(doc.get("total_files") or 0) for doc in sessions),
+            "updated_at": now,
+        }
+        if self.persistent:
+            await self.chains.update_one(
+                {"_id": str(chain_id), "owner_id": int(owner_id)},
+                {"$set": chain_fields},
+            )
+        else:
+            async with self._memory_lock:
+                chain_doc = self._memory_chains.get(str(chain_id))
+                if chain_doc is not None and chain_doc["owner_id"] == int(owner_id):
+                    chain_doc.update(copy.deepcopy(chain_fields))
+        return copy.deepcopy(sessions)
+
+    async def delete_session_from_chain(self, session_id, owner_id):
+        """Delete an owned child session and keep its parent chain usable."""
+        owner_id = int(owner_id)
+        await self._ensure_indexes()
+        await self._backfill_chain_records(owner_id=owner_id)
+        session_doc = await self.get_session(str(session_id), owner_id=owner_id)
+        if session_doc is None:
+            return None
+        chain_id = str(session_doc.get("chain_id") or session_doc["_id"])
+        await super().delete_session(session_doc["_id"])
+        remaining = await self._reindex_chain(chain_id, owner_id)
+        return {
+            "session": session_doc,
+            "chain_id": chain_id,
+            "remaining_sessions": len(remaining),
+        }
+
+    async def delete_chain_tree(self, chain_id, owner_id):
+        """Delete an owned parent chain together with all child/file records."""
+        owner_id = int(owner_id)
+        chain_doc = await self.get_chain(str(chain_id), owner_id=owner_id)
+        if chain_doc is None:
+            return None
+        sessions = [
+            doc
+            for doc in await self.list_chain(str(chain_id))
+            if doc["owner_id"] == owner_id
+        ]
+        session_ids = [doc["_id"] for doc in sessions]
+        if self.persistent:
+            await self._ensure_indexes()
+            if session_ids:
+                await self.files.delete_many({"session_id": {"$in": session_ids}})
+                await self.sessions.delete_many(
+                    {"_id": {"$in": session_ids}, "owner_id": owner_id}
+                )
+            await self.chains.delete_one(
+                {"_id": str(chain_id), "owner_id": owner_id}
+            )
+        else:
+            async with self._memory_lock:
+                for session_id in session_ids:
+                    self._memory_sessions.pop(session_id, None)
+                for file_id in [
+                    file_id
+                    for file_id, doc in self._memory_files.items()
+                    if doc["session_id"] in session_ids
+                ]:
+                    self._memory_files.pop(file_id, None)
+                self._memory_chains.pop(str(chain_id), None)
+        return {
+            "chain": chain_doc,
+            "sessions": sessions,
+            "deleted_sessions": len(session_ids),
+        }
+
+    async def delete_all_for_owner(self, owner_id):
+        """Delete all owned TeraBox chains, sessions, and file records."""
+        owner_id = int(owner_id)
+        sessions = await super().list_sessions(owner_id=owner_id, limit=0)
+        session_ids = [doc["_id"] for doc in sessions]
+        chains = await self.list_chains(owner_id=owner_id, limit=0)
+        if self.persistent:
+            await self._ensure_indexes()
+            if session_ids:
+                await self.files.delete_many({"session_id": {"$in": session_ids}})
+            await self.sessions.delete_many({"owner_id": owner_id})
+            await self.chains.delete_many({"owner_id": owner_id})
+        else:
+            async with self._memory_lock:
+                for session_id in session_ids:
+                    self._memory_sessions.pop(session_id, None)
+                for file_id in [
+                    file_id
+                    for file_id, doc in self._memory_files.items()
+                    if doc["session_id"] in session_ids
+                ]:
+                    self._memory_files.pop(file_id, None)
+                for chain_id in [
+                    chain_id
+                    for chain_id, doc in self._memory_chains.items()
+                    if doc["owner_id"] == owner_id
+                ]:
+                    self._memory_chains.pop(chain_id, None)
+        return {
+            "deleted_sessions": len(session_ids),
+            "deleted_chains": len(chains),
+        }
+
+    async def list_chain_files(self, chain_id):
+        """Return every file record in a chain, preserving source order."""
+        sessions = await self.list_chain(str(chain_id))
+        files = []
+        for session_doc in sessions:
+            files.extend(await self.list_files(session_doc["_id"]))
+        files.sort(
+            key=lambda doc: (
+                int(doc.get("source_position") or 0),
+                int(doc.get("position") or 0),
+                str(doc.get("_id") or ""),
+            )
+        )
+        return files
+
+    async def replace_chain_file_metadata(self, chain_id, refreshed_files):
+        """Replace durable share metadata across every child session.
+
+        Stable ``fs_id`` values are the authoritative join key. Records made by
+        older releases, which did not persist an fs_id, receive a one-time
+        migration by unique relative path; all subsequent refreshes use fs_id.
+        """
+        chain_id = str(chain_id)
+        refreshed_files = [copy.deepcopy(doc) for doc in refreshed_files]
+        by_fs_id = {}
+        by_path = {}
+        for metadata in refreshed_files:
+            fs_id = str(metadata.get("fs_id") or "").strip()
+            source_dlink = str(metadata.get("source_dlink") or "").strip()
+            if not fs_id or not source_dlink:
+                continue
+            if fs_id in by_fs_id:
+                raise ValueError(f"Duplicate TeraBox fs_id in refreshed share: {fs_id}")
+            by_fs_id[fs_id] = metadata
+            relative_path = str(metadata.get("relative_path") or "")
+            by_path.setdefault(relative_path, []).append(metadata)
+
+        stored_files = await self.list_chain_files(chain_id)
+        chain_doc = await self.get_chain(chain_id)
+        next_revision = int((chain_doc or {}).get("metadata_revision") or 0) + 1
+        now = utcnow()
+        matched = {}
+        unmatched = []
+        mongo_updates = []
+        for file_doc in stored_files:
+            fs_id = str(file_doc.get("fs_id") or "").strip()
+            metadata = by_fs_id.get(fs_id) if fs_id else None
+            if metadata is None and not fs_id:
+                legacy_matches = by_path.get(
+                    str(file_doc.get("relative_path") or file_doc.get("filename") or ""),
+                    [],
+                )
+                if len(legacy_matches) == 1:
+                    metadata = legacy_matches[0]
+            if metadata is None:
+                unmatched.append(file_doc["_id"])
+                continue
+
+            fields = {
+                "fs_id": str(metadata["fs_id"]),
+                "source_dlink": str(metadata["source_dlink"]),
+                "relative_path": str(
+                    metadata.get("relative_path") or file_doc.get("relative_path") or ""
+                ),
+                "filename": str(
+                    metadata.get("filename") or file_doc.get("filename") or ""
+                ),
+                "size_bytes": max(
+                    0,
+                    int(metadata.get("size_bytes") or file_doc.get("size_bytes") or 0),
+                ),
+                "source_position": int(
+                    metadata.get("source_position")
+                    or file_doc.get("source_position")
+                    or file_doc.get("position")
+                    or 0
+                ),
+                "metadata_revision": next_revision,
+                "metadata_updated_at": now,
+                "updated_at": now,
+            }
+            if self.persistent:
+                mongo_updates.append(
+                    UpdateOne({"_id": file_doc["_id"]}, {"$set": fields})
+                )
+            else:
+                async with self._memory_lock:
+                    current = self._memory_files.get(file_doc["_id"])
+                    if current is not None:
+                        current.update(copy.deepcopy(fields))
+            matched[file_doc["_id"]] = fields
+
+        if self.persistent and mongo_updates:
+            await self.files.bulk_write(mongo_updates, ordered=False)
+
+        chain_fields = {
+            "metadata_revision": next_revision,
+            "metadata_refreshed_at": now,
+            "metadata_file_count": len(refreshed_files),
+            "updated_at": now,
+        }
+        if self.persistent:
+            await self.chains.update_one(
+                {"_id": chain_id}, {"$set": chain_fields}
+            )
+        else:
+            async with self._memory_lock:
+                current_chain = self._memory_chains.get(chain_id)
+                if current_chain is not None:
+                    current_chain.update(copy.deepcopy(chain_fields))
+
+        return {
+            "revision": next_revision,
+            "matched": matched,
+            "unmatched_file_ids": unmatched,
+            "files": await self.list_chain_files(chain_id),
+        }
 
     async def set_state(self, session_id, state, **fields):
         session_doc = await super().set_state(session_id, state, **fields)

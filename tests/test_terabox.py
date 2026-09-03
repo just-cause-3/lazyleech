@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock
 
 from terabox_resolver import (
     TeraboxError,
+    TeraboxMetadataStaleError,
     _cookie_site,
     _download_url,
     extract_surl,
@@ -113,6 +114,134 @@ class TeraboxAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "https://attacker.example/file/signed"
             )
         fake_session.get.assert_not_called()
+
+    async def test_marks_expired_source_dlink_as_stale(self):
+        from terabox_resolver import TeraboxResolver
+
+        class Content:
+            async def read(self, _size):
+                return b'{"error":"expired"}'
+
+        class Response:
+            status = 403
+            headers = {}
+            url = "https://dm-d.1024terabox.com/file/expired"
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        fake_session = Mock()
+        fake_session.get.return_value = Response()
+        resolver = TeraboxResolver(
+            fake_session,
+            "current-cookie",
+            "https://dm.1024terabox.com/ai/index",
+        )
+
+        with self.assertRaises(TeraboxMetadataStaleError):
+            await resolver.authorize_download_url(
+                "https://dm-d.1024terabox.com/file/expired"
+            )
+
+    async def test_verification_response_is_not_mislabeled_as_stale(self):
+        from terabox_resolver import TeraboxResolver
+
+        class Content:
+            async def read(self, _size):
+                return b'{"errno":400210,"errmsg":"need verify_v2"}'
+
+        class Response:
+            status = 403
+            headers = {}
+            url = "https://dm-d.1024terabox.com/file/challenged"
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        fake_session = Mock()
+        fake_session.get.return_value = Response()
+        resolver = TeraboxResolver(
+            fake_session,
+            "challenged-cookie",
+            "https://dm.1024terabox.com/ai/index",
+        )
+
+        with self.assertRaisesRegex(TeraboxError, "verification") as raised:
+            await resolver.authorize_download_url(
+                "https://dm-d.1024terabox.com/file/challenged"
+            )
+        self.assertNotIsInstance(raised.exception, TeraboxMetadataStaleError)
+
+
+class TeraboxManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_walk_keeps_stable_id_path_size_and_same_site_dlink(self):
+        from terabox_resolver import TeraboxResolver
+
+        resolver = TeraboxResolver(
+            Mock(),
+            "cookie",
+            "https://dm.1024terabox.com/ai/index",
+        )
+        resolver._share_list = AsyncMock(
+            return_value={
+                "errno": 0,
+                "list": [
+                    {
+                        "server_filename": "one.bin",
+                        "isdir": "0",
+                        "path": "/Folder/one.bin",
+                        "size": 123,
+                        "fs_id": 456,
+                        "dlink": "https://dm-d.1024terabox.com/file/one?chkv=1",
+                    }
+                ],
+            }
+        )
+        output = []
+
+        await resolver._walk("share", "", "Folder", output)
+
+        self.assertEqual("456", output[0].fs_id)
+        self.assertEqual("Folder/one.bin", output[0].relative_path)
+        self.assertEqual(123, output[0].size)
+        self.assertEqual(
+            "https://dm-d.1024terabox.com/file/one?origin=dlna",
+            output[0].download_url,
+        )
+
+    async def test_walk_rejects_cross_site_source_dlink(self):
+        from terabox_resolver import TeraboxResolver
+
+        resolver = TeraboxResolver(
+            Mock(),
+            "cookie",
+            "https://dm.1024terabox.com/ai/index",
+        )
+        resolver._share_list = AsyncMock(
+            return_value={
+                "errno": 0,
+                "list": [
+                    {
+                        "server_filename": "one.bin",
+                        "isdir": "0",
+                        "size": 123,
+                        "fs_id": 456,
+                        "dlink": "https://attacker.example/file/one",
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(TeraboxError, "unsafe cross-site"):
+            await resolver._walk("share", "", "", [])
 
 
 class TeraboxBootstrapTests(unittest.IsolatedAsyncioTestCase):
