@@ -232,7 +232,7 @@ class TeraboxAccountClient:
         self,
         fs_ids: list[int | str],
         archive_name: str,
-        preferred_connections: int = 8,
+        preferred_connections: int = 16,
     ) -> TeraboxBatchDownload:
         """Return a fresh, preflighted URL for one server-generated ZIP archive."""
         safe_archive_name(archive_name)
@@ -336,13 +336,8 @@ class TeraboxAccountClient:
                     ]
                     if same_cookie_site:
                         download_headers.append(f"Cookie: lang=en; ndus={self.cookie}")
-                    # Only use multiple segments after the generated archive
-                    # proves that it honors byte-range requests.
-                    connections = (
-                        preferred_connections if response.status == 206 else 1
-                    )
                     return TeraboxBatchDownload(
-                        current_url, download_headers, connections
+                        current_url, download_headers, preferred_connections
                     )
                 raise TeraboxError(
                     "TeraBox batch download authorization returned HTTP "

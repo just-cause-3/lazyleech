@@ -137,7 +137,7 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("method=batchdownload", download.url)
-        self.assertEqual(8, download.max_connections)
+        self.assertEqual(16, download.max_connections)
         self.assertTrue(any(header.startswith("Cookie:") for header in download.headers))
         download_call = resolver._json_get.await_args_list[1]
         params = download_call.args[1]
@@ -253,14 +253,14 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
         download = await account.authorize_batch_download([11], "Folder.zip")
 
         self.assertEqual("https://storage.example/signed.zip", download.url)
-        self.assertEqual(8, download.max_connections)
+        self.assertEqual(16, download.max_connections)
         self.assertFalse(
             any(header.lower().startswith("cookie:") for header in download.headers)
         )
         second_headers = http_session.get.call_args_list[1].kwargs["headers"]
         self.assertNotIn("Cookie", second_headers)
 
-    async def test_falls_back_to_one_connection_when_ranges_are_ignored(self):
+    async def test_keeps_requested_connections_when_preflight_returns_200(self):
         class StreamResponse:
             status = 200
             headers = {"Content-Type": "application/zip"}
@@ -310,7 +310,7 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
             [11], "Folder.zip", preferred_connections=8
         )
 
-        self.assertEqual(1, download.max_connections)
+        self.assertEqual(8, download.max_connections)
 
 
 class FakeAccountTree:
