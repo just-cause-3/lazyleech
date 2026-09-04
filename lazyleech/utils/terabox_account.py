@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from yarl import URL
 
 from .terabox import (
     DEFAULT_TERABOX_ENDPOINT,
@@ -289,78 +290,140 @@ class TeraboxAccountClient:
             visited_urls.add(current_url)
             current_host = urlparse(current_url).hostname or ""
             same_cookie_site = _cookie_site(current_host) == _cookie_site(origin_host)
-            request_headers = self.resolver._request_headers(
-                authenticated=same_cookie_site
-            )
-            request_headers["Referer"] = f"{self.origin}/main"
-            request_headers["Accept-Encoding"] = "identity"
-            request_headers["Range"] = "bytes=0-0"
-            async with self.resolver.session.get(
-                current_url,
-                headers=request_headers,
-                timeout=self.timeout,
-                allow_redirects=False,
-            ) as response:
-                body = await response.content.read(512)
-                if response.status in {301, 302, 303, 307, 308}:
-                    target = urljoin(
-                        str(response.url), response.headers.get("Location", "")
-                    )
-                    target_parts = urlparse(target)
-                    if (
-                        target_parts.scheme != "https"
-                        or not target_parts.hostname
-                        or target_parts.username
-                        or target_parts.password
-                        or target_parts.port not in (None, 443)
-                    ):
-                        raise TeraboxError("TeraBox returned an unsafe batch redirect")
-                    current_url = target
-                    continue
-                if response.status in {200, 206}:
-                    if response.headers.get("Content-Type", "").lower().startswith(
-                        "application/json"
-                    ):
-                        try:
-                            error_data = json.loads(body)
-                        except (UnicodeDecodeError, json.JSONDecodeError):
-                            error_data = {}
-                        message = (
-                            error_data.get("errmsg")
-                            or error_data.get("show_msg")
-                            or "batch stream was rejected"
-                        )
-                        raise TeraboxError(
-                            f"TeraBox batch download failed: {message}"
-                        )
-                    download_headers = [
-                        f"User-Agent: {TERABOX_USER_AGENT}",
-                        f"Referer: {self.origin}/main",
-                        "Accept: */*",
-                        "Accept-Encoding: identity",
-                    ]
-                    if same_cookie_site:
-                        download_headers.append(f"Cookie: lang=en; ndus={self.cookie}")
-                    content_range = response.headers.get("Content-Range", "")
-                    range_match = re.fullmatch(
-                        r"(?:bytes\s+)?0-0/(\d+)",
-                        content_range.strip(),
-                        re.IGNORECASE,
-                    )
-                    total_size = int(range_match.group(1)) if range_match else 0
-                    range_supported = response.status == 206 and total_size > 0
-                    return TeraboxBatchDownload(
-                        current_url,
-                        download_headers,
-                        preferred_connections if range_supported else 1,
-                        total_size,
-                        range_supported,
-                    )
-                raise TeraboxError(
-                    "TeraBox batch download authorization returned HTTP "
-                    f"{response.status}"
+            followed_redirect = False
+            # Some TeraBox batch streams reject a Range probe even though a
+            # normal authenticated GET succeeds. Probe for segmentation first,
+            # then fall back to a single-connection stream on range-specific
+            # HTTP failures. Only 512 bytes are read from either response.
+            for use_range in (True, False):
+                request_headers = self.resolver._request_headers(
+                    authenticated=same_cookie_site
                 )
+                request_headers["Referer"] = f"{self.origin}/main"
+                request_headers["Accept-Encoding"] = "identity"
+                if use_range:
+                    request_headers["Range"] = "bytes=0-0"
+                else:
+                    request_headers.pop("Range", None)
+                # Batch URLs contain a server-signed query string. Passing an
+                # encoded yarl URL prevents aiohttp from requoting it and
+                # invalidating the signature (notably for spaces/brackets).
+                request_url = URL(current_url, encoded=True)
+                async with self.resolver.session.get(
+                    request_url,
+                    headers=request_headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                ) as response:
+                    body = await response.content.read(512)
+                    if response.status in {301, 302, 303, 307, 308}:
+                        target = urljoin(
+                            str(response.url), response.headers.get("Location", "")
+                        )
+                        target_parts = urlparse(target)
+                        if (
+                            target_parts.scheme != "https"
+                            or not target_parts.hostname
+                            or target_parts.username
+                            or target_parts.password
+                            or target_parts.port not in (None, 443)
+                        ):
+                            raise TeraboxError(
+                                "TeraBox returned an unsafe batch redirect"
+                            )
+                        current_url = target
+                        followed_redirect = True
+                        break
+
+                    error_data = _batch_error_data(response.headers, body)
+                    if response.status in {200, 206} and error_data is None:
+                        download_headers = [
+                            f"User-Agent: {TERABOX_USER_AGENT}",
+                            f"Referer: {self.origin}/main",
+                            "Accept: */*",
+                            "Accept-Encoding: identity",
+                        ]
+                        if same_cookie_site:
+                            download_headers.append(
+                                f"Cookie: lang=en; ndus={self.cookie}"
+                            )
+                        content_range = response.headers.get("Content-Range", "")
+                        range_match = re.fullmatch(
+                            r"(?:bytes\s+)?0-0/(\d+)",
+                            content_range.strip(),
+                            re.IGNORECASE,
+                        )
+                        total_size = int(range_match.group(1)) if range_match else 0
+                        range_supported = (
+                            use_range and response.status == 206 and total_size > 0
+                        )
+                        return TeraboxBatchDownload(
+                            current_url,
+                            download_headers,
+                            preferred_connections if range_supported else 1,
+                            total_size,
+                            range_supported,
+                        )
+
+                    if (
+                        use_range
+                        and response.status in {400, 405, 416}
+                        and error_data is None
+                    ):
+                        continue
+                    raise _batch_response_error(
+                        response.status,
+                        response.headers,
+                        body,
+                        error_data,
+                    )
+            if followed_redirect:
+                continue
         raise TeraboxError("TeraBox batch download exceeded the redirect limit")
+
+
+def _batch_error_data(headers, body: bytes) -> dict | None:
+    """Return a JSON error response without mistaking a ZIP stream for JSON."""
+    content_type = str(headers.get("Content-Type", "")).lower()
+    stripped = body.lstrip()
+    if "json" not in content_type and not stripped.startswith((b"{", b"[")):
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _batch_response_error(status, headers, body, error_data=None) -> TeraboxError:
+    """Build a useful, bounded error without exposing a signed URL or cookie."""
+    data = error_data if isinstance(error_data, dict) else {}
+    if _needs_verification(data):
+        return TeraboxError(
+            "TeraBox requires account verification. Complete it in the official "
+            "website, save a fresh ndus cookie, and retry"
+        )
+    message = data.get("show_msg") or data.get("errmsg") or data.get("message")
+    errno = data.get("errno", data.get("error_code"))
+    if message:
+        suffix = f", code {errno}" if errno not in (None, "") else ""
+        return TeraboxError(
+            f"TeraBox batch download failed (HTTP {status}{suffix}): {message}"
+        )
+
+    text = body.decode("utf-8", errors="replace")
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    detail = title_match.group(1) if title_match else text
+    detail = re.sub(r"https?://\S+", "<url>", detail)
+    detail = re.sub(r"<[^>]+>", " ", detail)
+    detail = re.sub(r"\s+", " ", detail).strip()[:160]
+    if detail:
+        return TeraboxError(
+            f"TeraBox batch download authorization returned HTTP {status}: {detail}"
+        )
+    return TeraboxError(
+        f"TeraBox batch download authorization returned HTTP {status}"
+    )
 
 
 def safe_archive_name(value: str, fallback: str = "terabox-batch.zip") -> str:

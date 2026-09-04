@@ -328,6 +328,180 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, download.total_size)
         self.assertFalse(download.range_supported)
 
+    async def test_retries_without_range_when_batch_probe_returns_400(self):
+        class StreamResponse:
+            def __init__(self, status, body=b""):
+                self.status = status
+                self.headers = {"Content-Type": "application/octet-stream"}
+                self.url = "https://dm-data.1024terabox.com/batch"
+                self.content = SimpleNamespace(read=AsyncMock(return_value=body))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        http_session = Mock()
+        http_session.get.side_effect = [
+            StreamResponse(400, b"Bad Request"),
+            StreamResponse(200, b"PK"),
+        ]
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=http_session,
+            _request_headers=Mock(
+                side_effect=lambda **_kwargs: {
+                    "Cookie": "lang=en; ndus=disposable"
+                }
+            ),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                side_effect=[
+                    {
+                        "errno": 0,
+                        "data": {
+                            "uk": 123,
+                            "sign1": "value",
+                            "sign3": "key",
+                            "timestamp": 456,
+                        },
+                    },
+                    {
+                        "errno": 0,
+                        "dlink": "https://dm-data.1024terabox.com/batch",
+                    },
+                ]
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        download = await account.authorize_batch_download([11], "Folder.zip")
+
+        self.assertFalse(download.range_supported)
+        self.assertEqual(1, download.max_connections)
+        first_headers = http_session.get.call_args_list[0].kwargs["headers"]
+        second_headers = http_session.get.call_args_list[1].kwargs["headers"]
+        self.assertEqual("bytes=0-0", first_headers["Range"])
+        self.assertNotIn("Range", second_headers)
+
+    async def test_preserves_server_signed_batch_query_encoding(self):
+        class StreamResponse:
+            status = 200
+            headers = {"Content-Type": "application/zip"}
+            url = (
+                "https://dm-data.1024terabox.com/batch"
+                "?zipcontent=%5B%22%2FA%20B%22%5D&sign=a%2Bb"
+            )
+            content = SimpleNamespace(read=AsyncMock(return_value=b"PK"))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        dlink = StreamResponse.url
+        http_session = Mock()
+        http_session.get.return_value = StreamResponse()
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=http_session,
+            _request_headers=Mock(return_value={}),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                side_effect=[
+                    {
+                        "errno": 0,
+                        "data": {
+                            "uk": 123,
+                            "sign1": "value",
+                            "sign3": "key",
+                            "timestamp": 456,
+                        },
+                    },
+                    {"errno": 0, "dlink": dlink},
+                ]
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        await account.authorize_batch_download([11], "Folder.zip")
+
+        request_url = http_session.get.call_args.args[0]
+        self.assertEqual(dlink, str(request_url))
+
+    async def test_batch_http_error_exposes_json_message(self):
+        class ErrorResponse:
+            status = 400
+            headers = {"Content-Type": "application/json"}
+            url = "https://dm-data.1024terabox.com/batch"
+            content = SimpleNamespace(
+                read=AsyncMock(
+                    return_value=b'{"errno":31066,"show_msg":"invalid fidlist"}'
+                )
+            )
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        http_session = Mock()
+        http_session.get.side_effect = [ErrorResponse(), ErrorResponse()]
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=http_session,
+            _request_headers=Mock(return_value={}),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                side_effect=[
+                    {
+                        "errno": 0,
+                        "data": {
+                            "uk": 123,
+                            "sign1": "value",
+                            "sign3": "key",
+                            "timestamp": 456,
+                        },
+                    },
+                    {
+                        "errno": 0,
+                        "dlink": "https://dm-data.1024terabox.com/batch",
+                    },
+                ]
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        with self.assertRaisesRegex(TeraboxError, "31066.*invalid fidlist"):
+            await account.authorize_batch_download([11], "Folder.zip")
+
 
 class FakeAccountTree:
     def __init__(self, tree, root):
