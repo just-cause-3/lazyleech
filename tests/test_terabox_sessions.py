@@ -1438,6 +1438,40 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FILE_PENDING, resumed[0]["status"])
         self.assertEqual(FILE_UPLOADED, resumed[1]["status"])
 
+    async def test_continue_preserves_terminally_skipped_files(self):
+        store = TeraboxSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="terabox-account:/Library",
+            title="Library",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {"page_url": "terabox-account:/Library", "filename": "large.zip"},
+                {"page_url": "terabox-account:/Library", "filename": "retry.zip"},
+            ],
+            session_fields={"chain_id": "chain", "part_index": 1, "total_parts": 1},
+        )
+        files = await store.list_files(session["_id"])
+        await store.update_file(
+            files[0]["_id"],
+            FILE_FAILED,
+            error="TeraBox batch package is too large (error 31090)",
+            terminal_skip=True,
+        )
+        await store.update_file(
+            files[1]["_id"], FILE_FAILED, error="temporary failure"
+        )
+
+        await store.prepare_continue(session["_id"], -1002, 99)
+        resumed = await store.list_files(session["_id"])
+
+        self.assertEqual(FILE_FAILED, resumed[0]["status"])
+        self.assertTrue(resumed[0]["terminal_skip"])
+        self.assertEqual(FILE_PENDING, resumed[1]["status"])
+
     async def test_last_part_sends_one_final_chain_index(self):
         store = TeraboxSessionStore(db_url="")
         session = await store.create_session(

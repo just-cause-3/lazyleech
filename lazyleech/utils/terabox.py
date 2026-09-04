@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
+from yarl import URL
 
 
 TERABOX_APP_PARAMS = {
@@ -198,14 +199,19 @@ class TeraboxResolver:
             timeout=self.timeout,
             allow_redirects=False,
         ) as response:
-            if response.status != 200:
-                raise TeraboxError(f"TeraBox returned HTTP {response.status} for {path}")
             try:
                 data = await response.json(content_type=None)
             except (json.JSONDecodeError, aiohttp.ContentTypeError) as error:
+                if response.status != 200:
+                    raise TeraboxError(
+                        f"TeraBox returned HTTP {response.status} for {path}"
+                    ) from error
                 raise TeraboxError(f"TeraBox returned invalid JSON for {path}") from error
         if not isinstance(data, dict):
             raise TeraboxError(f"TeraBox returned an invalid response for {path}")
+        # TeraBox commonly returns useful structured API errors with HTTP 4xx.
+        # Let the endpoint-specific caller classify those error codes instead
+        # of discarding the payload behind a generic HTTP exception.
         return data
 
     async def _bootstrap(self) -> None:
@@ -353,7 +359,7 @@ class TeraboxResolver:
         )
         headers["Range"] = "bytes=0-0"
         async with self.session.get(
-            download_url,
+            URL(download_url, encoded=True),
             headers=headers,
             timeout=self.timeout,
             allow_redirects=False,

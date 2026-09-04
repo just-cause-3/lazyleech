@@ -100,6 +100,25 @@ class TeraboxAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ndus=disposable-cookie", request_headers["Cookie"])
         self.assertFalse(fake_session.get.call_args.kwargs["allow_redirects"])
 
+    async def test_preserves_signed_source_dlink_encoding(self):
+        from terabox_resolver import TeraboxResolver
+
+        fake_session = Mock()
+        fake_session.get.return_value = _FakeResponse()
+        resolver = TeraboxResolver(
+            fake_session,
+            "disposable-cookie",
+            "https://dm.1024terabox.com/ai/index",
+        )
+        source = (
+            "https://dm-d.1024terabox.com/file"
+            "?path=%2FA%20B%2F%5Bfile%5D.zip&sign=a%2Bb"
+        )
+
+        await resolver.authorize_download_url(source)
+
+        self.assertEqual(source, str(fake_session.get.call_args.args[0]))
+
     async def test_refuses_cookie_on_unrelated_download_host(self):
         from terabox_resolver import TeraboxResolver
 

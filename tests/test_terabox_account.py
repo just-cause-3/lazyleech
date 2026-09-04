@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock, Mock, patch
 import lazyleech.plugins.terabox as terabox
 from lazyleech.utils.terabox import TeraboxError
 from lazyleech.utils.terabox_account import (
+    TeraboxAccountFileDownload,
     TeraboxAccountClient,
     TeraboxBatchDownload,
+    TeraboxPackageTooLargeError,
     _rc4_signature,
     account_source_url,
     is_account_directory,
@@ -15,6 +17,9 @@ from lazyleech.utils.terabox_account import (
 )
 from lazyleech.utils.terabox_sessions import (
     FILE_DOWNLOADED,
+    FILE_FAILED,
+    FILE_UPLOADED,
+    SESSION_COMPLETED,
     SESSION_PAUSED,
     SESSION_RUNNING,
     TeraboxSessionStore,
@@ -154,6 +159,80 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("fQ1YmEE=", params["sign"])
         self.assertEqual("456", params["timestamp"])
         self.assertIn("ndus=disposable", account.download_headers[-1])
+
+    async def test_authorizes_one_private_file_without_batch_zip(self):
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=Mock(),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                return_value={
+                    "errno": 0,
+                    "info": [
+                        {
+                            "fs_id": 99,
+                            "path": "/Library/file.bin",
+                            "dlink": (
+                                "https://dm-d.terabox.com/file/signed"
+                            ),
+                        }
+                    ],
+                }
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        download = await account.authorize_file_download(
+            "99", "/Library/file.bin", preferred_connections=12
+        )
+
+        self.assertEqual("https://dm-d.terabox.com/file/signed", download.url)
+        self.assertEqual(12, download.max_connections)
+        self.assertFalse(any("Cookie:" in header for header in download.headers))
+        params = resolver._json_get.await_args.args[1]
+        self.assertEqual("1", params["dlink"])
+        self.assertEqual("dlna", params["origin"])
+        self.assertEqual('["/Library/file.bin"]', params["target"])
+
+    async def test_rejects_unapproved_private_file_dlink(self):
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=Mock(),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                return_value={
+                    "errno": 0,
+                    "info": [
+                        {
+                            "fs_id": 99,
+                            "dlink": "https://attacker.example/file",
+                        }
+                    ],
+                }
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        with self.assertRaisesRegex(TeraboxError, "unsafe"):
+            await account.authorize_file_download(
+                "99", "/Library/file.bin"
+            )
 
     async def test_rejects_cross_site_batch_url(self):
         resolver = SimpleNamespace(
@@ -502,6 +581,97 @@ class TeraboxAccountClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TeraboxError, "31066.*invalid fidlist"):
             await account.authorize_batch_download([11], "Folder.zip")
 
+    async def test_batch_package_too_large_has_typed_error(self):
+        class ErrorResponse:
+            status = 400
+            headers = {"Content-Type": "application/json"}
+            url = "https://dm-data.1024terabox.com/batch"
+            content = SimpleNamespace(
+                read=AsyncMock(
+                    return_value=(
+                        b'{"error_code":31090,'
+                        b'"error_msg":"package is too large"}'
+                    )
+                )
+            )
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            session=SimpleNamespace(get=Mock(return_value=ErrorResponse())),
+            _request_headers=Mock(return_value={}),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                side_effect=[
+                    {
+                        "errno": 0,
+                        "data": {
+                            "uk": 123,
+                            "sign1": "value",
+                            "sign3": "key",
+                            "timestamp": 456,
+                        },
+                    },
+                    {
+                        "errno": 0,
+                        "dlink": "https://dm-data.1024terabox.com/batch",
+                    },
+                ]
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        with self.assertRaises(TeraboxPackageTooLargeError):
+            await account.authorize_batch_download([11], "Folder.zip")
+
+    async def test_batch_api_http_error_payload_has_typed_error(self):
+        resolver = SimpleNamespace(
+            ndus="disposable",
+            origin="https://dm.1024terabox.com",
+            js_token="token",
+            _share_authenticated=True,
+            timeout=object(),
+            _bootstrap=AsyncMock(),
+            _json_get=AsyncMock(
+                side_effect=[
+                    {
+                        "errno": 0,
+                        "data": {
+                            "uk": 123,
+                            "sign1": "value",
+                            "sign3": "key",
+                            "timestamp": 456,
+                        },
+                    },
+                    {
+                        "error_code": 31090,
+                        "error_msg": "package is too large",
+                    },
+                ]
+            ),
+        )
+        with patch(
+            "lazyleech.utils.terabox_account.TeraboxResolver",
+            return_value=resolver,
+        ):
+            account = TeraboxAccountClient(Mock(), "disposable")
+
+        with self.assertRaises(TeraboxPackageTooLargeError):
+            await account.authorize_batch_download([11], "Folder.zip")
+
 
 class FakeAccountTree:
     def __init__(self, tree, root):
@@ -590,6 +760,34 @@ class TeraboxAccountPlannerTests(unittest.IsolatedAsyncioTestCase):
             [[1], [2]], [item["batch_fs_ids"] for item in scan["archives"]]
         )
 
+    async def test_local_scan_recurses_once_and_preserves_tree(self):
+        root = folder("Library", "/Library", 10)
+        tree = {
+            "/Library": [
+                file("root.txt", "/Library/root.txt", 1, 10),
+                folder("A", "/Library/A", 20),
+            ],
+            "/Library/A": [
+                file("one.zip", "/Library/A/one.zip", 2, 100),
+            ],
+        }
+
+        scan = await terabox._scan_account_local_files(
+            FakeAccountTree(tree, root), "/Library"
+        )
+
+        self.assertEqual(2, scan["source_file_count"])
+        self.assertEqual(110, scan["source_bytes"])
+        self.assertEqual(
+            ["Library/root.txt", "Library/A/one.zip"],
+            [item["relative_path"] for item in scan["files"]],
+        )
+        self.assertEqual(["1", "2"], [item["fs_id"] for item in scan["files"]])
+        self.assertEqual(
+            ["/Library/root.txt", "/Library/A/one.zip"],
+            [item["account_file_path"] for item in scan["files"]],
+        )
+
     async def test_creation_persists_batch_provider_and_starts_first_part(self):
         store = TeraboxSessionStore(db_url="")
         mib = 1024**2
@@ -643,6 +841,65 @@ class TeraboxAccountPlannerTests(unittest.IsolatedAsyncioTestCase):
         chain = (await store.list_chains(owner_id=123, limit=0))[0]
         self.assertEqual("terabox_account_batch", chain["provider"])
         self.assertEqual(4, chain["total_source_files"])
+        start.assert_called_once()
+
+    async def test_creation_persists_direct_account_files_in_sequential_parts(self):
+        store = TeraboxSessionStore(db_url="")
+        mib = 1024**2
+        files = [
+            {
+                "page_url": "terabox-account:/Library",
+                "filename": f"file{index}.bin",
+                "relative_path": f"Library/file{index}.bin",
+                "size_bytes": 6 * mib,
+                "fs_id": str(index),
+                "account_file_path": f"/Library/file{index}.bin",
+                "source_position": index,
+                "account_directory": "/Library",
+            }
+            for index in (1, 2)
+        ]
+        scan = {
+            "root_path": "/Library",
+            "name": "Library",
+            "files": files,
+            "source_file_count": 2,
+            "source_bytes": 12 * mib,
+        }
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=55,
+        )
+        reply = SimpleNamespace(edit_text=AsyncMock())
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="cookie"),
+            ),
+            patch.object(
+                terabox,
+                "_scan_account_local_files",
+                AsyncMock(return_value=scan),
+            ),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            sessions = await terabox._create_account_local_sessions(
+                object(), message, "/Library", 10 * mib, reply
+            )
+
+        self.assertEqual(2, len(sessions))
+        self.assertEqual(SESSION_RUNNING, sessions[0]["state"])
+        self.assertEqual(SESSION_PAUSED, sessions[1]["state"])
+        first_file = (await store.list_files(sessions[0]["_id"]))[0]
+        self.assertEqual("1", first_file["fs_id"])
+        self.assertNotIn("batch_fs_ids", first_file)
+        chain = (await store.list_chains(owner_id=123, limit=0))[0]
+        self.assertEqual("terabox_account_local", chain["provider"])
+        self.assertEqual("account_local_workspace", chain["planning_mode"])
         start.assert_called_once()
 
     async def test_runner_uses_fresh_batch_url_and_supported_connections(self):
@@ -724,6 +981,181 @@ class TeraboxAccountPlannerTests(unittest.IsolatedAsyncioTestCase):
         )
         stored_file = (await store.list_files(session_doc["_id"]))[0]
         self.assertEqual(FILE_DOWNLOADED, stored_file["status"])
+
+    async def test_runner_authorizes_direct_account_file_by_persisted_id(self):
+        store = TeraboxSessionStore(db_url="")
+        session_doc = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="terabox-account:/Library",
+            title="Library (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": "terabox-account:/Library",
+                    "filename": "one.bin",
+                    "relative_path": "Library/one.bin",
+                    "size_bytes": 10,
+                    "fs_id": "42",
+                    "account_file_path": "/Library/one.bin",
+                }
+            ],
+            session_fields={
+                "provider": "terabox_account_local",
+                "chain_id": "chain",
+                "part_index": 1,
+                "total_parts": 1,
+                "part_bytes": 10,
+            },
+        )
+        fake_account = Mock(spec=TeraboxAccountClient)
+        fake_account.authorize_file_download = AsyncMock(
+            return_value=TeraboxAccountFileDownload(
+                "https://storage.example/one.bin",
+                ["User-Agent: test"],
+                12,
+            )
+        )
+
+        async def complete_download(*_args, **kwargs):
+            self.assertEqual(12, kwargs["max_connections"])
+            self.assertIsNone(kwargs["segmented_total_length"])
+            self.assertTrue(await kwargs["on_gid"]("filegid"))
+            await kwargs["on_downloaded"]()
+            return "complete"
+
+        message = SimpleNamespace(reply_text=AsyncMock())
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="disposable"),
+            ),
+            patch.object(
+                terabox,
+                "TeraboxAccountClient",
+                return_value=fake_account,
+            ),
+            patch.object(
+                terabox,
+                "initiate_directdl",
+                side_effect=complete_download,
+            ),
+        ):
+            await terabox._run_terabox_session(
+                object(), message, session_doc["_id"]
+            )
+
+        fake_account.authorize_file_download.assert_awaited_once_with(
+            "42",
+            "/Library/one.bin",
+            preferred_connections=terabox.TERABOX_LOCAL_CONNECTIONS,
+        )
+        stored_file = (await store.list_files(session_doc["_id"]))[0]
+        self.assertEqual(FILE_DOWNLOADED, stored_file["status"])
+
+    async def test_runner_skips_oversized_batch_and_continues_queue(self):
+        store = TeraboxSessionStore(db_url="")
+        session_doc = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="terabox-account:/Library",
+            title="Library (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": "terabox-account:/Library",
+                    "filename": "TooBig.zip",
+                    "relative_path": "Library/TooBig.zip",
+                    "account_directory": "/Library/TooBig",
+                    "size_bytes": 4 * 1024**3,
+                    "batch_fs_ids": [42],
+                },
+                {
+                    "page_url": "terabox-account:/Library",
+                    "filename": "Next.zip",
+                    "relative_path": "Library/Next.zip",
+                    "account_directory": "/Library/Next",
+                    "size_bytes": 10,
+                    "batch_fs_ids": [43],
+                },
+            ],
+            session_fields={
+                "provider": "terabox_account_batch",
+                "chain_id": "chain",
+                "part_index": 1,
+                "total_parts": 1,
+                "part_bytes": 10,
+            },
+        )
+        fake_account = Mock(spec=TeraboxAccountClient)
+        fake_account.authorize_batch_download = AsyncMock(
+            side_effect=[
+                TeraboxError(
+                    "TeraBox batch download authorization returned HTTP 400: "
+                    '{"error_code":31090,"error_msg":"package is too large"}'
+                ),
+                TeraboxBatchDownload(
+                    "https://dm-data.1024terabox.com/batch",
+                    ["User-Agent: test"],
+                    1,
+                    0,
+                    False,
+                ),
+            ]
+        )
+
+        async def complete_download(*_args, **kwargs):
+            self.assertTrue(await kwargs["on_gid"]("batchgid"))
+            await kwargs["on_downloaded"]()
+            await kwargs["on_uploaded"](
+                [("Next.zip", "https://t.me/c/1/1")], None
+            )
+            return "complete"
+
+        message = SimpleNamespace(reply_text=AsyncMock())
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="disposable"),
+            ),
+            patch.object(
+                terabox,
+                "TeraboxAccountClient",
+                return_value=fake_account,
+            ),
+            patch.object(
+                terabox,
+                "initiate_directdl",
+                side_effect=complete_download,
+            ) as directdl,
+        ):
+            await terabox._run_terabox_session(
+                object(), message, session_doc["_id"]
+            )
+
+        self.assertEqual(2, fake_account.authorize_batch_download.await_count)
+        directdl.assert_awaited_once()
+        stored_files = await store.list_files(session_doc["_id"])
+        self.assertEqual(FILE_FAILED, stored_files[0]["status"])
+        self.assertTrue(stored_files[0]["terminal_skip"])
+        self.assertEqual(FILE_UPLOADED, stored_files[1]["status"])
+        completed = await store.get_session(session_doc["_id"])
+        self.assertEqual(SESSION_COMPLETED, completed["state"])
+        self.assertEqual(1, completed["skipped_files"])
+        notices = "\n".join(
+            call.args[0] for call in message.reply_text.await_args_list
+        )
+        self.assertIn("/Library/TooBig", notices)
+        self.assertIn("queue will continue", notices)
+        self.assertNotIn("/continuetera", notices)
 
 
 if __name__ == "__main__":

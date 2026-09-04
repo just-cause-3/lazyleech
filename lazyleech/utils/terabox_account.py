@@ -27,6 +27,13 @@ from .terabox import (
 TERABOX_ACCOUNT_SOURCE_PREFIX = "terabox-account:"
 TERABOX_ACCOUNT_LIST_PAGE_SIZE = 1000
 TERABOX_ACCOUNT_MAX_PAGES = 1000
+TERABOX_ACCOUNT_USER_AGENT = (
+    "terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox"
+)
+
+
+class TeraboxPackageTooLargeError(TeraboxError):
+    """TeraBox refused to build a server-side batch ZIP (error 31090)."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,13 @@ class TeraboxBatchDownload:
     max_connections: int = 1
     total_size: int = 0
     range_supported: bool = False
+
+
+@dataclass(frozen=True)
+class TeraboxAccountFileDownload:
+    url: str
+    headers: list[str]
+    max_connections: int = 8
 
 
 def normalize_account_path(value: str) -> str:
@@ -154,12 +168,18 @@ class TeraboxAccountClient:
                 request_params,
                 authenticated=True,
             )
-        if data.get("errno") not in (0, "0", None):
+        error_code = data.get("errno", data.get("error_code"))
+        if error_code not in (0, "0", None):
             message = data.get("show_msg") or data.get("errmsg") or "request failed"
             if _needs_verification(data):
                 raise TeraboxError(
                     "TeraBox requires account verification. Complete it in the "
                     "official website, save a fresh ndus cookie, and retry"
+                )
+            if str(error_code) == "31090":
+                raise TeraboxPackageTooLargeError(
+                    "TeraBox cannot create this batch ZIP because the package "
+                    "is too large"
                 )
             raise TeraboxError(f"TeraBox account request failed: {message}")
         return data
@@ -231,6 +251,117 @@ class TeraboxAccountClient:
             raise TeraboxError("TeraBox account metadata did not include a user ID")
         return info
 
+    async def _download_api_response(
+        self,
+        fs_ids: list[int | str],
+        download_type: str,
+    ) -> tuple[dict, list[int]]:
+        normalized_ids = []
+        for value in fs_ids:
+            try:
+                normalized_ids.append(int(value))
+            except (TypeError, ValueError) as error:
+                raise TeraboxError("A TeraBox download has an invalid file ID") from error
+        if not normalized_ids:
+            raise TeraboxError("A TeraBox download must contain at least one item")
+
+        info = await self.home_info()
+        signature = _rc4_signature(info.get("sign3"), info.get("sign1"))
+        data = await self._account_get(
+            "/api/download",
+            {
+                "type": download_type,
+                "fidlist": json.dumps(normalized_ids, separators=(",", ":")),
+                "sign": signature,
+                "timestamp": str(info.get("timestamp") or info.get("task_time") or ""),
+                "vip": "2",
+                "need_speed": "0",
+                "bdstoken": "",
+            },
+        )
+        return data, normalized_ids
+
+    @staticmethod
+    def _download_api_dlink(data: dict, fs_id: int | None = None) -> str:
+        dlink = data.get("dlink")
+        if isinstance(dlink, list):
+            candidates = [item for item in dlink if isinstance(item, dict)]
+            selected = None
+            if fs_id is not None:
+                selected = next(
+                    (
+                        item
+                        for item in candidates
+                        if str(item.get("fs_id") or "") == str(fs_id)
+                    ),
+                    None,
+                )
+            selected = selected or (candidates[0] if candidates else None)
+            dlink = selected.get("dlink") if selected else (dlink[0] if dlink else "")
+        return str(dlink or "").strip()
+
+    async def authorize_file_download(
+        self,
+        fs_id: int | str,
+        file_path: str,
+        preferred_connections: int = 8,
+    ) -> TeraboxAccountFileDownload:
+        """Authorize one private-drive file without creating a server ZIP."""
+        preferred_connections = max(1, min(int(preferred_connections), 16))
+        try:
+            normalized_id = int(fs_id)
+        except (TypeError, ValueError) as error:
+            raise TeraboxError("A TeraBox download has an invalid file ID") from error
+        normalized_path = normalize_account_path(file_path)
+        data = await self._account_get(
+            "/api/filemetas",
+            {
+                "target": json.dumps(
+                    [normalized_path], separators=(",", ":"), ensure_ascii=False
+                ),
+                "dlink": "1",
+                "origin": "dlna",
+            },
+        )
+        candidates = [
+            item for item in (data.get("info") or []) if isinstance(item, dict)
+        ]
+        selected = next(
+            (
+                item
+                for item in candidates
+                if str(item.get("fs_id") or "") == str(normalized_id)
+            ),
+            candidates[0] if len(candidates) == 1 else None,
+        )
+        download_url = str((selected or {}).get("dlink") or "").strip()
+        if not download_url:
+            raise TeraboxError("TeraBox did not return a file download URL")
+        parsed = urlparse(download_url)
+        hostname = (parsed.hostname or "").lower()
+        approved_host = any(
+            hostname == suffix or hostname.endswith("." + suffix)
+            for suffix in ("terabox.com", "1024terabox.com")
+        )
+        if (
+            parsed.scheme != "https"
+            or not approved_host
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+        ):
+            raise TeraboxError("TeraBox returned an unsafe file download URL")
+        return TeraboxAccountFileDownload(
+            download_url,
+            [
+                f"User-Agent: {TERABOX_ACCOUNT_USER_AGENT}",
+                f"Referer: {self.origin}/main",
+                "Accept: */*",
+                "Accept-Encoding: identity",
+            ],
+            preferred_connections,
+        )
+
     async def authorize_batch_download(
         self,
         fs_ids: list[int | str],
@@ -240,34 +371,8 @@ class TeraboxAccountClient:
         """Return a fresh, preflighted URL for one server-generated ZIP archive."""
         safe_archive_name(archive_name)
         preferred_connections = max(1, min(int(preferred_connections), 16))
-        normalized_ids = []
-        for value in fs_ids:
-            try:
-                normalized_ids.append(int(value))
-            except (TypeError, ValueError) as error:
-                raise TeraboxError("A TeraBox batch item has an invalid file ID") from error
-        if not normalized_ids:
-            raise TeraboxError("A TeraBox batch download must contain at least one item")
-
-        info = await self.home_info()
-        signature = _rc4_signature(info.get("sign3"), info.get("sign1"))
-        data = await self._account_get(
-            "/api/download",
-            {
-                "type": "batch",
-                "fidlist": json.dumps(normalized_ids, separators=(",", ":")),
-                "sign": signature,
-                "timestamp": str(info.get("timestamp") or info.get("task_time") or ""),
-                "vip": "2",
-                "need_speed": "0",
-                "bdstoken": "",
-            },
-        )
-        dlink = data.get("dlink")
-        if isinstance(dlink, list) and dlink:
-            first = dlink[0]
-            dlink = first.get("dlink") if isinstance(first, dict) else first
-        dlink = str(dlink or "").strip()
+        data, _normalized_ids = await self._download_api_response(fs_ids, "batch")
+        dlink = self._download_api_dlink(data)
         if not dlink:
             raise TeraboxError("TeraBox did not return a batch download URL")
 
@@ -385,11 +490,11 @@ class TeraboxAccountClient:
 def _batch_error_data(headers, body: bytes) -> dict | None:
     """Return a JSON error response without mistaking a ZIP stream for JSON."""
     content_type = str(headers.get("Content-Type", "")).lower()
-    stripped = body.lstrip()
+    stripped = body.lstrip().removeprefix(b"\xef\xbb\xbf").lstrip()
     if "json" not in content_type and not stripped.startswith((b"{", b"[")):
         return None
     try:
-        data = json.loads(body.decode("utf-8", errors="strict"))
+        data = json.loads(stripped.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -405,6 +510,10 @@ def _batch_response_error(status, headers, body, error_data=None) -> TeraboxErro
         )
     message = data.get("show_msg") or data.get("errmsg") or data.get("message")
     errno = data.get("errno", data.get("error_code"))
+    if str(errno) == "31090":
+        return TeraboxPackageTooLargeError(
+            "TeraBox cannot create this batch ZIP because the package is too large"
+        )
     if message:
         suffix = f", code {errno}" if errno not in (None, "") else ""
         return TeraboxError(
@@ -432,12 +541,21 @@ def safe_archive_name(value: str, fallback: str = "terabox-batch.zip") -> str:
     return base + ".zip"
 
 
+def safe_account_file_name(value: str, fallback: str = "terabox-file") -> str:
+    """Return a filesystem-safe private-drive filename while preserving Unicode."""
+    return _safe_name(value, fallback=fallback)
+
+
 __all__ = [
     "TERABOX_ACCOUNT_SOURCE_PREFIX",
+    "TERABOX_ACCOUNT_USER_AGENT",
+    "TeraboxAccountFileDownload",
     "TeraboxAccountClient",
     "TeraboxBatchDownload",
+    "TeraboxPackageTooLargeError",
     "account_source_url",
     "is_account_directory",
     "normalize_account_path",
+    "safe_account_file_name",
     "safe_archive_name",
 ]

@@ -195,12 +195,27 @@ connections. Range-capable account ZIPs therefore use a validated internal
 downloader with rolling 8 MiB ranges and up to 16 workers by default; every
 response offset and total is checked before it is written. Non-range streams
 fall back to one Aria2 connection.
+
+`/teralocaldl "/My Cloud/Folder" 15GB` uses the same authenticated account
+scan and persistent sequential-session model, but requests a signed `dlink`
+for each file and never asks TeraBox to create a server ZIP. The complete
+directory tree is scanned once and each stable file ID, relative path, size,
+and source position is stored in MongoDB. Each file is authorized immediately
+before its download with the cookie current at that time, so a restart or
+cookie replacement does not require another directory scan. The workspace
+limit includes temporary Telegram split parts, matching `/teraintelligent`.
+Only one source file downloads at a time; Telegram uploads remain independently
+queued. This command is restricted to configured chat administrators and does
+not create, move, rename, or delete anything in the TeraBox account.
+
 The scan defaults to at most 100 file IDs per generated ZIP, 5,000 directories,
 and 100,000 source files; tune these safety limits with
 `TERABOX_BATCH_MAX_ITEMS`, `TERABOX_BATCH_MAX_DIRECTORIES`, and
 `TERABOX_BATCH_MAX_SOURCE_FILES`. `TERABOX_BATCH_ARCHIVE_OVERHEAD_MB` reserves
 extra workspace per generated ZIP (8 MiB by default). Override the ranged-stream
 connection count with `TERABOX_BATCH_CONNECTIONS` (1-16).
+`TERABOX_LOCAL_CONNECTIONS` controls per-file `/teralocaldl` connections
+(1-16, default 16).
 
 Per-file `Files:` summaries are suppressed for these session chains. After the
 entire chain uploads, the bot sends one folder-style, numbered index containing

@@ -1033,6 +1033,7 @@ class BunkrSessionStore:
                 {
                     "session_id": session_id,
                     "status": {"$in": list(UNFINISHED_FILE_STATES)},
+                    "terminal_skip": {"$ne": True},
                 },
                 {
                     "$set": {
@@ -1049,6 +1050,7 @@ class BunkrSessionStore:
                     if (
                         doc["session_id"] == session_id
                         and doc["status"] in UNFINISHED_FILE_STATES
+                        and not doc.get("terminal_skip")
                     ):
                         doc.update(
                             {

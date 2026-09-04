@@ -35,9 +35,11 @@ from ..utils.terabox import (
 )
 from ..utils.terabox_account import (
     TeraboxAccountClient,
+    TeraboxPackageTooLargeError,
     account_source_url,
     is_account_directory,
     normalize_account_path,
+    safe_account_file_name,
     safe_archive_name,
 )
 from ..utils.terabox_config import TeraboxConfigStore
@@ -107,6 +109,9 @@ TERABOX_BATCH_MAX_SOURCE_FILES = _bounded_env_int(
 )
 TERABOX_BATCH_CONNECTIONS = _bounded_env_int(
     "TERABOX_BATCH_CONNECTIONS", 16, maximum=16
+)
+TERABOX_LOCAL_CONNECTIONS = _bounded_env_int(
+    "TERABOX_LOCAL_CONNECTIONS", 16, maximum=16
 )
 
 
@@ -703,6 +708,43 @@ async def _fail_terabox_session(message, session_id, file_doc, error):
     )
 
 
+async def _fail_terabox_package_too_large(message, session_id, file_doc):
+    """Skip an oversized server ZIP without mutating the user's cloud drive."""
+    await terabox_session_store.update_file_if_status(
+        file_doc["_id"],
+        (FILE_PENDING, FILE_RESOLVING, FILE_DOWNLOADING),
+        FILE_FAILED,
+        gid=None,
+        error="TeraBox batch package is too large (error 31090)",
+        terminal_skip=True,
+    )
+    folder = (
+        file_doc.get("account_directory")
+        or file_doc.get("relative_path")
+        or file_doc.get("filename")
+        or "this folder"
+    )
+    await message.reply_text(
+        "Skipped a TeraBox folder because its server ZIP package is too large "
+        "(error 31090):\n"
+        f"<code>{html.escape(str(folder))}</code>\n\n"
+        "Split its contents manually into smaller subfolders (keep each below "
+        "about 3 GB), then create a new <code>/batchdltera</code> chain for the "
+        "parent folder. The bot will not move or retry this package; the current "
+        "queue will continue with the next item."
+    )
+
+
+def _is_terabox_package_too_large(error):
+    """Recognize 31090 even when an older resolver wrapped its JSON response."""
+    if isinstance(error, TeraboxPackageTooLargeError):
+        return True
+    detail = str(error or "").lower()
+    return "31090" in detail and (
+        "package is too large" in detail or "error_code" in detail
+    )
+
+
 async def _skip_terabox_file(session_doc, file_doc, error):
     """Persist one failed transfer and release its partial workspace."""
     reason = str(error or "download failed")
@@ -932,6 +974,92 @@ async def _scan_account_batch_archives(account, root_path, max_bytes):
     }
 
 
+def _account_local_file(root_path, directory_path, item):
+    raw_name = str(item.get("server_filename") or "").strip()
+    filename = safe_account_file_name(raw_name)
+    fs_id = str(item.get("fs_id") or "").strip()
+    if not fs_id:
+        raise TeraboxError(f"TeraBox did not return a file ID for {filename}")
+    raw_path = str(item.get("path") or "").strip()
+    if raw_path:
+        file_path = PurePosixPath(normalize_account_path(raw_path))
+    else:
+        file_path = PurePosixPath(normalize_account_path(directory_path)) / filename
+    root = PurePosixPath(normalize_account_path(root_path))
+    anchor = root.parent if str(root) != "/" else root
+    try:
+        relative = file_path.relative_to(anchor)
+    except ValueError as error:
+        raise TeraboxError(
+            f"TeraBox returned a file outside the requested root: {filename}"
+        ) from error
+    relative = relative.parent / filename
+    return {
+        "page_url": account_source_url(root_path),
+        "filename": filename,
+        "relative_path": str(relative),
+        "size_bytes": _account_file_size(item),
+        "fs_id": fs_id,
+        "account_file_path": str(file_path),
+        "account_directory": normalize_account_path(directory_path),
+    }
+
+
+async def _scan_account_local_files(account, root_path):
+    """Recursively scan a private-drive folder once, preserving file paths."""
+    root_path = normalize_account_path(root_path)
+    root_entry = await account.get_directory(root_path)
+    root_name = (
+        str(root_entry.get("server_filename") or "").strip()
+        or (PurePosixPath(root_path).name if root_path != "/" else "TeraBox Root")
+    )
+    files = []
+    visited = set()
+    seen_ids = set()
+
+    async def visit(directory_entry):
+        directory_path = normalize_account_path(directory_entry.get("path") or "/")
+        if directory_path in visited:
+            raise TeraboxError(f"TeraBox returned a directory cycle at {directory_path}")
+        visited.add(directory_path)
+        if len(visited) > TERABOX_BATCH_MAX_DIRECTORIES:
+            raise TeraboxError(
+                "The account folder exceeds the recursive directory safety limit"
+            )
+        children = natsorted(
+            await account.list_directory(directory_path),
+            key=lambda item: str(item.get("server_filename") or item.get("path") or ""),
+        )
+        directories = [item for item in children if is_account_directory(item)]
+        for item in children:
+            if is_account_directory(item):
+                continue
+            file_info = _account_local_file(root_path, directory_path, item)
+            if file_info["fs_id"] in seen_ids:
+                continue
+            seen_ids.add(file_info["fs_id"])
+            files.append(file_info)
+            if len(files) > TERABOX_BATCH_MAX_SOURCE_FILES:
+                raise TeraboxError(
+                    "The account folder exceeds the recursive source-file safety limit"
+                )
+        for directory in directories:
+            await visit(directory)
+
+    await visit(root_entry)
+    if not files:
+        raise TeraboxError("No files were found below that TeraBox account folder")
+    for position, file_info in enumerate(files, 1):
+        file_info["source_position"] = position
+    return {
+        "root_path": root_path,
+        "name": root_name,
+        "files": files,
+        "source_file_count": len(files),
+        "source_bytes": sum(item["size_bytes"] for item in files),
+    }
+
+
 def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=True):
     """Render one bounded page of a newly created split-chain plan."""
     total_parts = len(session_docs)
@@ -946,6 +1074,7 @@ def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=Tru
     intelligent = planning_mode in {
         "intelligent_workspace",
         "account_batch_workspace",
+        "account_local_workspace",
     }
     limit_label = "Workspace" if intelligent else "Source"
     file_summary = f"<b>Files:</b> {int(chain_doc.get('total_files') or 0)}"
@@ -1261,8 +1390,12 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
     if not session_doc or session_doc["state"] != SESSION_RUNNING:
         return
     provider = session_doc.get("provider") or "terabox"
+    account_provider = provider in {
+        "terabox_account_batch",
+        "terabox_account_local",
+    }
     try:
-        if provider == "terabox_account_batch":
+        if account_provider:
             cookie = await TERABOX_CONFIG.get_cookie()
             if not cookie:
                 raise TeraboxError(
@@ -1325,6 +1458,18 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     if batch_download.range_supported
                     else None
                 )
+                file_info = None
+            elif provider == "terabox_account_local":
+                file_download = await resolver.authorize_file_download(
+                    file_doc.get("fs_id"),
+                    file_doc.get("account_file_path"),
+                    preferred_connections=TERABOX_LOCAL_CONNECTIONS,
+                )
+                download_url = file_download.url
+                request_headers = file_download.headers
+                max_connections = file_download.max_connections
+                segmented_total_length = None
+                file_info = None
             elif file_doc.get("source_dlink") and file_doc.get("fs_id"):
                 download_url, request_headers = (
                     await _authorize_stored_terabox_file(session_doc, file_doc)
@@ -1363,7 +1508,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 segmented_total_length = None
                 file_info = None
             if (
-                provider != "terabox_account_batch"
+                not account_provider
                 and file_info is not None
                 and resolver is not None
             ):
@@ -1376,7 +1521,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     f"Referer: {TERABOX_BASE_URL}",
                 ]
             elif (
-                provider != "terabox_account_batch"
+                not account_provider
                 and file_info is not None
             ):
                 download_url = file_info.get("normal_dlink") or file_info.get(
@@ -1479,6 +1624,14 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if (
+                provider == "terabox_account_batch"
+                and _is_terabox_package_too_large(error)
+            ):
+                await _fail_terabox_package_too_large(
+                    message, session_id, file_doc
+                )
+                continue
             await _fail_terabox_session(message, session_id, file_doc, error)
             return
 
@@ -1841,6 +1994,151 @@ async def _create_account_batch_sessions(
     return session_docs
 
 
+async def _create_account_local_sessions(
+    client,
+    message,
+    folder_path,
+    max_bytes,
+    reply,
+):
+    """Persist direct, per-file sessions for one private-drive directory tree."""
+    cookie = await TERABOX_CONFIG.get_cookie()
+    if not cookie:
+        await reply.edit_text(
+            "TeraBox is not configured. Save a valid account cookie with "
+            "<code>/setteraboxcookie</code> first."
+        )
+        return []
+
+    try:
+        account = TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
+        scan = await _scan_account_local_files(account, folder_path)
+        files = scan["files"]
+        violations = _intelligent_limit_violations(files, max_bytes)
+        if violations:
+            required = max(_intelligent_workspace_bytes(item) for item in violations)
+            examples = ", ".join(
+                html.escape(str(item.get("filename") or "unnamed"))
+                for item in violations[:3]
+            )
+            more = f" and {len(violations) - 3} more" if len(violations) > 3 else ""
+            await reply.edit_text(
+                "The requested workspace is too small for direct account downloads. "
+                "A file above Telegram's upload boundary needs roughly twice its "
+                "source size while numbered parts are prepared.\n\n"
+                f"<b>Requested:</b> {_human_size(max_bytes)}\n"
+                f"<b>Minimum:</b> {_human_size(required)}\n"
+                f"<b>Files that do not fit:</b> {examples}{more}"
+            )
+            return []
+        groups = split_by_cumulative_size(
+            files,
+            max_bytes,
+            size_getter=_intelligent_workspace_bytes,
+        )
+    except Exception as error:
+        await reply.edit_text(
+            f"TeraBox account scan failed: {html.escape(str(error))[:500]}"
+        )
+        return []
+
+    chain_id = new_session_id()
+    total_parts = len(groups)
+    source_url = account_source_url(scan["root_path"])
+    session_name = scan["name"]
+    session_docs = []
+    chain_doc = None
+    try:
+        for part_index, group in enumerate(groups, 1):
+            part_bytes = sum(int(item.get("size_bytes") or 0) for item in group)
+            workspace_bytes = sum(_intelligent_workspace_bytes(item) for item in group)
+            session_docs.append(
+                await terabox_session_store.create_session(
+                    owner_id=message.from_user.id,
+                    chat_id=message.chat.id,
+                    source_message_id=message.id,
+                    source_url=source_url,
+                    title=f"{session_name} (part {part_index}/{total_parts})",
+                    mode="normal",
+                    custom_filename=None,
+                    files=group,
+                    initial_state=(
+                        SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "provider": "terabox_account_local",
+                        "name": session_name,
+                        "account_path": scan["root_path"],
+                        "chain_id": chain_id,
+                        "part_index": part_index,
+                        "total_parts": total_parts,
+                        "max_bytes": max_bytes,
+                        "part_bytes": part_bytes,
+                        "workspace_bytes": workspace_bytes,
+                        "source_file_count": len(group),
+                        "planning_mode": "account_local_workspace",
+                        "auto_continue": True,
+                    },
+                )
+            )
+        chain_doc = await terabox_session_store.create_chain(
+            chain_id=chain_id,
+            owner_id=message.from_user.id,
+            chat_id=message.chat.id,
+            source_message_id=message.id,
+            source_url=source_url,
+            name=session_name,
+            mode="normal",
+            total_parts=total_parts,
+            total_files=len(files),
+            session_ids=[doc["_id"] for doc in session_docs],
+            chain_fields={
+                "provider": "terabox_account_local",
+                "account_path": scan["root_path"],
+                "max_bytes": max_bytes,
+                "total_bytes": scan["source_bytes"],
+                "total_source_files": scan["source_file_count"],
+                "workspace_bytes": sum(
+                    _intelligent_workspace_bytes(item) for item in files
+                ),
+                "planning_mode": "account_local_workspace",
+                "split_file_count": sum(
+                    1 for item in files if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
+                ),
+                "auto_continue": True,
+            },
+        )
+    except Exception as error:
+        for session_doc in session_docs:
+            await terabox_session_store.delete_session(session_doc["_id"])
+        if chain_doc is not None:
+            await terabox_session_store.delete_chain(chain_id)
+        await reply.edit_text(
+            "Could not store the TeraBox local-file sessions; partial records "
+            f"were removed. Error: {html.escape(str(error))[:500]}"
+        )
+        return []
+
+    text, reply_markup = _terabox_plan_page(
+        chain_doc,
+        session_docs,
+        requested_page=1,
+        persistent=terabox_session_store.persistent,
+    )
+    await reply.edit_text(
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+    _start_terabox_session(
+        client,
+        message,
+        session_docs[0]["_id"],
+        resolved=(account, None),
+    )
+    return session_docs
+
+
 @Client.on_callback_query(
     filters.regex(r"^terachain_page:\d+:[A-Za-z0-9_-]+:\d+$")
 )
@@ -1960,6 +2258,40 @@ async def batch_download_terabox_cmd(client, message):
         "Scanning the authenticated TeraBox folder and planning batch sessions..."
     )
     await _create_account_batch_sessions(
+        client,
+        message,
+        folder_path,
+        max_bytes,
+        reply,
+    )
+
+
+@Client.on_message(
+    filters.command(["teralocaldl", "localdltera"])
+    & filters.chat(ALL_CHATS)
+)
+async def local_download_terabox_cmd(client, message):
+    if not await _is_cookie_admin(client, message):
+        await message.reply_text(
+            "Only a configured chat administrator can access the TeraBox account."
+        )
+        return
+    request = _batch_terabox_request_from_message(message)
+    if request is None:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/teralocaldl &lt;My Cloud folder path&gt; "
+            "&lt;available workspace&gt;</code>\n"
+            "Example: <code>/teralocaldl /pass_harif2/[Appetite] 15GB</code>\n"
+            "Quote paths containing spaces. Files are downloaded individually; "
+            "TeraBox server ZIP is not used."
+        )
+        return
+    folder_path, max_bytes = request
+    reply = await message.reply_text(
+        "Scanning the authenticated TeraBox folder and planning direct-file sessions..."
+    )
+    await _create_account_local_sessions(
         client,
         message,
         folder_path,
@@ -2357,6 +2689,7 @@ help_dict["terabox"] = (
 /splitfiletera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - File mode
 /teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Plan for source + split-part disk usage
 /batchdltera <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively batch-download an account folder (admins only)
+/teralocaldl <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively download account files without server ZIP (admins only)
 /terasessions <i>[page]</i> - List persistent parent chains and child sessions
 /terasession <i>[session ID]</i> - Show one part or the latest active/recent part
 /continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part
