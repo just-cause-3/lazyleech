@@ -104,6 +104,7 @@ teraintelligent <TeraBox share URL> <workspace> - Plan for source plus split cop
 terasessions [page] - List persistent parent chains and child sessions
 terasession [session ID] - Show one part or the latest active/recent part
 continuetera <chain or session ID> - Resume the next unfinished part
+skipterasession <session ID> - Skip one child part and advance its chain
 deleteterasession <session ID> - Delete one child session and reindex its chain
 deleteterachain <chain ID> - Delete a chain and all child histories
 deleteallterasessions - Delete all of your TeraBox histories

@@ -69,6 +69,7 @@ TERABOX_API_URL = "https://xapiverse.com/api/terabox"
 TERABOX_CONFIG = TeraboxConfigStore()
 terabox_session_tasks = {}
 terabox_tasks = set()
+terabox_pending_uploads = set()
 terabox_chain_locks = {}
 terabox_chain_refresh_locks = {}
 terabox_chain_cache = {}
@@ -1366,23 +1367,44 @@ async def _maybe_complete_terabox_session(client, message, session_id):
             SESSION_COMPLETED,
             skipped_files=counts.get(FILE_FAILED, 0),
         )
-        next_session = await terabox_session_store.activate_next_chain_part(
-            session_id
-        )
-        if next_session is not None:
-            _start_terabox_session(client, message, next_session["_id"])
-            return True
-
-        chain = await terabox_session_store.list_chain(completed["chain_id"])
-        if chain and all(item["state"] == SESSION_COMPLETED for item in chain):
-            last = chain[-1]
-            if not last.get("index_sent"):
-                await _send_terabox_chain_index(message, chain)
-                await terabox_session_store.set_state(
-                    last["_id"], SESSION_COMPLETED, index_sent=True
-                )
-        terabox_chain_locks.pop(chain_id, None)
+        await _advance_terabox_chain(client, message, completed)
         return True
+
+
+async def _advance_terabox_chain(client, message, completed):
+    """Start the next usable part or publish the final chain index.
+
+    The caller must hold this chain's lock. The store steps over child parts
+    which were completed explicitly through ``/skipterasession``.
+    """
+    chain_id = completed.get("chain_id") or completed["_id"]
+    chain = await terabox_session_store.list_chain(chain_id)
+    blockers = [
+        item
+        for item in chain
+        if int(item.get("part_index") or 0)
+        < int(completed.get("part_index") or 0)
+        and item.get("state") != SESSION_COMPLETED
+    ]
+    if blockers:
+        return None
+
+    next_session = await terabox_session_store.activate_next_chain_part(
+        completed["_id"]
+    )
+    if next_session is not None:
+        _start_terabox_session(client, message, next_session["_id"])
+        return next_session
+
+    chain = await terabox_session_store.list_chain(chain_id)
+    if chain and all(item["state"] == SESSION_COMPLETED for item in chain):
+        last = chain[-1]
+        if not last.get("index_sent"):
+            await _send_terabox_chain_index(message, chain)
+            await terabox_session_store.set_state(
+                last["_id"], SESSION_COMPLETED, index_sent=True
+            )
+    return None
 
 
 async def _run_terabox_session(client, message, session_id, resolved=None):
@@ -1543,9 +1565,15 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                 return True
 
             async def on_downloaded(current_file=file_doc):
-                await terabox_session_store.update_file(
-                    current_file["_id"], FILE_DOWNLOADED, gid=None, error=None
+                updated = await terabox_session_store.update_file_if_status(
+                    current_file["_id"],
+                    (FILE_RESOLVING, FILE_DOWNLOADING),
+                    FILE_DOWNLOADED,
+                    gid=None,
+                    error=None,
                 )
+                if updated is not None:
+                    terabox_pending_uploads.add(current_file["_id"])
 
             async def on_uploaded(
                 sent_files, upload_error, current_file=file_doc
@@ -1572,9 +1600,28 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                         "Telegram upload did not return a valid message link "
                         f"for every part ({len(telegram_files)} valid link(s))"
                     )
-                    await _fail_terabox_session(
-                        message, session_id, current_file, reason
+                    current_session = await terabox_session_store.get_session(
+                        session_id
                     )
+                    if current_session and current_session.get("skip_requested"):
+                        await terabox_session_store.update_file_if_status(
+                            current_file["_id"],
+                            FILE_DOWNLOADED,
+                            FILE_FAILED,
+                            gid=None,
+                            error=f"Session skipped; queued upload failed: {reason}",
+                            terminal_skip=True,
+                            session_skip=True,
+                        )
+                        terabox_pending_uploads.discard(current_file["_id"])
+                        await _maybe_complete_terabox_session(
+                            client, message, session_id
+                        )
+                    else:
+                        terabox_pending_uploads.discard(current_file["_id"])
+                        await _fail_terabox_session(
+                            message, session_id, current_file, reason
+                        )
                     return
                 updated = await terabox_session_store.update_file_if_status(
                     current_file["_id"],
@@ -1584,6 +1631,7 @@ async def _run_terabox_session(client, message, session_id, resolved=None):
                     error=None,
                     telegram_files=telegram_files,
                 )
+                terabox_pending_uploads.discard(current_file["_id"])
                 if updated is not None:
                     await _maybe_complete_terabox_session(
                         client, message, session_id
@@ -2338,7 +2386,14 @@ def _chain_session_line(session_doc, *, is_last=False):
     branch = "└──" if is_last else "├──"
     part_index = int(session_doc.get("part_index") or 1)
     total_parts = int(session_doc.get("total_parts") or 1)
-    state = html.escape(str(session_doc.get("state") or "unknown"))
+    raw_state = str(session_doc.get("state") or "unknown")
+    if session_doc.get("skipped_by_user"):
+        raw_state = (
+            "skipping (uploads finishing)"
+            if raw_state == SESSION_RUNNING
+            else "skipped"
+        )
+    state = html.escape(raw_state)
     total_files = int(session_doc.get("total_files") or 0)
     size = _human_size(int(session_doc.get("part_bytes") or 0))
     return (
@@ -2491,12 +2546,19 @@ async def terabox_session_cmd(client, message):
         return
     session_id = session_doc["_id"]
     counts = await terabox_session_store.counts(session_id)
+    state = str(session_doc["state"])
+    if session_doc.get("skipped_by_user"):
+        state = (
+            "skipping (uploads finishing)"
+            if state == SESSION_RUNNING
+            else "skipped"
+        )
     await message.reply_text(
         f"<b>Name:</b> {html.escape(str(session_doc.get('name') or 'TeraBox'))}\n"
         f"<b>TeraBox session:</b> <code>{session_id}</code>\n"
         f"<b>Chain:</b> <code>{session_doc['chain_id']}</code>\n"
         f"<b>Part:</b> {session_doc['part_index']}/{session_doc['total_parts']}\n"
-        f"<b>State:</b> {html.escape(session_doc['state'])}\n"
+        f"<b>State:</b> {html.escape(state)}\n"
         f"<b>Downloaded:</b> "
         f"{counts[FILE_DOWNLOADED] + counts.get(FILE_UPLOADED, 0)}/"
         f"{session_doc['total_files']}\n"
@@ -2564,6 +2626,12 @@ async def continue_terabox_session_cmd(client, message):
     if session_doc["state"] == SESSION_COMPLETED:
         await message.reply_text("That TeraBox session is already complete.")
         return
+    if session_doc.get("skip_requested"):
+        await message.reply_text(
+            "That TeraBox session is being skipped while its accepted Telegram "
+            "uploads finish. It cannot be resumed."
+        )
+        return
     await terabox_session_store.prepare_continue(
         session_id, message.chat.id, message.id
     )
@@ -2571,6 +2639,117 @@ async def continue_terabox_session_cmd(client, message):
     await message.reply_text(
         f"Resumed TeraBox session <code>{session_id}</code>."
     )
+
+
+@Client.on_message(
+    filters.command(["skipterasession", "skiptsession"])
+    & filters.chat(ALL_CHATS)
+)
+async def skip_terabox_session_cmd(client, message):
+    """Skip one child part without deleting its persistent chain history."""
+    session_id = _terabox_session_id_from_message(message)
+    session_doc = (
+        await terabox_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+        if session_id
+        else None
+    )
+    if session_doc is None:
+        await message.reply_text(
+            "Session not found. Use "
+            "<code>/skipterasession &lt;session ID&gt;</code>."
+        )
+        return
+    if session_doc.get("state") == SESSION_COMPLETED:
+        label = (
+            "already skipped"
+            if session_doc.get("skipped_by_user")
+            else "already complete"
+        )
+        await message.reply_text(f"That TeraBox session is {label}.")
+        return
+
+    await _stop_terabox_session_runtime(session_doc)
+    chain_id = session_doc.get("chain_id") or session_id
+    lock = terabox_chain_locks.setdefault(chain_id, asyncio.Lock())
+    next_session = None
+    waiting_uploads = 0
+    earlier_blocker = None
+    skipped_count = 0
+    async with lock:
+        session_doc = await terabox_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+        if session_doc is None:
+            await message.reply_text("That TeraBox session no longer exists.")
+            return
+        if session_doc.get("state") == SESSION_COMPLETED:
+            await message.reply_text("That TeraBox session is already complete.")
+            return
+
+        file_docs = await terabox_session_store.list_files(session_id)
+        live_upload_ids = {
+            file_doc["_id"]
+            for file_doc in file_docs
+            if file_doc.get("status") == FILE_DOWNLOADED
+            and file_doc["_id"] in terabox_pending_uploads
+        }
+        skipped_count = await terabox_session_store.skip_unfinished_files(
+            session_id,
+            "TeraBox session skipped by user",
+            preserve_file_ids=live_upload_ids,
+        )
+        counts = await terabox_session_store.counts(session_id)
+        waiting_uploads = counts.get(FILE_DOWNLOADED, 0)
+        state = SESSION_RUNNING if waiting_uploads else SESSION_COMPLETED
+        completed = await terabox_session_store.set_state(
+            session_id,
+            state,
+            skip_requested=True,
+            skipped_by_user=True,
+            skip_reason="Skipped by user",
+            skipped_files=counts.get(FILE_FAILED, 0),
+        )
+
+        chain = await terabox_session_store.list_chain(chain_id)
+        blockers = [
+            item
+            for item in chain
+            if int(item.get("part_index") or 0)
+            < int(completed.get("part_index") or 0)
+            and item.get("state") != SESSION_COMPLETED
+        ]
+        earlier_blocker = blockers[0] if blockers else None
+        if not waiting_uploads and earlier_blocker is None:
+            next_session = await _advance_terabox_chain(
+                client, message, completed
+            )
+
+    part_index = int(session_doc.get("part_index") or 1)
+    if waiting_uploads:
+        await message.reply_text(
+            f"Skipping TeraBox session <code>{session_id}</code> (Part "
+            f"{part_index}). Downloads stopped and {skipped_count} unfinished "
+            f"file(s) were skipped. {waiting_uploads} queued Telegram upload(s) "
+            "will finish normally; the next eligible part will start afterward."
+        )
+    elif earlier_blocker is not None:
+        await message.reply_text(
+            f"Skipped TeraBox session <code>{session_id}</code> (Part "
+            f"{part_index}) and {skipped_count} unfinished file(s). The chain "
+            f"remains on earlier Part {earlier_blocker['part_index']}."
+        )
+    else:
+        suffix = (
+            f" Part {next_session['part_index']} has started automatically."
+            if next_session is not None
+            else " No later unfinished part remains."
+        )
+        await message.reply_text(
+            f"Skipped TeraBox session <code>{session_id}</code> (Part "
+            f"{part_index}) and {skipped_count} unfinished file(s).{suffix}"
+        )
 
 
 @Client.on_message(
@@ -2693,6 +2872,7 @@ help_dict["terabox"] = (
 /terasessions <i>[page]</i> - List persistent parent chains and child sessions
 /terasession <i>[session ID]</i> - Show one part or the latest active/recent part
 /continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part
+/skipterasession <i>&lt;session ID&gt;</i> - Skip one child part and advance its chain
 /deleteterasession <i>&lt;session ID&gt;</i> - Delete one child session and reindex its chain
 /deleteterachain <i>&lt;chain ID&gt;</i> - Delete a chain and all child histories
 /deleteallterasessions - Delete all your TeraBox chain/session histories

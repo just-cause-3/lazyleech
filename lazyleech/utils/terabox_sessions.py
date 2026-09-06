@@ -4,7 +4,7 @@ import asyncio
 import copy
 import re
 
-from pymongo import ASCENDING, DESCENDING, UpdateOne
+from pymongo import ASCENDING, DESCENDING, ReturnDocument, UpdateOne
 
 from .bunkr_sessions import (
     FILE_CANCELLED,
@@ -101,6 +101,42 @@ class TeraboxSessionStore(BunkrSessionStore):
             async with self._memory_lock:
                 self._memory_chains[chain_doc["_id"]] = chain_doc
         return copy.deepcopy(chain_doc)
+
+    async def activate_next_chain_part(self, session_id):
+        """Activate the next queued part, stepping over user-skipped parts."""
+        current = await self.get_session(str(session_id))
+        if current is None or current.get("state") != SESSION_COMPLETED:
+            return None
+        chain_id = current.get("chain_id")
+        part_index = int(current.get("part_index") or 0)
+        if not chain_id or not part_index:
+            return None
+        next_session = next(
+            (
+                doc
+                for doc in await self.list_chain(chain_id)
+                if int(doc.get("part_index") or 0) > part_index
+                and doc.get("state") != SESSION_COMPLETED
+            ),
+            None,
+        )
+        if next_session is None or next_session.get("state") != SESSION_PAUSED:
+            return None
+        now = utcnow()
+        query = {"_id": next_session["_id"], "state": SESSION_PAUSED}
+        if self.persistent:
+            await self._ensure_indexes()
+            return await self.sessions.find_one_and_update(
+                query,
+                {"$set": {"state": SESSION_RUNNING, "updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+            )
+        async with self._memory_lock:
+            doc = self._memory_sessions.get(next_session["_id"])
+            if doc is None or doc.get("state") != SESSION_PAUSED:
+                return None
+            doc.update({"state": SESSION_RUNNING, "updated_at": now})
+            return copy.deepcopy(doc)
 
     async def _backfill_chain_records(self, owner_id=None):
         """Materialize parent records for chains created by older releases."""
@@ -559,6 +595,52 @@ class TeraboxSessionStore(BunkrSessionStore):
                     if chain_doc is not None:
                         chain_doc["updated_at"] = now
         return session_doc
+
+    async def skip_unfinished_files(
+        self, session_id, reason, *, preserve_file_ids=()
+    ):
+        """Terminally skip every file which is not uploaded or actively queued.
+
+        ``FILE_DOWNLOADED`` records may still be in the live Telegram upload
+        queue. Callers pass those IDs in ``preserve_file_ids`` so their upload
+        callbacks can finish normally while all other work in the session is
+        discarded.
+        """
+        now = utcnow()
+        preserve_file_ids = {
+            str(file_id) for file_id in preserve_file_ids if file_id
+        }
+        fields = {
+            "status": FILE_FAILED,
+            "gid": None,
+            "error": str(reason),
+            "terminal_skip": True,
+            "session_skip": True,
+            "updated_at": now,
+        }
+        if self.persistent:
+            await self._ensure_indexes()
+            query = {
+                "session_id": str(session_id),
+                "status": {"$ne": FILE_UPLOADED},
+            }
+            if preserve_file_ids:
+                query["_id"] = {"$nin": list(preserve_file_ids)}
+            result = await self.files.update_many(query, {"$set": fields})
+            return int(result.modified_count)
+
+        skipped = 0
+        async with self._memory_lock:
+            for file_id, doc in self._memory_files.items():
+                if (
+                    doc["session_id"] != str(session_id)
+                    or doc.get("status") == FILE_UPLOADED
+                    or str(file_id) in preserve_file_ids
+                ):
+                    continue
+                doc.update(copy.deepcopy(fields))
+                skipped += 1
+        return skipped
 
     async def prepare_continue(self, session_id, chat_id, source_message_id):
         """Redownload files whose queued upload was lost after a restart."""

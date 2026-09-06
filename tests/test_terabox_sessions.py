@@ -915,6 +915,247 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(SESSION_RUNNING, activated["state"])
         self.assertIsNone(await store.activate_next_chain_part(first["_id"]))
 
+    async def test_next_part_activation_steps_over_a_skipped_part(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        sessions = []
+        for part_index in range(1, 4):
+            sessions.append(
+                await store.create_session(
+                    **common,
+                    title=f"part {part_index}",
+                    files=[
+                        {
+                            "page_url": common["source_url"],
+                            "filename": f"{part_index}.bin",
+                        }
+                    ],
+                    initial_state=(
+                        SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "chain_id": "skipchain",
+                        "part_index": part_index,
+                        "total_parts": 3,
+                    },
+                )
+            )
+        await store.set_state(
+            sessions[1]["_id"],
+            SESSION_COMPLETED,
+            skipped_by_user=True,
+        )
+        await store.set_state(sessions[0]["_id"], SESSION_COMPLETED)
+
+        activated = await store.activate_next_chain_part(sessions[0]["_id"])
+
+        self.assertEqual(sessions[2]["_id"], activated["_id"])
+        self.assertEqual(SESSION_RUNNING, activated["state"])
+
+    async def test_skip_session_completes_part_and_starts_next(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        first = await store.create_session(
+            **common,
+            title="part 1",
+            files=[
+                {"page_url": common["source_url"], "filename": "sent.bin"},
+                {"page_url": common["source_url"], "filename": "pending.bin"},
+            ],
+            session_fields={
+                "chain_id": "commandskip",
+                "part_index": 1,
+                "total_parts": 2,
+            },
+        )
+        second = await store.create_session(
+            **common,
+            title="part 2",
+            files=[{"page_url": common["source_url"], "filename": "next.bin"}],
+            initial_state=SESSION_PAUSED,
+            session_fields={
+                "chain_id": "commandskip",
+                "part_index": 2,
+                "total_parts": 2,
+            },
+        )
+        first_files = await store.list_files(first["_id"])
+        await store.update_file(first_files[0]["_id"], FILE_UPLOADED)
+        message = SimpleNamespace(
+            command=["skipterasession", first["_id"]],
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+        client = object()
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(terabox, "_stop_terabox_session_runtime", AsyncMock()),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            await terabox.skip_terabox_session_cmd(client, message)
+
+        skipped = await store.get_session(first["_id"])
+        activated = await store.get_session(second["_id"])
+        skipped_files = await store.list_files(first["_id"])
+        self.assertEqual(SESSION_COMPLETED, skipped["state"])
+        self.assertTrue(skipped["skipped_by_user"])
+        self.assertEqual(
+            [FILE_UPLOADED, FILE_FAILED],
+            [file_doc["status"] for file_doc in skipped_files],
+        )
+        self.assertTrue(skipped_files[1]["terminal_skip"])
+        self.assertEqual(SESSION_RUNNING, activated["state"])
+        start.assert_called_once_with(client, message, second["_id"])
+
+    async def test_skip_future_session_does_not_jump_over_earlier_part(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        sessions = []
+        for part_index in range(1, 4):
+            sessions.append(
+                await store.create_session(
+                    **common,
+                    title=f"part {part_index}",
+                    files=[
+                        {
+                            "page_url": common["source_url"],
+                            "filename": f"{part_index}.bin",
+                        }
+                    ],
+                    initial_state=(
+                        SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+                    ),
+                    session_fields={
+                        "chain_id": "futurecommandskip",
+                        "part_index": part_index,
+                        "total_parts": 3,
+                    },
+                )
+            )
+        message = SimpleNamespace(
+            command=["skipterasession", sessions[2]["_id"]],
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(terabox, "_stop_terabox_session_runtime", AsyncMock()),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            await terabox.skip_terabox_session_cmd(object(), message)
+
+        self.assertEqual(
+            SESSION_RUNNING,
+            (await store.get_session(sessions[0]["_id"]))["state"],
+        )
+        self.assertEqual(
+            SESSION_PAUSED,
+            (await store.get_session(sessions[1]["_id"]))["state"],
+        )
+        self.assertEqual(
+            SESSION_COMPLETED,
+            (await store.get_session(sessions[2]["_id"]))["state"],
+        )
+        start.assert_not_called()
+
+    async def test_skip_session_waits_for_an_already_queued_upload(self):
+        store = TeraboxSessionStore(db_url="")
+        common = {
+            "owner_id": 123,
+            "chat_id": -1001,
+            "source_message_id": 55,
+            "source_url": "https://terabox.com/s/1share",
+            "mode": "normal",
+            "custom_filename": None,
+        }
+        first = await store.create_session(
+            **common,
+            title="part 1",
+            files=[{"page_url": common["source_url"], "filename": "queued.bin"}],
+            session_fields={
+                "chain_id": "uploadskip",
+                "part_index": 1,
+                "total_parts": 2,
+            },
+        )
+        second = await store.create_session(
+            **common,
+            title="part 2",
+            files=[{"page_url": common["source_url"], "filename": "next.bin"}],
+            initial_state=SESSION_PAUSED,
+            session_fields={
+                "chain_id": "uploadskip",
+                "part_index": 2,
+                "total_parts": 2,
+            },
+        )
+        queued_file = (await store.list_files(first["_id"]))[0]
+        await store.update_file(queued_file["_id"], FILE_DOWNLOADED)
+        message = SimpleNamespace(
+            command=["skipterasession", first["_id"]],
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+        client = object()
+        terabox.terabox_pending_uploads.add(queued_file["_id"])
+        try:
+            with (
+                patch.object(terabox, "terabox_session_store", store),
+                patch.object(
+                    terabox, "_stop_terabox_session_runtime", AsyncMock()
+                ),
+                patch.object(terabox, "_start_terabox_session") as start,
+            ):
+                await terabox.skip_terabox_session_cmd(client, message)
+                waiting = await store.get_session(first["_id"])
+                still_queued = await store.get_file(queued_file["_id"])
+                self.assertEqual(SESSION_RUNNING, waiting["state"])
+                self.assertTrue(waiting["skip_requested"])
+                self.assertEqual(FILE_DOWNLOADED, still_queued["status"])
+                self.assertEqual(
+                    SESSION_PAUSED,
+                    (await store.get_session(second["_id"]))["state"],
+                )
+                start.assert_not_called()
+
+                await store.update_file(queued_file["_id"], FILE_UPLOADED)
+                await terabox._maybe_complete_terabox_session(
+                    client, message, first["_id"]
+                )
+                self.assertEqual(
+                    SESSION_COMPLETED,
+                    (await store.get_session(first["_id"]))["state"],
+                )
+                start.assert_called_once_with(client, message, second["_id"])
+        finally:
+            terabox.terabox_pending_uploads.discard(queued_file["_id"])
+
     async def test_runner_starts_next_part_only_after_all_current_uploads(self):
         store = TeraboxSessionStore(db_url="")
         common = {
