@@ -56,6 +56,34 @@ class TeraboxAccountPathTests(unittest.TestCase):
         self.assertEqual("/My Folder/Done", path)
         self.assertEqual(15 * 1024**3, size)
 
+    def test_local_command_parses_multiple_unquoted_paths_with_spaces(self):
+        message = SimpleNamespace(
+            text=(
+                "/teralocaldl@scrnshitbot /home/[Whirlpool] "
+                "/[Syrup Many Milk] /home/[POISON] 16GB"
+            ),
+            caption=None,
+        )
+
+        paths, size = terabox._local_terabox_request_from_message(message)
+
+        self.assertEqual(
+            ["/home/[Whirlpool]", "/[Syrup Many Milk]", "/home/[POISON]"],
+            paths,
+        )
+        self.assertEqual(16 * 1024**3, size)
+
+    def test_local_command_parses_quoted_paths_and_separate_size_unit(self):
+        message = SimpleNamespace(
+            text='/teralocaldl "/One Folder" \'/Two Folder\' 12 GiB',
+            caption=None,
+        )
+
+        paths, size = terabox._local_terabox_request_from_message(message)
+
+        self.assertEqual(["/One Folder", "/Two Folder"], paths)
+        self.assertEqual(12 * 1024**3, size)
+
     def test_rc4_signature_is_stable(self):
         self.assertEqual("fQ1YmEE=", _rc4_signature("key", "value"))
 
@@ -901,6 +929,96 @@ class TeraboxAccountPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("terabox_account_local", chain["provider"])
         self.assertEqual("account_local_workspace", chain["planning_mode"])
         start.assert_called_once()
+
+    async def test_multiple_local_paths_create_separate_persistent_chain_queue(self):
+        store = TeraboxSessionStore(db_url="")
+        mib = 1024**2
+
+        def scan(folder_name, fs_id):
+            return {
+                "root_path": f"/{folder_name}",
+                "name": folder_name,
+                "files": [
+                    {
+                        "page_url": f"terabox-account:/{folder_name}",
+                        "filename": f"{folder_name}.bin",
+                        "relative_path": f"{folder_name}/{folder_name}.bin",
+                        "size_bytes": mib,
+                        "fs_id": fs_id,
+                        "account_file_path": f"/{folder_name}/{folder_name}.bin",
+                        "source_position": 1,
+                        "account_directory": f"/{folder_name}",
+                    }
+                ],
+                "source_file_count": 1,
+                "source_bytes": mib,
+            }
+
+        scans = [scan("First", "1"), scan("Second", "2"), scan("Third", "3")]
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=55,
+            reply_text=AsyncMock(),
+        )
+        reply = SimpleNamespace(edit_text=AsyncMock())
+        client = object()
+        fake_account = Mock(spec=TeraboxAccountClient)
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox.TERABOX_CONFIG,
+                "get_cookie",
+                AsyncMock(return_value="cookie"),
+            ),
+            patch.object(terabox, "TeraboxAccountClient", return_value=fake_account),
+            patch.object(
+                terabox,
+                "_scan_account_local_files",
+                AsyncMock(side_effect=scans),
+            ),
+            patch.object(terabox, "_start_terabox_session") as start,
+        ):
+            created = await terabox._create_account_local_chain_queue(
+                client,
+                message,
+                ["/First", "/Second", "/Third"],
+                16 * mib,
+                reply,
+            )
+
+        self.assertEqual(3, len(created))
+        chains = await store.list_chain_queue(
+            created[0]["chain"]["chain_queue_id"], owner_id=123
+        )
+        self.assertEqual([1, 2, 3], [doc["chain_queue_index"] for doc in chains])
+        self.assertEqual(3, len({doc["_id"] for doc in chains}))
+        first_session = created[0]["sessions"][0]
+        second_session = created[1]["sessions"][0]
+        third_session = created[2]["sessions"][0]
+        self.assertEqual(
+            SESSION_RUNNING,
+            (await store.get_session(first_session["_id"]))["state"],
+        )
+        self.assertEqual(
+            SESSION_PAUSED,
+            (await store.get_session(second_session["_id"]))["state"],
+        )
+        self.assertEqual(
+            SESSION_PAUSED,
+            (await store.get_session(third_session["_id"]))["state"],
+        )
+        start.assert_called_once_with(
+            client,
+            message,
+            first_session["_id"],
+            resolved=(fake_account, None),
+        )
+        self.assertIn(
+            "Every chain keeps its own final linked directory index",
+            reply.edit_text.await_args.args[0],
+        )
 
     async def test_runner_uses_fresh_batch_url_and_supported_connections(self):
         store = TeraboxSessionStore(db_url="")

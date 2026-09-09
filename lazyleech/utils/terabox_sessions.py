@@ -56,6 +56,9 @@ class TeraboxSessionStore(BunkrSessionStore):
                 [("owner_id", ASCENDING), ("updated_at", ASCENDING)]
             )
             await self.chains.create_index("source_url")
+            await self.chains.create_index(
+                [("chain_queue_id", ASCENDING), ("chain_queue_index", ASCENDING)]
+            )
             self._chain_indexes_ready = True
 
     async def create_chain(
@@ -299,6 +302,107 @@ class TeraboxSessionStore(BunkrSessionStore):
             )
             docs = docs[skip:]
             return copy.deepcopy(docs[:limit] if limit else docs)
+
+    async def list_chain_queue(self, queue_id, owner_id=None):
+        """Return the independently persisted chains in one queue, in order."""
+        await self._ensure_indexes()
+        await self._backfill_chain_records(owner_id=owner_id)
+        query = {"chain_queue_id": str(queue_id)}
+        if owner_id is not None:
+            query["owner_id"] = int(owner_id)
+        if self.persistent:
+            cursor = self.chains.find(query).sort(
+                [("chain_queue_index", ASCENDING), ("created_at", ASCENDING)]
+            )
+            return [doc async for doc in cursor]
+        async with self._memory_lock:
+            docs = [
+                doc
+                for doc in self._memory_chains.values()
+                if doc.get("chain_queue_id") == str(queue_id)
+                and (owner_id is None or doc["owner_id"] == int(owner_id))
+            ]
+            docs.sort(
+                key=lambda doc: (
+                    int(doc.get("chain_queue_index") or 0),
+                    doc.get("created_at"),
+                )
+            )
+            return copy.deepcopy(docs)
+
+    async def chain_is_completed(self, chain_id):
+        sessions = await self.list_chain(str(chain_id))
+        return bool(sessions) and all(
+            doc.get("state") == SESSION_COMPLETED for doc in sessions
+        )
+
+    async def queued_chain_blocker(self, chain_id):
+        """Return the earliest unfinished queue predecessor, if one exists."""
+        current = await self.get_chain(str(chain_id))
+        queue_id = (current or {}).get("chain_queue_id")
+        if not queue_id:
+            return None
+        current_index = int(current.get("chain_queue_index") or 0)
+        for chain_doc in await self.list_chain_queue(
+            queue_id, owner_id=current.get("owner_id")
+        ):
+            if int(chain_doc.get("chain_queue_index") or 0) >= current_index:
+                break
+            if not await self.chain_is_completed(chain_doc["_id"]):
+                return chain_doc
+        return None
+
+    async def activate_next_queued_chain(self, chain_id):
+        """Activate the first part of the next unfinished chain in a queue."""
+        current = await self.get_chain(str(chain_id))
+        queue_id = (current or {}).get("chain_queue_id")
+        if not queue_id or not await self.chain_is_completed(str(chain_id)):
+            return None
+        current_index = int(current.get("chain_queue_index") or 0)
+        queue = await self.list_chain_queue(
+            queue_id, owner_id=current.get("owner_id")
+        )
+
+        # A future chain may have been explicitly skipped before its turn. Do
+        # not let that completion jump over an older unfinished queue member.
+        for chain_doc in queue:
+            index = int(chain_doc.get("chain_queue_index") or 0)
+            if index >= current_index:
+                break
+            if not await self.chain_is_completed(chain_doc["_id"]):
+                return None
+
+        for chain_doc in queue:
+            if int(chain_doc.get("chain_queue_index") or 0) <= current_index:
+                continue
+            sessions = await self.list_chain(chain_doc["_id"])
+            next_session = next(
+                (
+                    doc
+                    for doc in sessions
+                    if doc.get("state") != SESSION_COMPLETED
+                ),
+                None,
+            )
+            if next_session is None:
+                continue
+            if next_session.get("state") != SESSION_PAUSED:
+                return None
+            now = utcnow()
+            query = {"_id": next_session["_id"], "state": SESSION_PAUSED}
+            if self.persistent:
+                return await self.sessions.find_one_and_update(
+                    query,
+                    {"$set": {"state": SESSION_RUNNING, "updated_at": now}},
+                    return_document=ReturnDocument.AFTER,
+                )
+            async with self._memory_lock:
+                stored = self._memory_sessions.get(next_session["_id"])
+                if stored is None or stored.get("state") != SESSION_PAUSED:
+                    return None
+                stored.update({"state": SESSION_RUNNING, "updated_at": now})
+                return copy.deepcopy(stored)
+        return None
 
     async def delete_chain(self, chain_id, owner_id=None):
         query = {"_id": str(chain_id)}

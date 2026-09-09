@@ -959,6 +959,161 @@ class TeraboxSessionChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sessions[2]["_id"], activated["_id"])
         self.assertEqual(SESSION_RUNNING, activated["state"])
 
+    async def test_chain_queue_blocks_later_chain_and_skips_completed_chains(self):
+        store = TeraboxSessionStore(db_url="")
+        queue_id = "folderqueue"
+        children = []
+        for queue_index in range(1, 4):
+            chain_id = f"queuechain{queue_index}"
+            child = await store.create_session(
+                owner_id=123,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=f"terabox-account:/Folder{queue_index}",
+                title=f"Folder {queue_index} (part 1/1)",
+                mode="normal",
+                custom_filename=None,
+                files=[
+                    {
+                        "page_url": f"terabox-account:/Folder{queue_index}",
+                        "filename": f"{queue_index}.bin",
+                    }
+                ],
+                initial_state=(
+                    SESSION_RUNNING if queue_index == 1 else SESSION_PAUSED
+                ),
+                session_fields={
+                    "chain_id": chain_id,
+                    "part_index": 1,
+                    "total_parts": 1,
+                    "chain_queue_id": queue_id,
+                    "chain_queue_index": queue_index,
+                    "chain_queue_total": 3,
+                },
+            )
+            await store.create_chain(
+                chain_id=chain_id,
+                owner_id=123,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=f"terabox-account:/Folder{queue_index}",
+                name=f"Folder {queue_index}",
+                mode="normal",
+                total_parts=1,
+                total_files=1,
+                session_ids=[child["_id"]],
+                chain_fields={
+                    "chain_queue_id": queue_id,
+                    "chain_queue_index": queue_index,
+                    "chain_queue_total": 3,
+                },
+            )
+            children.append(child)
+
+        blocker = await store.queued_chain_blocker("queuechain3")
+        self.assertEqual("queuechain1", blocker["_id"])
+
+        await store.set_state(children[0]["_id"], SESSION_COMPLETED)
+        await store.set_state(
+            children[1]["_id"],
+            SESSION_COMPLETED,
+            skipped_by_user=True,
+        )
+        activated = await store.activate_next_queued_chain("queuechain1")
+
+        self.assertEqual(children[2]["_id"], activated["_id"])
+        self.assertEqual(SESSION_RUNNING, activated["state"])
+        self.assertIsNone(await store.queued_chain_blocker("queuechain3"))
+
+    async def test_completed_chain_sends_index_then_starts_next_queued_chain(self):
+        store = TeraboxSessionStore(db_url="")
+        children = []
+        for queue_index in (1, 2):
+            chain_id = f"finishqueue{queue_index}"
+            child = await store.create_session(
+                owner_id=123,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=f"terabox-account:/Folder{queue_index}",
+                title=f"Folder {queue_index} (part 1/1)",
+                mode="normal",
+                custom_filename=None,
+                files=[
+                    {
+                        "page_url": f"terabox-account:/Folder{queue_index}",
+                        "filename": f"{queue_index}.bin",
+                    }
+                ],
+                initial_state=(
+                    SESSION_RUNNING if queue_index == 1 else SESSION_PAUSED
+                ),
+                session_fields={
+                    "chain_id": chain_id,
+                    "part_index": 1,
+                    "total_parts": 1,
+                    "chain_queue_id": "finishqueue",
+                    "chain_queue_index": queue_index,
+                    "chain_queue_total": 2,
+                },
+            )
+            await store.create_chain(
+                chain_id=chain_id,
+                owner_id=123,
+                chat_id=-1001,
+                source_message_id=55,
+                source_url=f"terabox-account:/Folder{queue_index}",
+                name=f"Folder {queue_index}",
+                mode="normal",
+                total_parts=1,
+                total_files=1,
+                session_ids=[child["_id"]],
+                chain_fields={
+                    "chain_queue_id": "finishqueue",
+                    "chain_queue_index": queue_index,
+                    "chain_queue_total": 2,
+                },
+            )
+            children.append(child)
+
+        first_file = (await store.list_files(children[0]["_id"]))[0]
+        await store.update_file(
+            first_file["_id"],
+            FILE_UPLOADED,
+            telegram_files=[{"name": "1.bin", "link": "https://t.me/c/1/1"}],
+        )
+        events = []
+
+        async def record_index(*_args):
+            events.append("index")
+
+        def record_start(*_args):
+            events.append("start")
+
+        with (
+            patch.object(terabox, "terabox_session_store", store),
+            patch.object(
+                terabox,
+                "_send_terabox_chain_index",
+                AsyncMock(side_effect=record_index),
+            ),
+            patch.object(
+                terabox,
+                "_start_terabox_session",
+                side_effect=record_start,
+            ) as start,
+        ):
+            completed = await terabox._maybe_complete_terabox_session(
+                object(), SimpleNamespace(), children[0]["_id"]
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(["index", "start"], events)
+        self.assertEqual(
+            SESSION_RUNNING,
+            (await store.get_session(children[1]["_id"]))["state"],
+        )
+        start.assert_called_once()
+
     async def test_skip_session_completes_part_and_starts_next(self):
         store = TeraboxSessionStore(db_url="")
         common = {

@@ -1094,6 +1094,13 @@ def _terabox_plan_page(chain_doc, session_docs, requested_page=1, persistent=Tru
         f"<b>Page:</b> {page}/{total_pages}",
         "",
     ]
+    if chain_doc.get("chain_queue_id"):
+        lines.insert(
+            2,
+            f"<b>Chain queue:</b> <code>{chain_doc['chain_queue_id']}</code> "
+            f"({int(chain_doc.get('chain_queue_index') or 1)}/"
+            f"{int(chain_doc.get('chain_queue_total') or 1)})",
+        )
     for session_doc in visible:
         state = session_doc.get("state")
         state_text = {
@@ -1404,6 +1411,12 @@ async def _advance_terabox_chain(client, message, completed):
             await terabox_session_store.set_state(
                 last["_id"], SESSION_COMPLETED, index_sent=True
             )
+        queued_session = await terabox_session_store.activate_next_queued_chain(
+            chain_id
+        )
+        if queued_session is not None:
+            _start_terabox_session(client, message, queued_session["_id"])
+            return queued_session
     return None
 
 
@@ -1904,6 +1917,57 @@ def _batch_terabox_request_from_message(message):
     return None
 
 
+def _split_account_folder_paths(value):
+    """Split quoted or slash-delimited My Cloud paths without losing spaces."""
+    remaining = str(value or "").strip()
+    paths = []
+    while remaining:
+        if remaining[0] in {'"', "'"}:
+            quote = remaining[0]
+            closing = remaining.find(quote, 1)
+            if closing < 0:
+                raise TeraboxError("An account folder path has an unclosed quote")
+            raw_path = remaining[1:closing].strip()
+            remaining = remaining[closing + 1 :].strip()
+        else:
+            if not remaining.startswith("/"):
+                raise TeraboxError("Every account folder path must start with /")
+            boundary = re.search(r"\s+(?=/)", remaining)
+            if boundary is None:
+                raw_path = remaining
+                remaining = ""
+            else:
+                raw_path = remaining[: boundary.start()].strip()
+                remaining = remaining[boundary.end() :].strip()
+        paths.append(normalize_account_path(raw_path))
+    return paths
+
+
+def _local_terabox_request_from_message(message):
+    """Parse one or more account paths followed by a shared workspace limit."""
+    raw = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    command_and_args = raw.split(None, 1)
+    if len(command_and_args) != 2:
+        return None
+    match = re.search(
+        r"(?P<size>\d+(?:\.\d+)?\s*[KMGT](?:I)?B)\s*$",
+        command_and_args[1],
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    try:
+        max_bytes = parse_size_limit(match.group("size"))
+        folder_paths = _split_account_folder_paths(
+            command_and_args[1][: match.start()].strip()
+        )
+    except (TeraboxError, ValueError):
+        return None
+    if not folder_paths or len(folder_paths) > 25:
+        return None
+    return folder_paths, max_bytes
+
+
 async def _create_account_batch_sessions(
     client,
     message,
@@ -2048,18 +2112,25 @@ async def _create_account_local_sessions(
     folder_path,
     max_bytes,
     reply,
+    *,
+    account=None,
+    queue_fields=None,
+    start_immediately=True,
+    show_plan=True,
 ):
     """Persist direct, per-file sessions for one private-drive directory tree."""
-    cookie = await TERABOX_CONFIG.get_cookie()
-    if not cookie:
-        await reply.edit_text(
-            "TeraBox is not configured. Save a valid account cookie with "
-            "<code>/setteraboxcookie</code> first."
-        )
-        return []
+    queue_fields = dict(queue_fields or {})
+    if account is None:
+        cookie = await TERABOX_CONFIG.get_cookie()
+        if not cookie:
+            await reply.edit_text(
+                "TeraBox is not configured. Save a valid account cookie with "
+                "<code>/setteraboxcookie</code> first."
+            )
+            return []
+        account = TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
 
     try:
-        account = TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
         scan = await _scan_account_local_files(account, folder_path)
         files = scan["files"]
         violations = _intelligent_limit_violations(files, max_bytes)
@@ -2111,7 +2182,9 @@ async def _create_account_local_sessions(
                     custom_filename=None,
                     files=group,
                     initial_state=(
-                        SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+                        SESSION_RUNNING
+                        if start_immediately and part_index == 1
+                        else SESSION_PAUSED
                     ),
                     session_fields={
                         "provider": "terabox_account_local",
@@ -2126,6 +2199,7 @@ async def _create_account_local_sessions(
                         "source_file_count": len(group),
                         "planning_mode": "account_local_workspace",
                         "auto_continue": True,
+                        **queue_fields,
                     },
                 )
             )
@@ -2154,6 +2228,7 @@ async def _create_account_local_sessions(
                     1 for item in files if item["size_bytes"] > TELEGRAM_SPLIT_SIZE
                 ),
                 "auto_continue": True,
+                **queue_fields,
             },
         )
     except Exception as error:
@@ -2167,24 +2242,130 @@ async def _create_account_local_sessions(
         )
         return []
 
-    text, reply_markup = _terabox_plan_page(
-        chain_doc,
-        session_docs,
-        requested_page=1,
-        persistent=terabox_session_store.persistent,
+    if show_plan:
+        text, reply_markup = _terabox_plan_page(
+            chain_doc,
+            session_docs,
+            requested_page=1,
+            persistent=terabox_session_store.persistent,
+        )
+        await reply.edit_text(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    if start_immediately:
+        _start_terabox_session(
+            client,
+            message,
+            session_docs[0]["_id"],
+            resolved=(account, None),
+        )
+    return session_docs
+
+
+async def _create_account_local_chain_queue(
+    client,
+    message,
+    folder_paths,
+    max_bytes,
+    reply,
+):
+    """Create independent local-download chains and start only the first one."""
+    cookie = await TERABOX_CONFIG.get_cookie()
+    if not cookie:
+        await reply.edit_text(
+            "TeraBox is not configured. Save a valid account cookie with "
+            "<code>/setteraboxcookie</code> first."
+        )
+        return []
+
+    account = TeraboxAccountClient(session, cookie, TERABOX_BASE_URL)
+    queue_id = new_session_id()
+    queue_total = len(folder_paths)
+    created = []
+    for queue_index, folder_path in enumerate(folder_paths, 1):
+        queue_fields = {
+            "chain_queue_id": queue_id,
+            "chain_queue_index": queue_index,
+            "chain_queue_total": queue_total,
+        }
+        session_docs = await _create_account_local_sessions(
+            client,
+            message,
+            folder_path,
+            max_bytes,
+            reply,
+            account=account,
+            queue_fields=queue_fields,
+            start_immediately=False,
+            show_plan=False,
+        )
+        if not session_docs:
+            for item in created:
+                await terabox_session_store.delete_chain_tree(
+                    item["chain"]["_id"], message.from_user.id
+                )
+            await message.reply_text(
+                "The multi-folder queue was not started. Chains created for "
+                "earlier paths were rolled back."
+            )
+            return []
+        chain_doc = await terabox_session_store.get_chain(
+            session_docs[0]["chain_id"], owner_id=message.from_user.id
+        )
+        created.append(
+            {
+                "path": folder_path,
+                "chain": chain_doc,
+                "sessions": session_docs,
+            }
+        )
+
+    first_session = created[0]["sessions"][0]
+    first_session = await terabox_session_store.set_state(
+        first_session["_id"], SESSION_RUNNING
     )
-    await reply.edit_text(
-        text,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
+    lines = [
+        f"<b>TeraBox chain queue:</b> <code>{queue_id}</code>",
+        f"<b>Folders:</b> {queue_total} | <b>Workspace:</b> "
+        f"{_human_size(max_bytes)}",
+        "<b>Order:</b> automatic and sequential",
+        "",
+    ]
+    for queue_index, item in enumerate(created, 1):
+        chain_doc = item["chain"]
+        state = "running now" if queue_index == 1 else "queued"
+        line = (
+            f"<b>{queue_index}/{queue_total}.</b> "
+            f"{html.escape(str(chain_doc.get('name') or item['path']))} - "
+            f"{len(item['sessions'])} session(s), "
+            f"{int(chain_doc.get('total_files') or 0)} file(s) - "
+            f"<code>{chain_doc['_id']}</code> ({state})"
+        )
+        if len(("\n".join(lines + [line])).encode("utf-8")) > 3800:
+            lines.append(
+                f"...and {queue_total - queue_index + 1} more chain(s). "
+                "Use <code>/terasessions</code> to inspect them."
+            )
+            break
+        lines.append(line)
+    storage = "MongoDB" if terabox_session_store.persistent else "memory only"
+    lines.extend(
+        [
+            "",
+            "Every chain keeps its own final linked directory index.",
+            f"<b>Storage:</b> {storage}",
+        ]
     )
+    await reply.edit_text("\n".join(lines), disable_web_page_preview=True)
     _start_terabox_session(
         client,
         message,
-        session_docs[0]["_id"],
+        first_session["_id"],
         resolved=(account, None),
     )
-    return session_docs
+    return created
 
 
 @Client.on_callback_query(
@@ -2324,28 +2505,40 @@ async def local_download_terabox_cmd(client, message):
             "Only a configured chat administrator can access the TeraBox account."
         )
         return
-    request = _batch_terabox_request_from_message(message)
+    request = _local_terabox_request_from_message(message)
     if request is None:
         await message.reply_text(
             "Usage:\n"
-            "<code>/teralocaldl &lt;My Cloud folder path&gt; "
+            "<code>/teralocaldl &lt;folder path(s)&gt; "
             "&lt;available workspace&gt;</code>\n"
             "Example: <code>/teralocaldl /pass_harif2/[Appetite] 15GB</code>\n"
-            "Quote paths containing spaces. Files are downloaded individually; "
-            "TeraBox server ZIP is not used."
+            "Queue example: <code>/teralocaldl /home/[Whirlpool] "
+            "/[Syrup Many Milk] /home/[POISON] 16GB</code>\n"
+            "Each path becomes an independent sequential chain. Files are "
+            "downloaded individually; TeraBox server ZIP is not used."
         )
         return
-    folder_path, max_bytes = request
+    folder_paths, max_bytes = request
     reply = await message.reply_text(
-        "Scanning the authenticated TeraBox folder and planning direct-file sessions..."
+        "Scanning the authenticated TeraBox folder path(s) and planning "
+        "direct-file chains..."
     )
-    await _create_account_local_sessions(
-        client,
-        message,
-        folder_path,
-        max_bytes,
-        reply,
-    )
+    if len(folder_paths) == 1:
+        await _create_account_local_sessions(
+            client,
+            message,
+            folder_paths[0],
+            max_bytes,
+            reply,
+        )
+    else:
+        await _create_account_local_chain_queue(
+            client,
+            message,
+            folder_paths,
+            max_bytes,
+            reply,
+        )
 
 
 def _terabox_session_id_from_message(message):
@@ -2409,11 +2602,19 @@ def _chain_page_header(chain_doc, sessions, continued=False):
         1 for doc in sessions if doc.get("state") == SESSION_COMPLETED
     )
     suffix = " <i>(continued)</i>" if continued else ""
-    return [
+    lines = [
         f"📁 <b>{name}</b>{suffix}",
         f"Chain: <code>{chain_doc['_id']}</code>",
         f"Progress: {completed}/{len(sessions)} session(s) completed",
     ]
+    if chain_doc.get("chain_queue_id"):
+        lines.insert(
+            2,
+            f"Queue: <code>{chain_doc['chain_queue_id']}</code> · "
+            f"{int(chain_doc.get('chain_queue_index') or 1)}/"
+            f"{int(chain_doc.get('chain_queue_total') or 1)}",
+        )
+    return lines
 
 
 async def _terabox_chain_segments(chain_doc):
@@ -2553,10 +2754,18 @@ async def terabox_session_cmd(client, message):
             if state == SESSION_RUNNING
             else "skipped"
         )
+    queue_text = ""
+    if session_doc.get("chain_queue_id"):
+        queue_text = (
+            f"<b>Chain queue:</b> <code>{session_doc['chain_queue_id']}</code> "
+            f"({int(session_doc.get('chain_queue_index') or 1)}/"
+            f"{int(session_doc.get('chain_queue_total') or 1)})\n"
+        )
     await message.reply_text(
         f"<b>Name:</b> {html.escape(str(session_doc.get('name') or 'TeraBox'))}\n"
         f"<b>TeraBox session:</b> <code>{session_id}</code>\n"
         f"<b>Chain:</b> <code>{session_doc['chain_id']}</code>\n"
+        f"{queue_text}"
         f"<b>Part:</b> {session_doc['part_index']}/{session_doc['total_parts']}\n"
         f"<b>State:</b> {html.escape(state)}\n"
         f"<b>Downloaded:</b> "
@@ -2617,6 +2826,17 @@ async def continue_terabox_session_cmd(client, message):
     if blockers:
         await message.reply_text(
             f"Part {blockers[0]['part_index']} must complete before this part starts."
+        )
+        return
+    queue_blocker = await terabox_session_store.queued_chain_blocker(
+        session_doc["chain_id"]
+    )
+    if queue_blocker is not None:
+        await message.reply_text(
+            "An earlier chain in this folder queue must finish first: "
+            f"<b>{html.escape(str(queue_blocker.get('name') or 'TeraBox'))}</b> "
+            f"(<code>{queue_blocker['_id']}</code>, queue position "
+            f"{int(queue_blocker.get('chain_queue_index') or 1)})."
         )
         return
     running_task = terabox_session_tasks.get(session_id)
@@ -2868,7 +3088,7 @@ help_dict["terabox"] = (
 /splitfiletera <i>&lt;TeraBox URL&gt; &lt;size&gt;</i> - File mode
 /teraintelligent <i>&lt;TeraBox URL&gt; &lt;workspace&gt;</i> - Plan for source + split-part disk usage
 /batchdltera <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively batch-download an account folder (admins only)
-/teralocaldl <i>&lt;My Cloud path&gt; &lt;workspace&gt;</i> - Recursively download account files without server ZIP (admins only)
+/teralocaldl <i>&lt;path(s)&gt; &lt;workspace&gt;</i> - Direct account-file chains; multiple paths run as a persistent chain queue (admins only)
 /terasessions <i>[page]</i> - List persistent parent chains and child sessions
 /terasession <i>[session ID]</i> - Show one part or the latest active/recent part
 /continuetera <i>&lt;chain or session ID&gt;</i> - Resume the next unfinished part

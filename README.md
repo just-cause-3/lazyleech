@@ -208,6 +208,11 @@ limit includes temporary Telegram split parts, matching `/teraintelligent`.
 Only one source file downloads at a time; Telegram uploads remain independently
 queued. This command is restricted to configured chat administrators and does
 not create, move, rename, or delete anything in the TeraBox account.
+Multiple paths may be supplied before the shared workspace limit, for example
+`/teralocaldl /home/[Whirlpool] /[Syrup Many Milk] /home/[POISON] 16GB`.
+Each path becomes an independent persistent chain. Only the first chain starts;
+each later chain starts automatically after the preceding chain has completed
+and emitted its own linked directory index.
 
 The scan defaults to at most 100 file IDs per generated ZIP, 5,000 directories,
 and 100,000 source files; tune these safety limits with
