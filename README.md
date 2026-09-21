@@ -88,7 +88,7 @@ filetorrent <Torrent URL or File> or as reply to a Torrent URL or File - Sends v
 magnet <Magnet URL> or as reply to a Magnet URL
 zipmagnet <Magnet URL> or as reply to a Magnet URL
 filemagnet <Magnet URL> or as reply to a Magnet URL - Sends videos as files
-directdl <Direct URL> or as reply to a Direct URL | optional custom file name
+directdl <Direct URL> [Bunkr workspace] or as reply to a Direct URL | optional custom file name
 direct <Direct URL> or as reply to a Direct URL | optional custom file name
 zipdirectdl <Direct URL> or as reply to a Direct URL | optional custom file name
 zipdirect <Direct URL> or as reply to a Direct URL | optional custom file name
@@ -119,7 +119,7 @@ bsessions [page] - List your persistent Bunkr sessions with Previous/Next button
 bsession <session ID> - List downloaded and unfinished Bunkr file links
 pause <session ID> - Pause new/current Bunkr downloading; queued uploads continue
 skip <session ID> - Move the active Bunkr file to the bottom and start the next one
-continue <session ID> - Resume only unfinished files in a Bunkr session
+continue <session ID> [workspace] - Resume unfinished Bunkr files; optionally replace its workspace limit
 cancelsession <session ID> - Cancel Bunkr downloading and retain the session
 deletesession <session ID> - Delete one session history from the database
 deleteallsessions - Delete all of your session histories from the database
@@ -158,6 +158,16 @@ the throttled rate. A healthy completed download reduces the CDN's adaptive
 level. Tune this behavior with the `BUNKR_SLOW_*`, `BUNKR_CONNECTIONS`,
 `BUNKR_RECOVERY_CONNECTIONS`, `BUNKR_MAX_DOWNLOADS_PER_HOST`, and
 `BUNKR_MAX_HOST_COOLDOWN_SECONDS` environment variables.
+
+`/directdl BUNKR_URL 12GB` applies a persistent disk-workspace limit to a
+Bunkr album. The downloader probes each signed CDN file size and reserves its
+source-plus-Telegram-split peak. It may keep downloading while earlier uploads
+run only while the combined reservation fits; otherwise it waits until
+successful uploads delete their local files. The default is 10 GiB
+(`BUNKR_MAX_WORKSPACE_GB`), with 512 MiB kept free for Docker and temporary
+work (`BUNKR_WORKSPACE_RESERVE_MB`). If a single file cannot fit, the session
+stops safely and can be resumed with a larger value, for example
+`/continue SESSION_ID 16GB`.
 
 TeraBox downloads use the `TERABOX_COOKIE` (`ndus`) value to resolve a share
 through `TERABOX_BASE_URL`. The regional download hop receives that cookie,

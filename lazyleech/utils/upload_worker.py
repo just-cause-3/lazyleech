@@ -86,6 +86,16 @@ class UploadResult(list):
         self.complete = bool(complete)
 
 
+def _usable_thumbnail(path):
+    """Return a thumbnail path only when it contains actual image bytes."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return path if os.path.getsize(path) > 0 else None
+    except OSError:
+        return None
+
+
 def _truncate_utf8_filename(filename, max_bytes=250):
     """Shorten a filename without cutting a Unicode code point or extension."""
     if len(filename.encode("utf-8")) <= max_bytes:
@@ -214,24 +224,39 @@ async def cleanup_upload(
             upload_statuses.pop(message_identifier, None)
             remove_upload_status(message_identifier)
 
-    # Clean up the actual download directory completely
+    # Clean up the actual download directory completely. Do not acknowledge
+    # workspace release to session callbacks until deletion is verified.
     upload_complete = bool(getattr(sent_files, "complete", False))
     if upload_complete and not TESTMODE and torrent_info and "dir" in torrent_info:
+        dir_path = torrent_info["dir"]
+        cleanup_error = None
         try:
-            dir_path = torrent_info["dir"]
             if os.path.exists(dir_path):
-                shutil.rmtree(dir_path, ignore_errors=True)
-                logging.info(f"Successfully cleaned up download directory: {dir_path}")
-
-            # Try to clean up parent directory if empty
-            parent_dir = os.path.dirname(dir_path)
-            if os.path.exists(parent_dir) and not os.listdir(parent_dir):
-                os.rmdir(parent_dir)
-                logging.info(f"Cleaned up empty parent directory: {parent_dir}")
+                shutil.rmtree(dir_path)
+            if os.path.exists(dir_path):
+                raise OSError("download directory still exists after removal")
         except Exception as e:
-            logging.error(
-                f"Failed to completely clean up {torrent_info.get('dir')}: {e}"
-            )
+            if os.path.exists(dir_path):
+                cleanup_error = f"download cleanup failed for {dir_path}: {e}"
+                logging.exception(
+                    "Failed to completely clean up %s", torrent_info.get("dir")
+                )
+        if cleanup_error is None:
+            logging.info("Successfully cleaned up download directory: %s", dir_path)
+            # Parent pruning is optional; only the job directory controls
+            # whether the workspace reservation may be released.
+            parent_dir = os.path.dirname(dir_path)
+            try:
+                if os.path.exists(parent_dir) and not os.listdir(parent_dir):
+                    os.rmdir(parent_dir)
+                    logging.info("Cleaned up empty parent directory: %s", parent_dir)
+            except OSError:
+                logging.warning(
+                    "Could not prune empty parent directory: %s", parent_dir
+                )
+        else:
+            if upload_error is None:
+                upload_error = cleanup_error
 
     on_uploaded = (upload_options or {}).get("on_uploaded")
     if on_uploaded is not None:
@@ -513,7 +538,7 @@ async def _upload_file(
                     upload_waits.pop(upload_identifier, None)
                 thumbnail = None
                 for candidate in (user_thumbnail, user_watermarked_thumbnail):
-                    thumbnail = candidate if os.path.isfile(candidate) else thumbnail
+                    thumbnail = _usable_thumbnail(candidate) or thumbnail
                 sent_files.extend(
                     await _upload_split_parts(
                         client,
@@ -547,7 +572,7 @@ async def _upload_file(
                             return UploadResult(sent_files, complete=False)
                     thumbnail = None
                     for i in (user_thumbnail, user_watermarked_thumbnail):
-                        thumbnail = i if os.path.isfile(i) else thumbnail
+                        thumbnail = _usable_thumbnail(i) or thumbnail
                     mimetype = await get_file_mimetype(filepath)
                     progress_args = (
                         client,
@@ -592,6 +617,7 @@ async def _upload_file(
                                         break
                             else:
                                 width = height = 0
+                            thumbnail = _usable_thumbnail(thumbnail)
                             resp = await message.reply_video(
                                 filepath,
                                 thumb=thumbnail,
@@ -604,6 +630,7 @@ async def _upload_file(
                                 progress_args=progress_args,
                             )
                         else:
+                            thumbnail = _usable_thumbnail(thumbnail)
                             resp = await message.reply_document(
                                 filepath,
                                 thumb=thumbnail,
@@ -700,7 +727,7 @@ async def _upload_split_part(
         try:
             response = await message.reply_document(
                 filepath,
-                thumb=thumbnail,
+                thumb=_usable_thumbnail(thumbnail),
                 caption=filename,
                 parse_mode=None,
                 progress=progress_callback,

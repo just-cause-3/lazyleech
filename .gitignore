@@ -210,3 +210,7 @@ credentials.json
 aria2.session
 dht.dat
 dht6.dat
+
+
+promote_admin_exec.txt
+resend_terabox_index_exec.txt

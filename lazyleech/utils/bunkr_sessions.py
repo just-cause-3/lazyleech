@@ -1027,19 +1027,34 @@ class BunkrSessionStore:
 
     async def prepare_continue(self, session_id, chat_id, source_message_id):
         now = utcnow()
+        session_doc = await self.get_session(session_id)
+        resumable_states = list(UNFINISHED_FILE_STATES)
+        if session_doc and session_doc.get("workspace_managed"):
+            # A process restart loses the in-memory Telegram upload queue. A
+            # managed file which was downloaded but never acknowledged by its
+            # upload callback must be downloaded/queued again instead of
+            # permanently consuming workspace and blocking the session.
+            resumable_states.append(FILE_DOWNLOADED)
         if self.persistent:
             await self._ensure_indexes()
+            query = {
+                "session_id": session_id,
+                "status": {"$in": resumable_states},
+                "terminal_skip": {"$ne": True},
+            }
+            if FILE_DOWNLOADED in resumable_states:
+                query["$or"] = [
+                    {"status": {"$ne": FILE_DOWNLOADED}},
+                    {"upload_complete": False},
+                ]
             await self.files.update_many(
-                {
-                    "session_id": session_id,
-                    "status": {"$in": list(UNFINISHED_FILE_STATES)},
-                    "terminal_skip": {"$ne": True},
-                },
+                query,
                 {
                     "$set": {
                         "status": FILE_PENDING,
                         "gid": None,
                         "error": None,
+                        "upload_complete": False,
                         "updated_at": now,
                     }
                 },
@@ -1049,14 +1064,19 @@ class BunkrSessionStore:
                 for doc in self._memory_files.values():
                     if (
                         doc["session_id"] == session_id
-                        and doc["status"] in UNFINISHED_FILE_STATES
+                        and doc["status"] in resumable_states
                         and not doc.get("terminal_skip")
+                        and not (
+                            doc["status"] == FILE_DOWNLOADED
+                            and doc.get("upload_complete") is not False
+                        )
                     ):
                         doc.update(
                             {
                                 "status": FILE_PENDING,
                                 "gid": None,
                                 "error": None,
+                                "upload_complete": False,
                                 "updated_at": now,
                             }
                         )

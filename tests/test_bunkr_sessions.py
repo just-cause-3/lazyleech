@@ -72,6 +72,41 @@ class BunkrSessionStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(SESSION_RUNNING, session["state"])
         self.assertEqual(-1002, session["chat_id"])
 
+    async def test_managed_continue_requeues_unacknowledged_upload(self):
+        managed = await self.store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=56,
+            source_url="https://bunkr.example/a/managed",
+            title="managed",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.example/f/one", "one.mp4"),
+                ("https://bunkr.example/f/two", "two.mp4"),
+                ("https://bunkr.example/f/legacy", "legacy.mp4"),
+            ],
+            session_fields={
+                "workspace_managed": True,
+                "max_workspace_bytes": 10 * 1024**3,
+            },
+        )
+        files = await self.store.list_files(managed["_id"])
+        await self.store.update_file(
+            files[0]["_id"], FILE_DOWNLOADED, upload_complete=False
+        )
+        await self.store.update_file(
+            files[1]["_id"], FILE_DOWNLOADED, upload_complete=True
+        )
+        await self.store.update_file(files[2]["_id"], FILE_DOWNLOADED)
+
+        await self.store.prepare_continue(managed["_id"], -1002, 99)
+
+        files = await self.store.list_files(managed["_id"])
+        self.assertEqual(FILE_PENDING, files[0]["status"])
+        self.assertEqual(FILE_DOWNLOADED, files[1]["status"])
+        self.assertEqual(FILE_DOWNLOADED, files[2]["status"])
+
     async def test_cancel_and_delete_session(self):
         first = await self.store.claim_next_file(self.session["_id"])
         await self.store.update_file(first["_id"], FILE_DOWNLOADED)
@@ -370,6 +405,26 @@ class BunkrSessionCommandParsingTests(unittest.TestCase):
             leech._bunkr_cdn_host("https://CDN.Example:443/file?token=abc"),
         )
 
+    def test_workspace_size_parser_accepts_fractional_gibibytes(self):
+        self.assertEqual(
+            int(16.6 * 1024**3), leech._parse_workspace_size("16.6GB")
+        )
+        self.assertEqual(
+            ("https://bunkr.cr/a/album", 12 * 1024**3),
+            leech._trailing_workspace("https://bunkr.cr/a/album 12GB"),
+        )
+
+    def test_workspace_peak_includes_telegram_split_copy(self):
+        three_gib = 3 * 1024**3
+        self.assertEqual(
+            6 * 1024**3,
+            leech._bunkr_peak_workspace_bytes(three_gib, "normal"),
+        )
+        self.assertEqual(
+            9 * 1024**3,
+            leech._bunkr_peak_workspace_bytes(three_gib, "zip"),
+        )
+
     def test_split_bunkr_accepts_url_then_size(self):
         message = SimpleNamespace(
             command=["splitbunkr", "https://bunkr.cr/a/album", "20"],
@@ -403,6 +458,47 @@ class BunkrSessionCommandParsingTests(unittest.TestCase):
 
 
 class BunkrQueueCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_listqueue_shows_files_waiting_for_cdn_cooldown(self):
+        store = BunkrSessionStore(db_url="")
+        session_doc = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=1,
+            source_url="https://bunkr.cr/a/album",
+            title="cooldown album",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                ("https://bunkr.cr/f/one", "one.mp4"),
+                ("https://bunkr.cr/f/two", "two.mp4"),
+                ("https://bunkr.cr/f/three", "three.mp4"),
+            ],
+        )
+        files = await store.list_files(session_doc["_id"])
+        await store.update_file(files[0]["_id"], cdn_host="slow.cdn.test")
+        await store.update_file(files[1]["_id"], cdn_host="slow.cdn.test")
+        await store.update_file(files[2]["_id"], cdn_host="fast.cdn.test")
+        await store.set_host_cooldown(session_doc["_id"], "slow.cdn.test", 300)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            reply_text=AsyncMock(),
+        )
+
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        try:
+            await leech.listqueue_cmd(None, message)
+        finally:
+            leech.bunkr_session_store = original_store
+
+        text = "\n".join(call.args[0] for call in message.reply_text.await_args_list)
+        self.assertIn("CDN wait: 2", text)
+        self.assertIn("slow.cdn.test", text)
+        self.assertIn("one.mp4", text)
+        self.assertIn("two.mp4", text)
+        self.assertIn("Ready next", text)
+        self.assertIn("three.mp4", text)
+
     async def test_session_list_paginates_and_remains_owner_scoped(self):
         store = BunkrSessionStore(db_url="")
         for index in range(12):
@@ -632,6 +728,148 @@ class BunkrQueueCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BunkrSessionSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_managed_download_records_upload_cleanup_acknowledgement(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[("https://bunkr.example/f/one", "one.mp4")],
+            session_fields={
+                "workspace_managed": True,
+                "max_workspace_bytes": 10 * 1024**3,
+            },
+        )
+        file_doc = await store.claim_next_file(session["_id"])
+        message = SimpleNamespace(reply_text=AsyncMock())
+
+        class SentFiles(list):
+            complete = True
+
+        async def initiate(*_args, **kwargs):
+            await kwargs["on_downloaded"]()
+            await kwargs["on_uploaded"](
+                SentFiles([("one.mp4", "https://t.me/c/1/2")]), None
+            )
+            return "complete"
+
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        try:
+            with (
+                patch.object(
+                    leech,
+                    "resolve_bunkr_file",
+                    AsyncMock(
+                        return_value=(
+                            "https://cdn.example/one",
+                            "one.mp4",
+                            "https://bunkr.example/",
+                        )
+                    ),
+                ),
+                patch.object(
+                    leech, "_probe_bunkr_file_size", AsyncMock(return_value=1024)
+                ),
+                patch.object(
+                    leech, "_wait_for_bunkr_workspace", AsyncMock(return_value=True)
+                ),
+                patch.object(leech, "initiate_directdl", side_effect=initiate),
+            ):
+                await leech.process_bunkr_download(
+                    None, message, session, file_doc, ()
+                )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        stored = await store.get_file(file_doc["_id"])
+        self.assertTrue(stored["upload_complete"])
+        self.assertEqual(1024, stored["size_bytes"])
+        self.assertEqual(
+            "https://t.me/c/1/2", stored["telegram_files"][0]["link"]
+        )
+
+    async def test_workspace_waits_for_upload_cleanup_then_allows_download(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[("https://bunkr.example/f/one", "one.mp4")],
+            session_fields={
+                "workspace_managed": True,
+                "max_workspace_bytes": 10 * 1024**3,
+            },
+        )
+        file_doc = await store.claim_next_file(session["_id"])
+        blocked = {
+            "actual_used": 8 * 1024**3,
+            "occupied": 8 * 1024**3,
+            "outstanding": 1,
+            "required": 4 * 1024**3,
+            "projected": 12 * 1024**3,
+            "free_bytes": 20 * 1024**3,
+            "additional": 4 * 1024**3,
+        }
+        ready = {
+            **blocked,
+            "actual_used": 0,
+            "occupied": 0,
+            "outstanding": 0,
+            "projected": 4 * 1024**3,
+        }
+        original_store = leech.bunkr_session_store
+        leech.bunkr_session_store = store
+        try:
+            with (
+                patch.object(
+                    leech,
+                    "_bunkr_workspace_snapshot",
+                    AsyncMock(side_effect=[blocked, ready]),
+                ) as snapshot,
+                patch.object(leech.asyncio, "sleep", AsyncMock()) as sleep,
+            ):
+                allowed = await leech._wait_for_bunkr_workspace(
+                    SimpleNamespace(), session, file_doc, 4 * 1024**3
+                )
+        finally:
+            leech.bunkr_session_store = original_store
+
+        self.assertTrue(allowed)
+        self.assertEqual(2, snapshot.await_count)
+        sleep.assert_awaited_once()
+
+    async def test_workspace_rejects_single_file_over_limit(self):
+        store = BunkrSessionStore(db_url="")
+        session = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=55,
+            source_url="https://bunkr.example/a/album",
+            title="album",
+            mode="normal",
+            custom_filename=None,
+            files=[("https://bunkr.example/f/one", "one.mp4")],
+            session_fields={
+                "workspace_managed": True,
+                "max_workspace_bytes": 5 * 1024**3,
+            },
+        )
+        file_doc = await store.claim_next_file(session["_id"])
+
+        with self.assertRaises(leech.BunkrWorkspaceError):
+            await leech._wait_for_bunkr_workspace(
+                SimpleNamespace(), session, file_doc, 3 * 1024**3
+            )
+
     async def test_automatic_defer_cools_when_no_alternate_host_exists(self):
         store = BunkrSessionStore(db_url="")
         session = await store.create_session(

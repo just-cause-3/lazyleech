@@ -19,6 +19,7 @@ import html
 import itertools
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections import deque
@@ -73,6 +74,7 @@ from ..utils.bunkr_sessions import (
     SESSION_RUNNING,
     bunkr_session_store,
 )
+from ..utils.file_split import TELEGRAM_SPLIT_SIZE
 from ..utils.misc import (
     allow_admin_cancel,
     calculate_eta,
@@ -121,6 +123,13 @@ def _positive_int_env(name, default, maximum=None):
     return min(value, maximum) if maximum else value
 
 
+def _nonnegative_float_env(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 BUNKR_SLOW_SPEED_KBPS = _nonnegative_int_env("BUNKR_SLOW_SPEED_KBPS", 650)
 BUNKR_SLOW_GRACE_SECONDS = _nonnegative_int_env(
     "BUNKR_SLOW_GRACE_SECONDS", 30
@@ -148,6 +157,15 @@ BUNKR_SLOW_HOST_COOLDOWN_SECONDS = _positive_int_env(
 BUNKR_MAX_HOST_COOLDOWN_SECONDS = _positive_int_env(
     "BUNKR_MAX_HOST_COOLDOWN_SECONDS", 1200, maximum=21600
 )
+BUNKR_DEFAULT_WORKSPACE_BYTES = int(
+    _nonnegative_float_env("BUNKR_MAX_WORKSPACE_GB", 10) * 1024**3
+)
+BUNKR_WORKSPACE_RESERVE_BYTES = (
+    _nonnegative_int_env("BUNKR_WORKSPACE_RESERVE_MB", 512) * 1024**2
+)
+BUNKR_WORKSPACE_POLL_SECONDS = _positive_int_env(
+    "BUNKR_WORKSPACE_POLL_SECONDS", 3, maximum=60
+)
 BUNKR_COOLDOWN_POLL_SECONDS = 15
 BUNKR_SIGNED_URL_REFRESH_SECONDS = 60
 BUNKR_SESSIONS_PAGE_SIZE = 10
@@ -163,6 +181,75 @@ BUNKR_VIDEO_EXTENSIONS = (
     ".m4a",
     ".ts",
 )
+
+_WORKSPACE_SIZE_RE = re.compile(
+    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT](?:I)?B)",
+    re.IGNORECASE,
+)
+
+
+class BunkrWorkspaceError(Exception):
+    """The next Bunkr file cannot safely fit in the configured workspace."""
+
+
+def _parse_workspace_size(value):
+    match = _WORKSPACE_SIZE_RE.fullmatch(str(value or "").strip())
+    if match is None:
+        raise ValueError("Invalid workspace size")
+    factors = {
+        "KB": 1024,
+        "KIB": 1024,
+        "MB": 1024**2,
+        "MIB": 1024**2,
+        "GB": 1024**3,
+        "GIB": 1024**3,
+        "TB": 1024**4,
+        "TIB": 1024**4,
+    }
+    size = int(float(match.group("value")) * factors[match.group("unit").upper()])
+    if size <= 0:
+        raise ValueError("Workspace size must be greater than zero")
+    return size
+
+
+def _trailing_workspace(value):
+    """Return ``(text_without_limit, bytes_or_none)`` for a trailing size."""
+    raw = str(value or "").strip()
+    match = re.search(
+        r"(?:^|\s)(\d+(?:\.\d+)?\s*[KMGT](?:I)?B)\s*$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return raw, None
+    return raw[: match.start()].strip(), _parse_workspace_size(match.group(1))
+
+
+def _bunkr_peak_workspace_bytes(size_bytes, mode="normal"):
+    """Peak source/preparation space needed before Telegram accepts a file."""
+    size = max(0, int(size_bytes or 0))
+    if mode == "zip":
+        # Source + generated ZIP, plus numbered ZIP parts above Telegram's cap.
+        return size * (3 if size > TELEGRAM_SPLIT_SIZE else 2)
+    return size * (2 if size > TELEGRAM_SPLIT_SIZE else 1)
+
+
+def _directory_size(path):
+    total = 0
+    if not os.path.isdir(path):
+        return total
+    for root, directories, files in os.walk(path):
+        directories[:] = [
+            name for name in directories if not os.path.islink(os.path.join(root, name))
+        ]
+        for name in files:
+            filepath = os.path.join(root, name)
+            try:
+                if not os.path.islink(filepath):
+                    total += os.path.getsize(filepath)
+            except OSError:
+                continue
+    return total
 
 
 def _bunkr_cdn_host(download_url):
@@ -192,6 +279,148 @@ def _bunkr_download_dir(owner_id, session_id, file_id):
     return os.path.join(
         os.getcwd(), str(int(owner_id)), "bunkr_sessions", session_id, position
     )
+
+
+def _bunkr_session_workspace_dir(session_doc):
+    return os.path.join(
+        os.getcwd(),
+        str(int(session_doc["owner_id"])),
+        "bunkr_sessions",
+        str(session_doc["_id"]),
+    )
+
+
+async def _probe_bunkr_file_size(download_url, referer):
+    """Read a signed CDN object's size without downloading its payload."""
+    headers = {"Referer": referer, "Range": "bytes=0-0"}
+    try:
+        async with session.get(
+            download_url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=20,
+        ) as response:
+            content_range = str(response.headers.get("Content-Range") or "")
+            range_match = re.search(r"/(\d+)\s*$", content_range)
+            if range_match:
+                return max(0, int(range_match.group(1)))
+            content_length = response.headers.get("Content-Length")
+            if response.status == 200 and content_length:
+                return max(0, int(content_length))
+    except Exception:
+        return 0
+    return 0
+
+
+async def _bunkr_workspace_snapshot(session_doc, current_file, expected_size):
+    """Return predicted and physical space for one managed Bunkr session."""
+    files = await bunkr_session_store.list_files(session_doc["_id"])
+    reserved = 0
+    outstanding = 0
+    for file_doc in files:
+        if file_doc["_id"] == current_file["_id"]:
+            continue
+        if (
+            file_doc.get("status") == FILE_DOWNLOADED
+            and file_doc.get("upload_complete") is False
+        ):
+            outstanding += 1
+            reserved += _bunkr_peak_workspace_bytes(
+                file_doc.get("size_bytes"), session_doc.get("mode")
+            )
+
+    workspace_dir = _bunkr_session_workspace_dir(session_doc)
+    current_dir = _bunkr_download_dir(
+        session_doc["owner_id"], session_doc["_id"], current_file["_id"]
+    )
+    actual_used, current_used = await asyncio.gather(
+        asyncio.to_thread(_directory_size, workspace_dir),
+        asyncio.to_thread(_directory_size, current_dir),
+    )
+    occupied = max(max(0, actual_used - current_used), reserved)
+    required = _bunkr_peak_workspace_bytes(
+        expected_size, session_doc.get("mode")
+    )
+    projected = occupied + required
+    disk_anchor = workspace_dir if os.path.exists(workspace_dir) else os.getcwd()
+    free_bytes = (await asyncio.to_thread(shutil.disk_usage, disk_anchor)).free
+    additional = max(0, projected - actual_used)
+    return {
+        "actual_used": actual_used,
+        "occupied": occupied,
+        "outstanding": outstanding,
+        "required": required,
+        "projected": projected,
+        "free_bytes": free_bytes,
+        "additional": additional,
+    }
+
+
+async def _wait_for_bunkr_workspace(
+    message, session_doc, file_doc, expected_size
+):
+    """Wait until queued uploads release enough reserved and physical space."""
+    limit = max(0, int(session_doc.get("max_workspace_bytes") or 0))
+    if not limit:
+        return True
+    required = _bunkr_peak_workspace_bytes(
+        expected_size, session_doc.get("mode")
+    )
+    if expected_size and required > limit:
+        raise BunkrWorkspaceError(
+            f"{file_doc['filename']} needs about {format_bytes(required)} of "
+            f"workspace, above this session's {format_bytes(limit)} limit. "
+            f"Resume with /continue {session_doc['_id']} "
+            f"{max(1, required // 1024**3 + 1)}GB"
+        )
+
+    while True:
+        latest_session, latest_file = await asyncio.gather(
+            bunkr_session_store.get_session(session_doc["_id"]),
+            bunkr_session_store.get_file(file_doc["_id"]),
+        )
+        if not latest_session or latest_session.get("state") != SESSION_RUNNING:
+            return False
+        if not latest_file or latest_file.get("status") != FILE_RESOLVING:
+            return False
+
+        snapshot = await _bunkr_workspace_snapshot(
+            latest_session, latest_file, expected_size
+        )
+        if not expected_size and snapshot["outstanding"]:
+            # If the CDN did not disclose a size, never overlap it with a
+            # queued source whose uploader may still need split-copy space.
+            await asyncio.sleep(BUNKR_WORKSPACE_POLL_SECONDS)
+            continue
+        logical_fit = not expected_size or snapshot["projected"] <= limit
+        physical_fit = (
+            snapshot["free_bytes"]
+            >= snapshot["additional"] + BUNKR_WORKSPACE_RESERVE_BYTES
+        )
+        if logical_fit and physical_fit:
+            return True
+
+        # With no queued upload left to release space, waiting cannot improve
+        # the situation. Stop safely so the user can clear disk or raise the
+        # limit and resume the same persistent session.
+        if snapshot["outstanding"] == 0:
+            if not logical_fit:
+                detail = (
+                    f"existing Bunkr data plus this file would peak at "
+                    f"{format_bytes(snapshot['projected'])}, above the "
+                    f"{format_bytes(limit)} session limit"
+                )
+            else:
+                needed = snapshot["additional"] + BUNKR_WORKSPACE_RESERVE_BYTES
+                detail = (
+                    f"the filesystem has {format_bytes(snapshot['free_bytes'])} "
+                    f"free but needs about {format_bytes(needed)}"
+                )
+            raise BunkrWorkspaceError(
+                f"Cannot start {file_doc['filename']}: {detail}. Clear abandoned "
+                "downloads or increase the workspace limit, then resume."
+            )
+        await asyncio.sleep(BUNKR_WORKSPACE_POLL_SECONDS)
 
 
 async def _extract_bunkr_video_files(link, filename=None):
@@ -544,6 +773,7 @@ async def directdl_cmd(client, message):
     else:
         flags = ()
     link = filename = None
+    workspace_bytes = None
     reply = message.reply_to_message
     if text:
         link = text[0].strip()
@@ -552,6 +782,7 @@ async def directdl_cmd(client, message):
     if not link:
         await message.reply_text("""Usage:
 - /directdl <i>&lt;Direct URL&gt; | optional custom file name</i>
+- /directdl <i>&lt;Bunkr URL&gt; [workspace, e.g. 12GB]</i>
 - /directdl <i>(as reply to a Direct URL) | optional custom file name</i>
 - /direct <i>&lt;Direct URL&gt; | optional custom file name</i>
 - /direct <i>(as reply to a Direct URL) | optional custom file name</i>
@@ -564,17 +795,48 @@ async def directdl_cmd(client, message):
 - /filedirectdl <i>&lt;Direct URL&gt; | optional custom file name</i> - Sends videos as files
 - /filedirectdl <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files
 - /filedirect <i>&lt;Direct URL&gt; | optional custom file name</i> - Sends videos as files
-- /filedirect <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files""")
+- /filedirect <i>(as reply to a Direct URL) | optional custom file name</i> - Sends videos as files
+
+Bunkr albums default to a managed 10 GiB workspace. Override it by appending a size.""")
         return
+    # A replied Bunkr link may use only `/directdl 10GB` as its arguments.
+    reply_link = None if getattr(reply, "empty", True) else getattr(reply, "text", None)
+    without_workspace, parsed_workspace = _trailing_workspace(link)
+    if not without_workspace and parsed_workspace and reply_link:
+        link = reply_link.strip()
+        workspace_bytes = parsed_workspace
+
     split = link.split("|", 1)
     if len(split) > 1:
         filename = os.path.basename(split[1].strip())
         link = split[0].strip()
 
-    await process_link(client, message, link, filename, flags)
+    candidate_link, candidate_workspace = _trailing_workspace(link)
+    if candidate_workspace is not None and is_bunkr_url(candidate_link):
+        link = candidate_link
+        workspace_bytes = candidate_workspace
+    if is_bunkr_url(link) and workspace_bytes is None:
+        workspace_bytes = BUNKR_DEFAULT_WORKSPACE_BYTES
+
+    await process_link(
+        client,
+        message,
+        link,
+        filename,
+        flags,
+        workspace_bytes=workspace_bytes,
+    )
 
 
-async def process_link(client, message, link, filename, flags, reply_msg=None):
+async def process_link(
+    client,
+    message,
+    link,
+    filename,
+    flags,
+    reply_msg=None,
+    workspace_bytes=None,
+):
     parsed = list(urlparse(link, "https"))
     if parsed[0] == "magnet":
         if not reply_msg:
@@ -618,6 +880,14 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
                 mode=_bunkr_mode_from_flags(flags),
                 custom_filename=filename,
                 files=files,
+                session_fields=(
+                    {
+                        "workspace_managed": True,
+                        "max_workspace_bytes": int(workspace_bytes),
+                    }
+                    if workspace_bytes
+                    else None
+                ),
             )
             session_id = session_doc["_id"]
             persistence_note = (
@@ -629,7 +899,13 @@ async def process_link(client, message, link, filename, flags, reply_msg=None):
             session_text = (
                 f"<b>Bunkr session:</b> <code>{session_id}</code>\n"
                 f"Found <b>{len(files)}</b> video file(s). Downloading sequentially.\n\n"
-                f"Pause: <code>/pause {session_id}</code>\n"
+                + (
+                    f"<b>Workspace:</b> {format_bytes(workspace_bytes)} "
+                    "(downloads wait for upload cleanup)\n\n"
+                    if workspace_bytes
+                    else ""
+                )
+                + f"Pause: <code>/pause {session_id}</code>\n"
                 f"Continue: <code>/continue {session_id}</code>\n"
                 f"Details: <code>/bsession {session_id}</code>"
                 f"{persistence_note}"
@@ -705,6 +981,19 @@ async def _run_bunkr_session(client, message, session_id):
                 # uploads continue, and periodically re-check the circuit breakers.
                 await asyncio.sleep(BUNKR_COOLDOWN_POLL_SECONDS)
                 continue
+            if session_doc.get("workspace_managed"):
+                files = await bunkr_session_store.list_files(session_id)
+                outstanding_uploads = [
+                    item
+                    for item in files
+                    if item.get("status") == FILE_DOWNLOADED
+                    and item.get("upload_complete") is False
+                ]
+                if outstanding_uploads:
+                    # Upload callbacks mark each file complete only after the
+                    # worker has deleted its local source directory.
+                    await asyncio.sleep(BUNKR_WORKSPACE_POLL_SECONDS)
+                    continue
             final_state = (
                 SESSION_COMPLETED
                 if counts[FILE_DOWNLOADED] == session_doc["total_files"]
@@ -759,7 +1048,13 @@ async def _bunkr_session_chunks(session_doc, include_files=True):
         f"<b>Downloaded:</b> {downloaded_count}/{session_doc['total_files']} | "
         f"<b>Not downloaded:</b> {not_downloaded_count}\n"
         f"<b>Storage:</b> {persistence}\n"
-        f"{cooling_line}"
+        + (
+            f"<b>Workspace:</b> "
+            f"{format_bytes(session_doc.get('max_workspace_bytes'))}\n"
+            if session_doc.get("workspace_managed")
+            else ""
+        )
+        + f"{cooling_line}"
         f"{source_line}\n"
     )
     if not include_files:
@@ -822,6 +1117,79 @@ async def _send_bunkr_session_summary(message, session_doc, include_files=True):
         await message.reply_text(chunk, disable_web_page_preview=True)
 
 
+def _bunkr_queue_file_preview(files, limit=5):
+    ordered = sorted(files, key=lambda item: item.get("position", 0))
+    names = [
+        f"<code>{html.escape(str(item.get('filename') or 'Unnamed'))}</code>"
+        for item in ordered[:limit]
+    ]
+    if len(ordered) > limit:
+        names.append(f"<i>… and {len(ordered) - limit} more</i>")
+    return ", ".join(names)
+
+
+async def _bunkr_queue_session_entry(session_doc):
+    files, cooled_hosts = await asyncio.gather(
+        bunkr_session_store.list_files(session_doc["_id"]),
+        _active_bunkr_cooldowns(session_doc["_id"]),
+    )
+    pending = [item for item in files if item.get("status") == FILE_PENDING]
+    active = [
+        item
+        for item in files
+        if item.get("status") in (FILE_RESOLVING, FILE_DOWNLOADING)
+    ]
+    upload_wait = [
+        item
+        for item in files
+        if item.get("status") == FILE_DOWNLOADED
+        and item.get("upload_complete") is False
+    ]
+    cdn_wait = [
+        item
+        for item in pending
+        if str(item.get("cdn_host") or "").lower() in cooled_hosts
+    ]
+    ready = [item for item in pending if item not in cdn_wait]
+    counts = await bunkr_session_store.counts(session_doc["_id"])
+    title = html.escape(str(session_doc.get("title") or "Bunkr"))
+    lines = [
+        f"<b>{title}</b>",
+        f"• <code>{session_doc['_id']}</code> — "
+        f"{html.escape(session_doc['state'])} — "
+        f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded",
+        f"• Active: {len(active)} | Ready: {len(ready)} | "
+        f"CDN wait: {len(cdn_wait)} | Upload cleanup: {len(upload_wait)}",
+    ]
+    if active:
+        lines.append(f"▶️ Active: {_bunkr_queue_file_preview(active, 1)}")
+    if ready:
+        lines.append(f"⏭ Ready next: {_bunkr_queue_file_preview(ready, 2)}")
+    if cdn_wait:
+        by_host = {}
+        for item in cdn_wait:
+            host = str(item.get("cdn_host") or "unknown").lower()
+            by_host.setdefault(host, []).append(item)
+        host_groups = sorted(by_host.items())
+        for host, host_files in host_groups[:3]:
+            lines.append(
+                f"⏳ CDN <code>{html.escape(host)}</code> ({len(host_files)}): "
+                f"{_bunkr_queue_file_preview(host_files, 2)}"
+            )
+        if len(host_groups) > 3:
+            hidden_files = sum(len(items) for _, items in host_groups[3:])
+            lines.append(
+                f"⏳ <i>{len(host_groups) - 3} more cooling CDN(s), "
+                f"{hidden_files} file(s)</i>"
+            )
+    if upload_wait:
+        lines.append(
+            "⬆️ Waiting for upload/delete: "
+            f"{_bunkr_queue_file_preview(upload_wait, 2)}"
+        )
+    return "\n".join(lines)
+
+
 @Client.on_message(filters.command("listqueue") & filters.chat(ALL_CHATS))
 async def listqueue_cmd(client, message):
     sessions = await bunkr_session_store.list_sessions(
@@ -832,18 +1200,23 @@ async def listqueue_cmd(client, message):
         await message.reply_text("The download queue is currently empty.")
         return
 
-    text = "<b>Current Bunkr sessions:</b>\n\n"
+    entries = []
     for session_doc in sessions:
-        counts = await bunkr_session_store.counts(session_doc["_id"])
-        title = html.escape(str(session_doc.get("title") or "Bunkr"))
-        text += (
-            f"<b>{title}</b>\n"
-            f"• <code>{session_doc['_id']}</code> — "
-            f"{html.escape(session_doc['state'])} — "
-            f"{counts[FILE_DOWNLOADED]}/{session_doc['total_files']} downloaded\n"
-        )
+        entries.append(await _bunkr_queue_session_entry(session_doc))
 
-    await message.reply_text(text, disable_web_page_preview=True)
+    header = "<b>Current Bunkr sessions:</b>\n\n"
+    chunks = []
+    current = header
+    for entry in entries:
+        block = entry + "\n\n"
+        if len(current) + len(block) > 3900 and current != header:
+            chunks.append(current.rstrip())
+            current = "<b>Current Bunkr sessions (continued):</b>\n\n"
+        current += block
+    if current.strip():
+        chunks.append(current.rstrip())
+    for chunk in chunks:
+        await message.reply_text(chunk, disable_web_page_preview=True)
 
 
 def _bunkr_session_id_from_message(message):
@@ -855,6 +1228,15 @@ def _bunkr_session_id_from_message(message):
         if match:
             return match.group(1).lower()
     return None
+
+
+def _continue_workspace_from_message(message):
+    if len(message.command) < 3:
+        return None
+    try:
+        return _parse_workspace_size("".join(message.command[2:]))
+    except ValueError:
+        return None
 
 
 async def _owned_bunkr_session(message, default_states=None):
@@ -1145,6 +1527,15 @@ async def continue_bunkr_session_cmd(client, message):
         await message.reply_text("That Bunkr session is already complete.")
         return
 
+    new_workspace = _continue_workspace_from_message(message)
+    if new_workspace is not None:
+        session_doc = await bunkr_session_store.set_state(
+            session_doc["_id"],
+            session_doc["state"],
+            workspace_managed=True,
+            max_workspace_bytes=new_workspace,
+        )
+
     task = bunkr_session_tasks.get(session_doc["_id"])
     if task and not task.done():
         await bunkr_session_store.set_state(
@@ -1174,6 +1565,11 @@ async def continue_bunkr_session_cmd(client, message):
     await message.reply_text(
         f"Continuing Bunkr session <code>{session_doc['_id']}</code> from its "
         "first unfinished link."
+        + (
+            f" Workspace limit: {format_bytes(new_workspace)}."
+            if new_workspace is not None
+            else ""
+        )
     )
 
 
@@ -1567,6 +1963,30 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             if routed is not None:
                 return "deferred"
 
+        workspace_managed = bool(
+            session_doc.get("workspace_managed")
+            and int(session_doc.get("max_workspace_bytes") or 0) > 0
+        )
+        expected_size = 0
+        if workspace_managed:
+            expected_size = await _probe_bunkr_file_size(direct_url, referer)
+            if expected_size:
+                await bunkr_session_store.update_file(
+                    file_id, size_bytes=expected_size
+                )
+            workspace_ready = await _wait_for_bunkr_workspace(
+                message, session_doc, latest_file, expected_size
+            )
+            if not workspace_ready:
+                latest_session = await bunkr_session_store.get_session(
+                    session_doc["_id"]
+                )
+                if latest_session and latest_session["state"] == SESSION_PAUSED:
+                    await bunkr_session_store.update_file_if_status(
+                        file_id, FILE_RESOLVING, FILE_PENDING, gid=None
+                    )
+                return "deferred"
+
         async def on_gid(gid):
             nonlocal slow_monitor
             updated = await bunkr_session_store.update_file_if_status(
@@ -1594,11 +2014,75 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             return True
 
         async def on_downloaded():
+            download_fields = {
+                "gid": None,
+                "error": None,
+                "size_bytes": expected_size
+                or latest_file.get("size_bytes")
+                or 0,
+            }
+            if workspace_managed:
+                download_fields["upload_complete"] = False
             await bunkr_session_store.update_file(
-                file_id, FILE_DOWNLOADED, gid=None, error=None
+                file_id,
+                FILE_DOWNLOADED,
+                **download_fields,
             )
             if cdn_host and (slow_monitor is None or slow_monitor.completed_healthy()):
                 await bunkr_session_store.record_cdn_success(cdn_host)
+
+        async def on_uploaded(sent_files, upload_error):
+            if not workspace_managed:
+                return
+            upload_complete = bool(getattr(sent_files, "complete", False))
+            if upload_complete and not upload_error:
+                telegram_files = [
+                    {"name": str(name), "link": str(link)}
+                    for name, link in sent_files
+                    if link
+                ]
+                await bunkr_session_store.update_file_if_status(
+                    file_id,
+                    FILE_DOWNLOADED,
+                    FILE_DOWNLOADED,
+                    gid=None,
+                    error=None,
+                    upload_complete=True,
+                    telegram_files=telegram_files,
+                )
+                return
+
+            reason = upload_error or "Telegram upload did not complete"
+            await bunkr_session_store.update_file_if_status(
+                file_id,
+                FILE_DOWNLOADED,
+                FILE_FAILED,
+                gid=None,
+                error=str(reason),
+                upload_complete=False,
+            )
+            await bunkr_session_store.set_state(
+                session_doc["_id"], SESSION_FAILED
+            )
+            for active in await bunkr_session_store.active_files(
+                session_doc["_id"]
+            ):
+                await bunkr_session_store.update_file_if_status(
+                    active["_id"],
+                    (FILE_RESOLVING, FILE_DOWNLOADING),
+                    FILE_PENDING,
+                    gid=None,
+                    error="Waiting for failed upload to be retried",
+                )
+                if active.get("gid"):
+                    await _remove_bunkr_download(active["gid"], cleanup=False)
+            await message.reply_text(
+                f"Bunkr session <code>{session_doc['_id']}</code> stopped because "
+                f"<code>{html.escape(str(file_doc['filename']))}</code> did not "
+                "upload completely. Its local source was retained. Clear space if "
+                "needed and resume with "
+                f"<code>/continue {session_doc['_id']}</code>."
+            )
 
         async def on_removed():
             latest = await bunkr_session_store.get_file(file_id)
@@ -1706,6 +2190,8 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
                 max_connections=max_connections,
                 download_dir=download_dir,
                 resume=True,
+                on_uploaded=on_uploaded if workspace_managed else None,
+                suppress_upload_summary=workspace_managed,
             )
         if result == "complete":
             await bunkr_session_store.update_file(
@@ -1754,6 +2240,10 @@ async def process_bunkr_download(client, message, session_doc, file_doc, flags):
             f"Failed to download {html.escape(str(file_doc['filename']))}: "
             f"{html.escape(str(e))}"
         )
+        if isinstance(e, BunkrWorkspaceError):
+            await bunkr_session_store.set_state(
+                session_doc["_id"], SESSION_FAILED
+            )
 
 
 async def initiate_directdl(
@@ -2390,6 +2880,7 @@ help_dict["leech"] = (
 
 /directdl <i>&lt;Direct URL&gt; | optional custom file name</i>
 /directdl <i>(as reply to a Direct URL) | optional custom file name</i>
+/directdl <i>&lt;Bunkr URL&gt; [workspace, e.g. 12GB]</i>
 /direct <i>&lt;Direct URL&gt; | optional custom file name</i>
 /direct <i>(as reply to a Direct URL) | optional custom file name</i>
 
@@ -2412,7 +2903,7 @@ help_dict["leech"] = (
 /bsession <i>&lt;session ID&gt;</i> - Lists downloaded and unfinished file links
 /pause <i>&lt;session ID&gt;</i> - Pauses Bunkr downloading; queued uploads continue
 /skip <i>&lt;session ID&gt;</i> - Moves the active Bunkr file to the queue bottom
-/continue <i>&lt;session ID&gt;</i> - Resumes unfinished Bunkr files
+/continue <i>&lt;session ID&gt; [workspace]</i> - Resumes unfinished Bunkr files
 /cancelsession <i>&lt;session ID&gt;</i> - Cancels downloading but retains the session
 /deletesession <i>&lt;session ID&gt;</i> - Deletes session history from the database
 /deleteallsessions - Deletes all of your session histories from the database

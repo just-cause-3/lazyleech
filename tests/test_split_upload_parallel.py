@@ -8,6 +8,20 @@ from unittest.mock import AsyncMock, patch
 from lazyleech.utils import upload_worker
 
 
+class ThumbnailValidationTests(unittest.TestCase):
+    def test_zero_byte_thumbnail_is_not_sent_to_telegram(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            thumbnail = Path(tempdir) / "thumbnail.jpg"
+            thumbnail.touch()
+
+            self.assertIsNone(upload_worker._usable_thumbnail(str(thumbnail)))
+
+            thumbnail.write_bytes(b"valid-image-placeholder")
+            self.assertEqual(
+                str(thumbnail), upload_worker._usable_thumbnail(str(thumbnail))
+            )
+
+
 class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_parts_are_started_together_but_results_are_numerically_ordered(self):
         both_started = asyncio.Event()
@@ -114,6 +128,74 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             remove_tree.assert_not_called()
+            self.assertTrue(download_root.exists())
+
+    async def test_success_callback_runs_only_after_download_directory_is_deleted(self):
+        reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            download_root = Path(workdir) / "download-root"
+            download_root.mkdir()
+            (download_root / "uploaded.bin").write_bytes(b"uploaded")
+            task = asyncio.create_task(
+                self._return_result(
+                    upload_worker.UploadResult(
+                        [("uploaded.bin", "https://t.me/c/1/2")], complete=True
+                    )
+                )
+            )
+            callback = AsyncMock()
+
+            async def verify_cleanup(_sent_files, error):
+                self.assertIsNone(error)
+                self.assertFalse(download_root.exists())
+
+            callback.side_effect = verify_cleanup
+            with patch.object(upload_worker, "TESTMODE", False):
+                await upload_worker.cleanup_upload(
+                    task,
+                    (-1001, 55),
+                    {"dir": str(download_root)},
+                    reply,
+                    123,
+                    {"on_uploaded": callback},
+                )
+
+            callback.assert_awaited_once()
+            self.assertFalse(download_root.exists())
+
+    async def test_cleanup_failure_is_reported_to_completion_callback(self):
+        reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            download_root = Path(workdir) / "download-root"
+            download_root.mkdir()
+            task = asyncio.create_task(
+                self._return_result(
+                    upload_worker.UploadResult(
+                        [("uploaded.bin", "https://t.me/c/1/2")], complete=True
+                    )
+                )
+            )
+            callback = AsyncMock()
+
+            with (
+                patch.object(upload_worker, "TESTMODE", False),
+                patch.object(
+                    upload_worker.shutil,
+                    "rmtree",
+                    side_effect=OSError("busy"),
+                ),
+            ):
+                await upload_worker.cleanup_upload(
+                    task,
+                    (-1001, 55),
+                    {"dir": str(download_root)},
+                    reply,
+                    123,
+                    {"on_uploaded": callback},
+                )
+
+            callback.assert_awaited_once()
+            self.assertIn("download cleanup failed", callback.await_args.args[1])
             self.assertTrue(download_root.exists())
 
     async def test_split_source_is_removed_before_parts_start_uploading(self):
