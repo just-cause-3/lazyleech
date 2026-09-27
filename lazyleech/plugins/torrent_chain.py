@@ -47,6 +47,11 @@ from .leech import _new_download_reference, _parse_workspace_size, handle_leech
 
 
 TORRENT_FILE_MAX_BYTES = 4 * 1024**2
+TORRENT_FETCH_CHUNK_BYTES = 256 * 1024
+TORRENT_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
 try:
     _workspace_reserve_mb = max(
         0, int(os.environ.get("TORRENT_WORKSPACE_RESERVE_MB", "512"))
@@ -205,15 +210,141 @@ async def _download_torrent_bytes(message_with_document):
     return bytes(data)
 
 
+def _validate_torrent_payload(data):
+    """Validate bencode structure without materialising large ``pieces`` values."""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise ValueError("The torrent file is empty")
+    data = bytes(data)
+    top_level_keys = set()
+
+    def parse_bytes(position):
+        colon = data.find(b":", position)
+        if colon < 0:
+            raise ValueError("missing byte-string separator")
+        length_text = data[position:colon]
+        if (
+            not length_text
+            or not length_text.isdigit()
+            or (len(length_text) > 1 and length_text.startswith(b"0"))
+        ):
+            raise ValueError("invalid byte-string length")
+        end = colon + 1 + int(length_text)
+        if end > len(data):
+            raise ValueError("truncated byte string")
+        return end, data[colon + 1 : end]
+
+    def parse_value(position, depth=0):
+        if position >= len(data):
+            raise ValueError("truncated value")
+        marker = data[position]
+        if 48 <= marker <= 57:
+            end, _value = parse_bytes(position)
+            return end
+        if marker == ord("i"):
+            end = data.find(b"e", position + 1)
+            if end < 0:
+                raise ValueError("unterminated integer")
+            integer = data[position + 1 : end]
+            if (
+                not integer
+                or integer == b"-0"
+                or (integer.startswith(b"0") and len(integer) > 1)
+                or (integer.startswith(b"-0") and len(integer) > 2)
+            ):
+                raise ValueError("invalid integer")
+            try:
+                int(integer)
+            except ValueError as error:
+                raise ValueError("invalid integer") from error
+            return end + 1
+        if marker == ord("l"):
+            position += 1
+            while position < len(data) and data[position] != ord("e"):
+                position = parse_value(position, depth + 1)
+            if position >= len(data):
+                raise ValueError("unterminated list")
+            return position + 1
+        if marker == ord("d"):
+            position += 1
+            while position < len(data) and data[position] != ord("e"):
+                if not 48 <= data[position] <= 57:
+                    raise ValueError("dictionary key is not a byte string")
+                position, key = parse_bytes(position)
+                if depth == 0:
+                    top_level_keys.add(key)
+                position = parse_value(position, depth + 1)
+            if position >= len(data):
+                raise ValueError("unterminated dictionary")
+            return position + 1
+        raise ValueError("unknown bencode marker")
+
+    try:
+        if data[0] != ord("d"):
+            raise ValueError("top-level value is not a dictionary")
+        end = parse_value(0)
+        if end != len(data):
+            raise ValueError("trailing data")
+        if b"info" not in top_level_keys:
+            raise ValueError("missing info dictionary")
+    except (RecursionError, ValueError) as error:
+        preview = data[:32].lstrip().lower()
+        if preview.startswith((b"<!doctype", b"<html", b"<head", b"<body")):
+            raise ValueError(
+                "Torrent URL returned an HTML page instead of a .torrent file"
+            ) from error
+        raise ValueError(f"Invalid or truncated torrent metadata: {error}") from error
+
+
+async def _read_torrent_response(response):
+    content_length = response.headers.get("Content-Length")
+    try:
+        declared_size = int(content_length) if content_length else None
+    except (TypeError, ValueError):
+        declared_size = None
+    if declared_size is not None and declared_size > TORRENT_FILE_MAX_BYTES:
+        raise ValueError("The torrent metadata exceeds the 4 MiB safety limit")
+
+    chunks = []
+    received = 0
+    async for chunk in response.content.iter_chunked(TORRENT_FETCH_CHUNK_BYTES):
+        received += len(chunk)
+        if received > TORRENT_FILE_MAX_BYTES:
+            raise ValueError("The torrent metadata exceeds the 4 MiB safety limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _torrent_fetch_headers(url):
+    parsed = urlparse(url)
+    headers = {
+        "User-Agent": TORRENT_FETCH_USER_AGENT,
+        "Accept": "application/x-bittorrent,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if parsed.hostname and parsed.hostname.lower().endswith("nyaa.si"):
+        match = re.search(r"/(?:download|view)/(\d+)", parsed.path)
+        if match:
+            headers["Referer"] = (
+                f"{parsed.scheme}://{parsed.netloc}/view/{match.group(1)}"
+            )
+    return headers
+
+
 async def _fetch_torrent_bytes(url):
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only HTTP(S) torrent URLs are supported")
-    async with session.get(url, timeout=30) as response:
+    async with session.get(
+        url,
+        timeout=30,
+        allow_redirects=True,
+        headers=_torrent_fetch_headers(url),
+    ) as response:
         if response.status >= 400:
             raise ValueError(f"Torrent URL returned HTTP {response.status}")
-        data = await response.content.read(TORRENT_FILE_MAX_BYTES + 1)
-    return bytes(data)
+        data = await _read_torrent_response(response)
+    _validate_torrent_payload(data)
+    return data
 
 
 async def _torrent_chain_request(message):
@@ -248,6 +379,7 @@ async def _torrent_chain_request(message):
         raise ValueError("The torrent file is empty")
     if len(torrent_data) > TORRENT_FILE_MAX_BYTES:
         raise ValueError("The torrent metadata exceeds the 4 MiB safety limit")
+    _validate_torrent_payload(torrent_data)
     return torrent_data, source_url, workspace_bytes
 
 

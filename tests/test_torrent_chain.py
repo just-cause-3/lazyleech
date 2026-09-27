@@ -2,7 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from lazyleech.plugins import torrent_chain
 from lazyleech.utils.bunkr_sessions import (
@@ -85,6 +85,74 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
         mapped = torrent_chain._map_torrent_uploads(files, sent)
         self.assertEqual(3, len(mapped["s:1"]))
         self.assertEqual("https://t.me/c/1/4", mapped["s:2"][0]["link"])
+
+    def test_torrent_payload_validation_rejects_truncated_metadata(self):
+        with self.assertRaisesRegex(ValueError, "Invalid or truncated"):
+            torrent_chain._validate_torrent_payload(b"d4:infod4:name4:teste")
+
+    def test_torrent_payload_validation_identifies_html(self):
+        with self.assertRaisesRegex(ValueError, "HTML page"):
+            torrent_chain._validate_torrent_payload(b"<!doctype html><html></html>")
+
+
+class TorrentFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_reads_every_stream_chunk_before_validation(self):
+        payload = b"d8:announce14:https://test/a4:infod4:name4:testee"
+
+        class Content:
+            async def iter_chunked(self, _size):
+                yield payload[:7]
+                yield payload[7:29]
+                yield payload[29:]
+
+        class Response:
+            status = 200
+            headers = {"Content-Length": str(len(payload))}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        http_session = SimpleNamespace(get=Mock(return_value=Response()))
+        with patch.object(torrent_chain, "session", http_session):
+            result = await torrent_chain._fetch_torrent_bytes(
+                "https://sukebei.nyaa.si/download/4520571.torrent"
+            )
+
+        self.assertEqual(payload, result)
+        request_kwargs = http_session.get.call_args.kwargs
+        self.assertEqual(
+            "https://sukebei.nyaa.si/view/4520571",
+            request_kwargs["headers"]["Referer"],
+        )
+
+    async def test_fetch_rejects_declared_oversized_metadata_before_streaming(self):
+        class Content:
+            async def iter_chunked(self, _size):
+                raise AssertionError("oversized response should not be consumed")
+                yield b""
+
+        class Response:
+            status = 200
+            headers = {"Content-Length": str(torrent_chain.TORRENT_FILE_MAX_BYTES + 1)}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with patch.object(
+            torrent_chain,
+            "session",
+            SimpleNamespace(get=Mock(return_value=Response())),
+        ):
+            with self.assertRaisesRegex(ValueError, "exceeds the 4 MiB"):
+                await torrent_chain._fetch_torrent_bytes("https://example.test/a.torrent")
 
 
 class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
