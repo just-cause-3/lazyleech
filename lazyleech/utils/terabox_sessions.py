@@ -30,14 +30,20 @@ FILE_UPLOADED = "uploaded"
 class TeraboxSessionStore(BunkrSessionStore):
     """Use the proven session state machine with isolated TeraBox collections."""
 
-    def __init__(self, db_url=None, database_name=None):
+    def __init__(
+        self,
+        db_url=None,
+        database_name=None,
+        collection_prefix="TERABOX",
+    ):
+        collection_prefix = str(collection_prefix or "TERABOX").upper()
         super().__init__(
             db_url=db_url,
             database_name=database_name,
-            collection_prefix="TERABOX",
+            collection_prefix=collection_prefix,
         )
         self.chains = (
-            self.database["TERABOX_CHAINS"]
+            self.database[f"{collection_prefix}_CHAINS"]
             if self.database is not None
             else None
         )

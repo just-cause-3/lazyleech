@@ -137,7 +137,15 @@ def is_gid_owner(user_id, gid):
     return bool(rest) and rest[0] in HEX_CHARACTERS
 
 
-async def aria2_add_torrent(session, user_id, link, timeout=0, pause=False):
+async def aria2_add_torrent(
+    session,
+    user_id,
+    link,
+    timeout=0,
+    pause=False,
+    download_dir=None,
+    selected_files=None,
+):
     if os.path.isfile(link):
         with open(link, "rb") as file:
             torrent = file.read()
@@ -150,7 +158,7 @@ async def aria2_add_torrent(session, user_id, link, timeout=0, pause=False):
 
     # For local .torrent files only
     torrent = base64.b64encode(torrent).decode()
-    dir = os.path.join(os.getcwd(), str(user_id), str(time.time()))
+    dir = download_dir or os.path.join(os.getcwd(), str(user_id), str(time.time()))
     options = {
         "gid": await generate_gid(session, user_id),
         "dir": dir,
@@ -159,6 +167,10 @@ async def aria2_add_torrent(session, user_id, link, timeout=0, pause=False):
     }
     if pause:
         options["pause"] = "true"
+    if selected_files:
+        options["select-file"] = ",".join(
+            str(int(index)) for index in selected_files
+        )
 
     return _raise_or_return(
         await aria2_request(

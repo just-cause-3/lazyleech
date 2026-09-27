@@ -85,6 +85,13 @@ watermarks, Pyrogram sessions, and database records are preserved. Set
 torrent <Torrent URL or File> or as reply to a Torrent URL or file
 ziptorrent <Torrent URL or File> or as reply to a Torrent URL or File
 filetorrent <Torrent URL or File> or as reply to a Torrent URL or File - Sends videos as files
+splittorrent <Torrent URL or File> <workspace> - Persistent selective torrent chain
+splitfiletorrent <Torrent URL or File> <workspace> - Torrent chain sent as documents
+torrentchains [page] - List persistent torrent chains
+torrentchain <chain or session ID> - Inspect a torrent chain
+continuetorrent <chain or session ID> - Resume the next unfinished torrent part
+deletetorrentchain <chain ID> - Delete a torrent chain
+deletealltorrentchains - Delete all your torrent chains
 magnet <Magnet URL> or as reply to a Magnet URL
 zipmagnet <Magnet URL> or as reply to a Magnet URL
 filemagnet <Magnet URL> or as reply to a Magnet URL - Sends videos as files
@@ -158,6 +165,19 @@ the throttled rate. A healthy completed download reduces the CDN's adaptive
 level. Tune this behavior with the `BUNKR_SLOW_*`, `BUNKR_CONNECTIONS`,
 `BUNKR_RECOVERY_CONNECTIONS`, `BUNKR_MAX_DOWNLOADS_PER_HOST`, and
 `BUNKR_MAX_HOST_COOLDOWN_SECONDS` environment variables.
+
+`/splittorrent URL 16GB` (or `/splittorrent 16GB` as a reply to a
+`.torrent` file) resolves the torrent metadata once and stores the raw torrent,
+its original file order, sizes, and child-part plan in MongoDB. Each child uses
+Aria2's `select-file` option to download only its assigned files. Planning
+accounts for all selected sources plus the largest temporary Telegram split
+copy, so the requested workspace is a peak limit rather than only a source-size
+limit. A 512 MiB physical-disk reserve is added by default
+(`TORRENT_WORKSPACE_RESERVE_MB`). After every Telegram upload succeeds, the
+download directory is verified deleted before the next child starts. The final
+message is a folder-style index containing the Telegram links. Use
+`/splitfiletorrent` for document uploads, `/torrentchains` to browse history,
+and `/continuetorrent CHAIN_OR_SESSION_ID` after a failure or restart.
 
 `/directdl BUNKR_URL 12GB` applies a persistent disk-workspace limit to a
 Bunkr album. The downloader probes each signed CDN file size and reserves its

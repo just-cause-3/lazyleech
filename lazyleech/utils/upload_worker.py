@@ -81,9 +81,10 @@ def _new_upload_identifier(chat_id):
 class UploadResult(list):
     """Uploaded file links plus whether the complete job succeeded."""
 
-    def __init__(self, values=(), *, complete=False):
+    def __init__(self, values=(), *, complete=False, source_results=None):
         super().__init__(values)
         self.complete = bool(complete)
+        self.source_results = list(source_results or [])
 
 
 def _usable_thumbnail(path):
@@ -281,6 +282,7 @@ async def _upload_worker(
 ):
     files = dict()
     sent_files = []
+    source_results = []
     upload_complete = True
 
     with tempfile.TemporaryDirectory(dir=str(user_id)) as zip_tempdir:
@@ -359,9 +361,21 @@ async def _upload_worker(
                 download_root=torrent_info.get("dir"),
             )
             sent_files.extend(uploaded)
+            source_results.append(
+                {
+                    "source_path": filepath,
+                    "relative_name": files[filepath],
+                    "uploads": list(uploaded),
+                    "complete": bool(uploaded.complete),
+                }
+            )
             upload_complete = upload_complete and uploaded.complete
     if bool((upload_options or {}).get("suppress_summary")):
-        return UploadResult(sent_files, complete=upload_complete)
+        return UploadResult(
+            sent_files,
+            complete=upload_complete,
+            source_results=source_results,
+        )
 
     text = "Files:\n"
     parser = pyrogram_html.HTML(client)
@@ -399,7 +413,11 @@ async def _upload_worker(
     ):
         await message.reply_text(text, quote=quote, disable_web_page_preview=True)
 
-    return UploadResult(sent_files, complete=upload_complete)
+    return UploadResult(
+        sent_files,
+        complete=upload_complete,
+        source_results=source_results,
+    )
 
 
 async def _upload_file(
