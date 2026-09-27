@@ -4,7 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
+
 from lazyleech.plugins import torrent_chain
+from lazyleech.utils.aria2 import Aria2Error, aria2_request
 from lazyleech.utils.bunkr_sessions import (
     FILE_DOWNLOADED,
     SESSION_PAUSED,
@@ -28,6 +31,11 @@ def torrent_file(index, name, size):
 
 
 class TorrentWorkspacePlannerTests(unittest.TestCase):
+    def test_help_entry_has_display_name_and_body(self):
+        display_name, body = torrent_chain.help_dict["torrent-chain"]
+        self.assertEqual("Torrent Chains", display_name)
+        self.assertIn("/splittorrent", body)
+
     def test_peak_includes_all_sources_and_largest_split_copy(self):
         files = [
             torrent_file(1, "root/small.bin", 1 * GIB),
@@ -96,6 +104,18 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
 
 
 class TorrentFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_aria2_broken_pipe_becomes_reportable_aria2_error(self):
+        class BrokenRequest:
+            async def __aenter__(self):
+                raise aiohttp.ClientOSError(32, "Broken pipe")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        rpc_session = SimpleNamespace(post=Mock(return_value=BrokenRequest()))
+        with self.assertRaisesRegex(Aria2Error, "Aria2 RPC request failed"):
+            await aria2_request(rpc_session, "aria2.addTorrent", [])
+
     async def test_fetch_reads_every_stream_chunk_before_validation(self):
         payload = b"d8:announce14:https://test/a4:infod4:name4:testee"
 

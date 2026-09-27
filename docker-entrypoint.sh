@@ -59,6 +59,7 @@ export PROGRESS_UPDATE_DELAY="${PROGRESS_UPDATE_DELAY:-5}"
 export LEECH_TIMEOUT="${LEECH_TIMEOUT:-300}"
 export MAGNET_TIMEOUT="${MAGNET_TIMEOUT:-60}"
 export IGNORE_PADDING_FILE="${IGNORE_PADDING_FILE:-1}"
+export ARIA2_RPC_MAX_REQUEST_SIZE="${ARIA2_RPC_MAX_REQUEST_SIZE:-16M}"
 
 # Start Aria2 daemon
 echo -e "${YELLOW}Starting Aria2 daemon...${NC}"
@@ -67,6 +68,7 @@ aria2c \
     --rpc-listen-all=true \
     --rpc-allow-origin-all \
     --rpc-secret="$ARIA2_SECRET" \
+    --rpc-max-request-size="$ARIA2_RPC_MAX_REQUEST_SIZE" \
     -j5 \
     -x16 \
     -s16 \
@@ -105,6 +107,7 @@ echo -e "  ADMIN_CHATS: ${ADMIN_CHATS}"
 echo -e "  EVERYONE_CHATS: ${EVERYONE_CHATS}"
 echo -e "  PROGRESS_UPDATE_DELAY: ${PROGRESS_UPDATE_DELAY}s"
 echo -e "  LEECH_TIMEOUT: ${LEECH_TIMEOUT}s"
+echo -e "  ARIA2_RPC_MAX_REQUEST_SIZE: ${ARIA2_RPC_MAX_REQUEST_SIZE}"
 
 # Check existing session
 SESSION_FILE="/app/session/lazyleech.session"

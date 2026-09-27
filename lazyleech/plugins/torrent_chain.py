@@ -1171,12 +1171,15 @@ async def delete_all_torrent_chains_cmd(client, message):
 
 
 help_dict["torrent-chain"] = (
-    "<b>Torrent workspace chains</b>\n\n"
-    "/splittorrent <i>&lt;torrent URL&gt; &lt;workspace&gt;</i> or reply to a .torrent\n"
-    "/splitfiletorrent <i>&lt;torrent URL&gt; &lt;workspace&gt;</i> - Send videos as files\n"
-    "/torrentchains <i>[page]</i> - List persistent torrent chains\n"
-    "/torrentchain <i>&lt;chain or session ID&gt;</i> - Inspect a chain\n"
-    "/continuetorrent <i>&lt;chain or session ID&gt;</i> - Resume the next part\n"
-    "/deletetorrentchain <i>&lt;chain ID&gt;</i> - Delete one chain\n"
-    "/deletealltorrentchains - Delete all your torrent chains"
+    "Torrent Chains",
+    (
+        "<b>Torrent workspace chains</b>\n\n"
+        "/splittorrent <i>&lt;torrent URL&gt; &lt;workspace&gt;</i> or reply to a .torrent\n"
+        "/splitfiletorrent <i>&lt;torrent URL&gt; &lt;workspace&gt;</i> - Send videos as files\n"
+        "/torrentchains <i>[page]</i> - List persistent torrent chains\n"
+        "/torrentchain <i>&lt;chain or session ID&gt;</i> - Inspect a chain\n"
+        "/continuetorrent <i>&lt;chain or session ID&gt;</i> - Resume the next part\n"
+        "/deletetorrentchain <i>&lt;chain ID&gt;</i> - Delete one chain\n"
+        "/deletealltorrentchains - Delete all your torrent chains"
+    ),
 )

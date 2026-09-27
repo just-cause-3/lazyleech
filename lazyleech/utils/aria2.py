@@ -22,6 +22,8 @@ import random
 import tempfile
 import time
 
+import aiohttp
+
 from .. import ARIA2_SECRET
 from .segmented_download import (
     add_segmented_download,
@@ -58,10 +60,18 @@ async def aria2_request(session, method, params=None):
         "method": method,
         "params": params,
     }
-    async with session.post(
-        "http://127.0.0.1:6800/jsonrpc", data=json.dumps(data)
-    ) as resp:
-        return await resp.json(encoding="utf-8")
+    try:
+        async with session.post(
+            "http://127.0.0.1:6800/jsonrpc", data=json.dumps(data)
+        ) as resp:
+            return await resp.json(encoding="utf-8")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise Aria2Error(
+            {
+                "code": -1,
+                "message": f"Aria2 RPC request failed: {error}",
+            }
+        ) from error
 
 
 async def aria2_tell_active(session):
