@@ -855,6 +855,11 @@ async def _complete_torrent_session(client, message, session_id):
         chain = await torrent_session_store.list_chain(chain_id)
         if chain and all(item.get("state") == SESSION_COMPLETED for item in chain):
             last = chain[-1]
+            if not last.get("index_sent"):
+                await _send_torrent_chain_index(message, chain)
+                await torrent_session_store.set_state(
+                    last["_id"], SESSION_COMPLETED, index_sent=True
+                )
         return True
 
 
@@ -1074,10 +1079,13 @@ async def _torrent_chains_page(owner_id, requested_page):
             ]
         )
         for child in children[:8]:
+            skipped = int(child.get("skipped_files") or 0)
+            skip_text = f" · {skipped} skipped" if skipped else ""
             lines.append(
                 f"├── Part {child.get('part_index')}/{child.get('total_parts')} · "
                 f"{html.escape(str(child.get('state')))} · "
-                f"{child.get('total_files')} file(s) · <code>{child['_id']}</code>"
+                f"{child.get('total_files')} file(s){skip_text} · "
+                f"<code>{child['_id']}</code>"
             )
         if len(children) > 8:
             lines.append(f"└── … {len(children) - 8} more part(s)")
@@ -1154,10 +1162,15 @@ async def _torrent_chain_detail_page(owner_id, requested_id, requested_page):
     ]
     for child in visible:
         counts = await torrent_session_store.counts(child["_id"])
+        child_files = await torrent_session_store.list_files(child["_id"])
+        skipped = sum(bool(item.get("terminal_skip")) for item in child_files)
+        downloadable = max(0, int(child.get("total_files") or 0) - skipped)
+        skip_text = f" — {skipped} skipped" if skipped else ""
         lines.append(
             f"Part {child.get('part_index')}/{child.get('total_parts')} — "
             f"{html.escape(str(child.get('state')))} — "
-            f"{counts.get(FILE_UPLOADED, 0)}/{child.get('total_files')} uploaded — "
+            f"{counts.get(FILE_UPLOADED, 0)}/{downloadable} uploaded"
+            f"{skip_text} — "
             f"<code>{child['_id']}</code>"
         )
     buttons = []
