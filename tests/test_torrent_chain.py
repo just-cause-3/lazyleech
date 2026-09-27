@@ -10,6 +10,8 @@ from lazyleech.plugins import torrent_chain
 from lazyleech.utils.aria2 import Aria2Error, aria2_request
 from lazyleech.utils.bunkr_sessions import (
     FILE_DOWNLOADED,
+    FILE_FAILED,
+    SESSION_COMPLETED,
     SESSION_PAUSED,
     SESSION_RUNNING,
 )
@@ -49,16 +51,51 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
             torrent_file(2, "two.bin", 3 * GIB),
             torrent_file(3, "three.bin", 1 * GIB),
         ]
-        groups = torrent_chain._partition_torrent_files(files, 6 * GIB)
+        groups, skipped = torrent_chain._partition_torrent_files(files, 6 * GIB)
         self.assertEqual([[1], [2], [3]], [
             [item["torrent_index"] for item in group] for group in groups
         ])
+        self.assertEqual([], skipped)
 
-    def test_single_file_that_cannot_fit_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "needs about"):
-            torrent_chain._partition_torrent_files(
-                [torrent_file(1, "large.bin", 3 * GIB)], 5 * GIB
-            )
+    def test_single_file_that_cannot_fit_is_terminally_skipped(self):
+        groups, skipped = torrent_chain._partition_torrent_files(
+            [torrent_file(1, "large.bin", 3 * GIB)], 5 * GIB
+        )
+        self.assertEqual([], groups)
+        self.assertEqual([1], [item["torrent_index"] for item in skipped])
+        self.assertEqual(6 * GIB, skipped[0]["required_workspace_bytes"])
+        self.assertIn("configured limit is 5.00 GB", skipped[0]["skip_reason"])
+
+    def test_final_index_marks_workspace_skips_in_original_torrent_order(self):
+        chain = [{"_id": "part1", "chain_id": "chain1", "name": "Example"}]
+        files = {
+            "part1": [
+                {
+                    "torrent_index": 2,
+                    "position": 1,
+                    "filename": "large.bin",
+                    "relative_path": "Example/large.bin",
+                    "status": FILE_FAILED,
+                    "terminal_skip": True,
+                    "error": "requires about 30.00 GB; configured limit is 25.00 GB",
+                    "telegram_files": [],
+                },
+                {
+                    "torrent_index": 1,
+                    "position": 2,
+                    "filename": "small.bin",
+                    "relative_path": "Example/small.bin",
+                    "status": FILE_UPLOADED,
+                    "telegram_files": [
+                        {"name": "small.bin", "link": "https://t.me/c/1/2"}
+                    ],
+                },
+            ]
+        }
+        rendered = "\n".join(torrent_chain._torrent_index_lines(chain, files))
+        self.assertIn("finished with 1 skipped file(s)", rendered)
+        self.assertIn("large.bin (skipped: requires about 30.00 GB", rendered)
+        self.assertLess(rendered.index("small.bin"), rendered.index("large.bin"))
 
     def test_upload_mapping_uses_per_source_results_not_part_estimates(self):
         files = [
@@ -201,6 +238,13 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     "torrent_index": 9,
                     "size_bytes": 20,
                 },
+                {
+                    "page_url": "telegram:example.torrent",
+                    "filename": "too-large.bin",
+                    "relative_path": "Example/too-large.bin",
+                    "torrent_index": 12,
+                    "size_bytes": 30,
+                },
             ],
             session_fields={
                 "chain_id": "runnerchain",
@@ -220,9 +264,16 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
             name="Example",
             mode="normal",
             total_parts=1,
-            total_files=2,
+            total_files=3,
             session_ids=[session_doc["_id"]],
             chain_fields={"torrent_data": b"torrent"},
+        )
+        created_files = await store.list_files(session_doc["_id"])
+        await store.update_file(
+            created_files[2]["_id"],
+            FILE_FAILED,
+            terminal_skip=True,
+            error="workspace limit exceeded",
         )
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=123),
@@ -282,7 +333,11 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         updated = await store.get_session(session_doc["_id"])
         self.assertEqual("completed", updated["state"])
         files = await store.list_files(session_doc["_id"])
-        self.assertTrue(all(item["status"] == FILE_UPLOADED for item in files))
+        self.assertEqual(
+            [FILE_UPLOADED, FILE_UPLOADED, FILE_FAILED],
+            [item["status"] for item in files],
+        )
+        self.assertTrue(files[2]["terminal_skip"])
         self.assertEqual("https://t.me/c/1/1", files[0]["telegram_files"][0]["link"])
 
     async def test_creation_persists_raw_torrent_and_queues_later_parts(self):
@@ -326,6 +381,98 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"torrent-metadata", chain["torrent_data"])
         second_files = await store.list_files(sessions[1]["_id"])
         self.assertEqual(2, second_files[0]["torrent_index"])
+
+    async def test_creation_persists_oversized_file_as_terminal_skip(self):
+        store = TorrentSessionStore(db_url="")
+        files = [
+            torrent_file(1, "Example/small.bin", 1 * GIB),
+            torrent_file(2, "Example/large.bin", 13 * GIB),
+        ]
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=77,
+            command=["splittorrent"],
+        )
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        try:
+            with patch.object(
+                torrent_chain,
+                "_inspect_torrent_bytes",
+                AsyncMock(return_value=("Example", files)),
+            ):
+                chain_id, _title, _files, sessions = (
+                    await torrent_chain._create_torrent_chain(
+                        message,
+                        b"torrent-metadata",
+                        "telegram:example.torrent",
+                        25 * GIB,
+                    )
+                )
+        finally:
+            torrent_chain.torrent_session_store = original_store
+
+        self.assertEqual(1, len(sessions))
+        self.assertEqual(1, sessions[0]["downloadable_files"])
+        self.assertEqual(1, sessions[0]["skipped_files"])
+        stored = await store.list_files(sessions[0]["_id"])
+        self.assertEqual(["pending", FILE_FAILED], [item["status"] for item in stored])
+        self.assertTrue(stored[1]["terminal_skip"])
+        self.assertIn("configured limit is 25.00 GB", stored[1]["error"])
+        chain = await store.get_chain(chain_id, owner_id=123)
+        self.assertEqual(1, chain["skipped_files"])
+
+    async def test_all_oversized_files_complete_without_starting_aria2(self):
+        store = TorrentSessionStore(db_url="")
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            id=77,
+            command=["splittorrent"],
+            reply_text=AsyncMock(),
+        )
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        torrent_chain.torrent_chain_locks.clear()
+        try:
+            with patch.object(
+                torrent_chain,
+                "_inspect_torrent_bytes",
+                AsyncMock(
+                    return_value=(
+                        "Example",
+                        [torrent_file(1, "Example/large.bin", 13 * GIB)],
+                    )
+                ),
+            ):
+                _chain_id, _title, _files, sessions = (
+                    await torrent_chain._create_torrent_chain(
+                        message,
+                        b"torrent-metadata",
+                        "telegram:example.torrent",
+                        25 * GIB,
+                    )
+                )
+            with (
+                patch.object(
+                    torrent_chain, "aria2_add_torrent", AsyncMock()
+                ) as add_torrent,
+                patch.object(
+                    torrent_chain, "_send_torrent_chain_index", AsyncMock()
+                ) as send_index,
+            ):
+                await torrent_chain._run_torrent_session(
+                    None, message, sessions[0]["_id"]
+                )
+        finally:
+            torrent_chain.torrent_session_store = original_store
+
+        add_torrent.assert_not_awaited()
+        send_index.assert_awaited_once()
+        completed = await store.get_session(sessions[0]["_id"])
+        self.assertEqual(SESSION_COMPLETED, completed["state"])
+        self.assertEqual(1, completed["skipped_files"])
 
     async def test_completed_part_activates_next_persisted_part(self):
         store = TorrentSessionStore(db_url="")

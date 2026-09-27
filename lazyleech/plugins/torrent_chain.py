@@ -86,13 +86,19 @@ def _partition_torrent_files(files, workspace_bytes):
     if workspace_bytes <= 0:
         raise ValueError("Workspace must be greater than zero")
     groups = []
+    skipped = []
     current = []
     for item in files:
-        if _torrent_part_peak([item]) > workspace_bytes:
-            raise ValueError(
-                f"{item['relative_path']} needs about "
-                f"{format_bytes(_torrent_part_peak([item]))} of workspace"
+        required = _torrent_part_peak([item])
+        if required > workspace_bytes:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = (
+                f"requires about {format_bytes(required)} of workspace; "
+                f"configured limit is {format_bytes(workspace_bytes)}"
             )
+            skipped_item["required_workspace_bytes"] = required
+            skipped.append(skipped_item)
+            continue
         candidate = current + [item]
         if current and _torrent_part_peak(candidate) > workspace_bytes:
             groups.append(current)
@@ -101,7 +107,7 @@ def _partition_torrent_files(files, workspace_bytes):
             current = candidate
     if current:
         groups.append(current)
-    return groups
+    return groups, skipped
 
 
 def _relative_torrent_path(path, base_dir):
@@ -385,13 +391,21 @@ async def _torrent_chain_request(message):
 
 async def _create_torrent_chain(message, torrent_data, source_url, workspace_bytes):
     title, files = await _inspect_torrent_bytes(message.from_user.id, torrent_data)
-    groups = _partition_torrent_files(files, workspace_bytes)
+    groups, skipped_files = _partition_torrent_files(files, workspace_bytes)
+    # A skipped-only torrent still gets a durable chain and final index.
+    if not groups:
+        groups = [[]]
     chain_id = new_session_id()
     total_parts = len(groups)
     session_docs = []
     try:
         for part_index, group in enumerate(groups, 1):
             initial_state = SESSION_RUNNING if part_index == 1 else SESSION_PAUSED
+            part_skips = skipped_files if part_index == 1 else []
+            stored_files = sorted(
+                [*group, *part_skips],
+                key=lambda item: int(item["torrent_index"]),
+            )
             session_doc = await torrent_session_store.create_session(
                 owner_id=message.from_user.id,
                 chat_id=message.chat.id,
@@ -409,7 +423,7 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
                         "size_bytes": item["size_bytes"],
                         "telegram_files": [],
                     }
-                    for item in group
+                    for item in stored_files
                 ],
                 initial_state=initial_state,
                 session_fields={
@@ -420,10 +434,33 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
                     "workspace_bytes": int(workspace_bytes),
                     "peak_workspace_bytes": _torrent_part_peak(group),
                     "source_bytes": sum(item["size_bytes"] for item in group),
+                    "downloadable_files": len(group),
+                    "skipped_files": len(part_skips),
                     "provider": "torrent_chain",
                 },
             )
             session_docs.append(session_doc)
+            if part_skips:
+                skip_by_index = {
+                    int(item["torrent_index"]): item for item in part_skips
+                }
+                for file_doc in await torrent_session_store.list_files(
+                    session_doc["_id"]
+                ):
+                    skipped = skip_by_index.get(int(file_doc["torrent_index"]))
+                    if skipped is None:
+                        continue
+                    await torrent_session_store.update_file(
+                        file_doc["_id"],
+                        FILE_FAILED,
+                        gid=None,
+                        error=skipped["skip_reason"],
+                        terminal_skip=True,
+                        workspace_skip=True,
+                        required_workspace_bytes=skipped[
+                            "required_workspace_bytes"
+                        ],
+                    )
         await torrent_session_store.create_chain(
             chain_id=chain_id,
             owner_id=message.from_user.id,
@@ -438,6 +475,8 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
             chain_fields={
                 "workspace_bytes": int(workspace_bytes),
                 "torrent_data": torrent_data,
+                "downloadable_files": len(files) - len(skipped_files),
+                "skipped_files": len(skipped_files),
                 "provider": "torrent_chain",
             },
         )
@@ -449,18 +488,36 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
 
 
 def _torrent_plan_chunks(chain_id, title, workspace_bytes, sessions):
+    skipped_files = sum(int(item.get("skipped_files") or 0) for item in sessions)
+    total_files = sum(int(item.get("total_files") or 0) for item in sessions)
     lines = [
         f"<b>Torrent chain:</b> <code>{chain_id}</code>",
         f"<b>Name:</b> {html.escape(title)}",
         f"<b>Workspace:</b> {format_bytes(workspace_bytes)}",
+        f"<b>Files:</b> {total_files} | <b>Skipped:</b> {skipped_files}",
         f"<b>Parts:</b> {len(sessions)} (automatic, sequential)",
         "",
     ]
+    if skipped_files:
+        lines.extend(
+            [
+                "Files whose upload preparation cannot fit this workspace "
+                "were skipped and will be identified in the final index.",
+                "",
+            ]
+        )
     for item in sessions:
         state = "running now" if item["part_index"] == 1 else "queued"
+        downloadable = int(
+            item.get("downloadable_files", item.get("total_files") or 0)
+        )
+        skipped = int(item.get("skipped_files") or 0)
+        file_summary = f"{downloadable} downloadable file(s)"
+        if skipped:
+            file_summary += f", {skipped} skipped"
         lines.append(
             f"Part {item['part_index']}/{item['total_parts']} — "
-            f"{item['total_files']} file(s), "
+            f"{file_summary}, "
             f"{format_bytes(item['source_bytes'])} source, "
             f"{format_bytes(item['peak_workspace_bytes'])} peak — "
             f"<code>{item['_id']}</code> ({state})"
@@ -633,7 +690,10 @@ async def _run_torrent_session(client, message, session_id):
         return
     file_docs = await torrent_session_store.list_files(session_id)
     unfinished = [
-        item for item in file_docs if item.get("status") != FILE_UPLOADED
+        item
+        for item in file_docs
+        if item.get("status") != FILE_UPLOADED
+        and not item.get("terminal_skip")
     ]
     if not unfinished:
         await _complete_torrent_session(client, message, session_id)
@@ -773,11 +833,18 @@ async def _complete_torrent_session(client, message, session_id):
         session_doc = await torrent_session_store.get_session(session_id)
         if not session_doc or session_doc.get("state") != SESSION_RUNNING:
             return False
-        counts = await torrent_session_store.counts(session_id)
-        if counts.get(FILE_UPLOADED, 0) != session_doc["total_files"]:
+        file_docs = await torrent_session_store.list_files(session_id)
+        uploaded = sum(
+            item.get("status") == FILE_UPLOADED for item in file_docs
+        )
+        skipped = sum(bool(item.get("terminal_skip")) for item in file_docs)
+        if uploaded + skipped != session_doc["total_files"]:
             return False
         completed = await torrent_session_store.set_state(
-            session_id, SESSION_COMPLETED, gid=None
+            session_id,
+            SESSION_COMPLETED,
+            gid=None,
+            skipped_files=skipped,
         )
         next_session = await torrent_session_store.activate_next_chain_part(
             completed["_id"]
@@ -788,42 +855,53 @@ async def _complete_torrent_session(client, message, session_id):
         chain = await torrent_session_store.list_chain(chain_id)
         if chain and all(item.get("state") == SESSION_COMPLETED for item in chain):
             last = chain[-1]
-            if not last.get("index_sent"):
-                await _send_torrent_chain_index(message, chain)
-                await torrent_session_store.set_state(
-                    last["_id"], SESSION_COMPLETED, index_sent=True
-                )
         return True
 
 
 def _torrent_index_lines(chain, files_by_session):
     chain_id = chain[0]["chain_id"]
     title = str(chain[0].get("name") or "Torrent")
+    all_files = [
+        file_doc
+        for session_doc in chain
+        for file_doc in files_by_session.get(session_doc["_id"], [])
+    ]
+    all_files.sort(
+        key=lambda item: (
+            int(item.get("torrent_index") or 0),
+            int(item.get("position") or 0),
+        )
+    )
+    skipped_count = sum(bool(item.get("terminal_skip")) for item in all_files)
+    heading = (
+        f"Torrent upload finished with {skipped_count} skipped file(s)"
+        if skipped_count
+        else "Torrent upload complete"
+    )
     lines = [
-        f"<b>Torrent upload complete</b> — <code>{chain_id}</code>",
+        f"<b>{heading}</b> — <code>{chain_id}</code>",
         f"📁 <b>{html.escape(title)}/</b>",
     ]
     root = {"dirs": {}, "entries": []}
-    for session_doc in chain:
-        for file_doc in files_by_session.get(session_doc["_id"], []):
-            parts = [
-                part
-                for part in str(
-                    file_doc.get("relative_path") or file_doc["filename"]
-                ).replace("\\", "/").split("/")
-                if part
-            ]
-            if len(parts) > 1 and parts[0] == title:
-                parts = parts[1:]
-            name = parts.pop() if parts else file_doc["filename"]
-            node = root
-            for directory in parts:
-                if directory not in node["dirs"]:
-                    child = {"dirs": {}, "entries": []}
-                    node["dirs"][directory] = child
-                    node["entries"].append(("dir", directory, child))
-                node = node["dirs"][directory]
-            node["entries"].append(("file", name, file_doc))
+    for file_doc in all_files:
+        parts = [
+            part
+            for part in str(
+                file_doc.get("relative_path") or file_doc["filename"]
+            ).replace("\\", "/").split("/")
+            if part
+        ]
+        if len(parts) > 1 and parts[0] == title:
+            parts = parts[1:]
+        name = parts.pop() if parts else file_doc["filename"]
+        node = root
+        for directory in parts:
+            if directory not in node["dirs"]:
+                child = {"dirs": {}, "entries": []}
+                node["dirs"][directory] = child
+                node["entries"].append(("dir", directory, child))
+            node = node["dirs"][directory]
+        node["entries"].append(("file", name, file_doc))
 
     number = 0
 
@@ -857,7 +935,18 @@ def _torrent_index_lines(chain, files_by_session):
                     f'{prefix}{branch} {number}. <a href="{link}">{upload_name}</a>'
                 )
             else:
-                lines.append(f"{prefix}{branch} {number}. {html.escape(name)} (missing)")
+                if value.get("terminal_skip"):
+                    reason = html.escape(
+                        str(value.get("error") or "workspace limit exceeded")[:240]
+                    )
+                    lines.append(
+                        f"{prefix}{branch} {number}. {html.escape(name)} "
+                        f"(skipped: {reason})"
+                    )
+                else:
+                    lines.append(
+                        f"{prefix}{branch} {number}. {html.escape(name)} (missing)"
+                    )
 
     render(root)
     return lines
