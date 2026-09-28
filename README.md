@@ -90,6 +90,7 @@ splitfiletorrent <Torrent URL or File> <workspace> - Torrent chain sent as docum
 torrentchains [page] - List persistent torrent chains
 torrentchain <chain or session ID> - Inspect a torrent chain
 continuetorrent <chain or session ID> - Resume the next unfinished torrent part
+skiptorrentsession <chain or session ID> - Skip one part, clean it, and continue
 deletetorrentchain <chain ID> - Delete a torrent chain
 deletealltorrentchains - Delete all your torrent chains
 magnet <Magnet URL> or as reply to a Magnet URL
@@ -174,10 +175,19 @@ accounts for all selected sources plus the largest temporary Telegram split
 copy, so the requested workspace is a peak limit rather than only a source-size
 limit. A 512 MiB physical-disk reserve is added by default
 (`TORRENT_WORKSPACE_RESERVE_MB`). After every Telegram upload succeeds, the
-download directory is verified deleted before the next child starts. The final
-message is a folder-style index containing the Telegram links. Use
-`/splitfiletorrent` for document uploads, `/torrentchains` to browse history,
-and `/continuetorrent CHAIN_OR_SESSION_ID` after a failure or restart.
+download directory is verified deleted before the next child starts. An
+individual file whose source-plus-split peak exceeds the requested workspace is
+persisted as a terminal skip and omitted from Aria2 selection, while the rest of
+the chain continues. The final folder-style index contains the Telegram links
+and marks every skipped file with its required workspace and configured limit.
+Use `/splitfiletorrent` for document uploads, `/torrentchains` to browse
+history, and `/continuetorrent CHAIN_OR_SESSION_ID` after a failure or restart.
+The creation plan is one editable paginated message, so large chains do not
+send a burst of messages. `/skiptorrentsession SESSION_OR_CHAIN_ID` cancels the
+current part, marks every unfinished file as skipped in the final index,
+verifies its session directory was removed, and starts the next part. You may
+also reply to a torrent-session error with `/skiptorrentsession`. Files already
+queued for Telegram upload finish normally before cleanup and advancement.
 
 `/directdl BUNKR_URL 12GB` applies a persistent disk-workspace limit to a
 Bunkr album. The downloader probes each signed CDN file size and reserves its

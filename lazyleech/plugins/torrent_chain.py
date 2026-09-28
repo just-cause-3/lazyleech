@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from natsort import natsorted
 from pyrogram import Client, filters
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import (
@@ -60,6 +61,7 @@ except (TypeError, ValueError):
     _workspace_reserve_mb = 512
 TORRENT_WORKSPACE_RESERVE_BYTES = _workspace_reserve_mb * 1024**2
 TORRENT_CHAIN_PAGE_SIZE = 5
+TORRENT_PLAN_PAGE_SIZE = 10
 
 torrent_session_tasks = {}
 torrent_chain_locks = {}
@@ -487,15 +489,26 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
     return chain_id, title, files, session_docs
 
 
-def _torrent_plan_chunks(chain_id, title, workspace_bytes, sessions):
+def _torrent_plan_page(chain_doc, sessions, requested_page=1):
+    """Render one bounded, editable page of a newly created chain plan."""
+    chain_id = str(chain_doc["_id"])
+    title = str(chain_doc.get("name") or "Torrent")
+    workspace_bytes = int(chain_doc.get("workspace_bytes") or 0)
     skipped_files = sum(int(item.get("skipped_files") or 0) for item in sessions)
     total_files = sum(int(item.get("total_files") or 0) for item in sessions)
+    total_pages = max(
+        1, (len(sessions) + TORRENT_PLAN_PAGE_SIZE - 1) // TORRENT_PLAN_PAGE_SIZE
+    )
+    page = min(max(1, int(requested_page)), total_pages)
+    start = (page - 1) * TORRENT_PLAN_PAGE_SIZE
+    visible = sessions[start : start + TORRENT_PLAN_PAGE_SIZE]
     lines = [
         f"<b>Torrent chain:</b> <code>{chain_id}</code>",
         f"<b>Name:</b> {html.escape(title)}",
         f"<b>Workspace:</b> {format_bytes(workspace_bytes)}",
         f"<b>Files:</b> {total_files} | <b>Skipped:</b> {skipped_files}",
         f"<b>Parts:</b> {len(sessions)} (automatic, sequential)",
+        f"<b>Page:</b> {page}/{total_pages}",
         "",
     ]
     if skipped_files:
@@ -506,8 +519,13 @@ def _torrent_plan_chunks(chain_id, title, workspace_bytes, sessions):
                 "",
             ]
         )
-    for item in sessions:
-        state = "running now" if item["part_index"] == 1 else "queued"
+    for item in visible:
+        state = {
+            SESSION_RUNNING: "running now",
+            SESSION_PAUSED: "queued",
+            SESSION_COMPLETED: "completed",
+            SESSION_FAILED: "stopped",
+        }.get(item.get("state"), str(item.get("state") or "unknown"))
         downloadable = int(
             item.get("downloadable_files", item.get("total_files") or 0)
         )
@@ -522,21 +540,40 @@ def _torrent_plan_chunks(chain_id, title, workspace_bytes, sessions):
             f"{format_bytes(item['peak_workspace_bytes'])} peak — "
             f"<code>{item['_id']}</code> ({state})"
         )
-    chunks = []
-    current = ""
-    for line in lines:
-        candidate = current + line + "\n"
-        if current and len(candidate.encode("utf-8")) > 3500:
-            chunks.append(current.rstrip())
-            current = (
-                f"<b>Torrent chain plan (continued)</b> — "
-                f"<code>{chain_id}</code>\n{line}\n"
+
+    owner_id = int(chain_doc["owner_id"])
+    buttons = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                "Previous",
+                callback_data=f"torrentplan_page:{owner_id}:{chain_id}:{page - 1}",
             )
-        else:
-            current = candidate
-    if current:
-        chunks.append(current.rstrip())
-    return chunks
+        )
+    buttons.append(
+        InlineKeyboardButton(
+            f"{page}/{total_pages}",
+            callback_data=f"torrentplan_page:{owner_id}:{chain_id}:{page}",
+        )
+    )
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton(
+                "Next",
+                callback_data=f"torrentplan_page:{owner_id}:{chain_id}:{page + 1}",
+            )
+        )
+    return "\n".join(lines), InlineKeyboardMarkup([buttons])
+
+
+async def _stored_torrent_plan_page(owner_id, chain_id, requested_page):
+    chain_doc = await torrent_session_store.get_chain(
+        chain_id, owner_id=owner_id
+    )
+    if chain_doc is None:
+        return None, None
+    sessions = await torrent_session_store.list_chain(chain_id)
+    return _torrent_plan_page(chain_doc, sessions, requested_page)
 
 
 @Client.on_message(
@@ -548,7 +585,7 @@ async def split_torrent_cmd(client, message):
         torrent_data, source_url, workspace_bytes = await _torrent_chain_request(
             message
         )
-        chain_id, title, _files, sessions = await _create_torrent_chain(
+        chain_id, _title, _files, sessions = await _create_torrent_chain(
             message, torrent_data, source_url, workspace_bytes
         )
     except (ValueError, Aria2Error) as error:
@@ -556,9 +593,47 @@ async def split_torrent_cmd(client, message):
             "Could not create torrent chain: " + html.escape(str(error))
         )
         return
-    for chunk in _torrent_plan_chunks(chain_id, title, workspace_bytes, sessions):
-        await message.reply_text(chunk)
+    chain_doc = await torrent_session_store.get_chain(
+        chain_id, owner_id=message.from_user.id
+    )
+    text, reply_markup = _torrent_plan_page(chain_doc, sessions, 1)
+    await message.reply_text(
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
     _start_torrent_session(client, message, sessions[0]["_id"])
+
+
+@Client.on_callback_query(
+    filters.regex(r"^torrentplan_page:\d+:[A-Za-z0-9_-]+:\d+$")
+)
+async def torrent_chain_plan_page_callback(client, callback_query):
+    _, owner_text, chain_id, page_text = callback_query.data.split(":", 3)
+    owner_id = int(owner_text)
+    if callback_query.from_user.id != owner_id:
+        await callback_query.answer(
+            "Only the user who created this chain can change its page.",
+            show_alert=True,
+        )
+        return
+    text, reply_markup = await _stored_torrent_plan_page(
+        owner_id, chain_id, int(page_text)
+    )
+    if text is None:
+        await callback_query.answer(
+            "This torrent chain is no longer available.", show_alert=True
+        )
+        return
+    try:
+        await callback_query.message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except MessageNotModified:
+        pass
+    await callback_query.answer()
 
 
 def _torrent_download_dir(session_doc):
@@ -568,6 +643,38 @@ def _torrent_download_dir(session_doc):
         "torrent_sessions",
         str(session_doc["_id"]),
     )
+
+
+async def _cleanup_torrent_session_directory(session_doc):
+    """Delete only this session's verified workspace directory."""
+    owner_root = os.path.abspath(
+        os.path.join(
+            os.getcwd(),
+            str(int(session_doc["owner_id"])),
+            "torrent_sessions",
+        )
+    )
+    target = os.path.abspath(_torrent_download_dir(session_doc))
+    try:
+        inside_owner_root = os.path.commonpath([owner_root, target]) == owner_root
+    except ValueError:
+        inside_owner_root = False
+    if not inside_owner_root or target == owner_root:
+        raise OSError(f"Refusing to clean unsafe torrent path: {target}")
+
+    if os.path.isdir(target):
+        await asyncio.to_thread(shutil.rmtree, target)
+    elif os.path.exists(target):
+        raise OSError(f"Torrent workspace is not a directory: {target}")
+    if os.path.exists(target):
+        raise OSError(f"Torrent workspace still exists after cleanup: {target}")
+
+    try:
+        if os.path.isdir(owner_root) and not os.listdir(owner_root):
+            os.rmdir(owner_root)
+    except OSError:
+        pass
+    return target
 
 
 def _directory_allocated_bytes(path):
@@ -712,7 +819,8 @@ async def _run_torrent_session(client, message, session_id):
             f"Torrent session <code>{session_id}</code> needs about "
             f"{format_bytes(required_free)} additional free space "
             f"but only {format_bytes(free)} is available. Clear space and use "
-            f"<code>/continuetorrent {session_id}</code>."
+            f"<code>/continuetorrent {session_id}</code>, or skip this part "
+            f"with <code>/skiptorrentsession {session_id}</code>."
         )
         return
 
@@ -846,21 +954,32 @@ async def _complete_torrent_session(client, message, session_id):
             gid=None,
             skipped_files=skipped,
         )
-        next_session = await torrent_session_store.activate_next_chain_part(
-            completed["_id"]
-        )
-        if next_session:
-            _start_torrent_session(client, message, next_session["_id"])
-            return True
-        chain = await torrent_session_store.list_chain(chain_id)
-        if chain and all(item.get("state") == SESSION_COMPLETED for item in chain):
-            last = chain[-1]
-            if not last.get("index_sent"):
-                await _send_torrent_chain_index(message, chain)
-                await torrent_session_store.set_state(
-                    last["_id"], SESSION_COMPLETED, index_sent=True
-                )
+        await _advance_torrent_chain(client, message, completed)
         return True
+
+
+async def _advance_torrent_chain(client, message, completed):
+    """Start the next part or publish the final index.
+
+    Callers hold the per-chain lock so a skip and an upload callback cannot
+    advance the same chain twice.
+    """
+    next_session = await torrent_session_store.activate_next_chain_part(
+        completed["_id"]
+    )
+    if next_session:
+        _start_torrent_session(client, message, next_session["_id"])
+        return next_session
+    chain_id = completed.get("chain_id") or completed["_id"]
+    chain = await torrent_session_store.list_chain(chain_id)
+    if chain and all(item.get("state") == SESSION_COMPLETED for item in chain):
+        last = chain[-1]
+        if not last.get("index_sent"):
+            await _send_torrent_chain_index(message, chain)
+            await torrent_session_store.set_state(
+                last["_id"], SESSION_COMPLETED, index_sent=True
+            )
+    return None
 
 
 def _torrent_index_lines(chain, files_by_session):
@@ -982,7 +1101,18 @@ async def _send_torrent_chain_index(message, chain):
 
 
 def _torrent_id_from_message(message):
-    return message.command[1].strip() if len(message.command) > 1 else None
+    if len(message.command) > 1:
+        return message.command[1].strip().lower()
+    reply = getattr(message, "reply_to_message", None)
+    if reply and not getattr(reply, "empty", False):
+        match = re.search(
+            r"(?:Torrent session|Torrent chain)[:\s]+([0-9a-f]{12})",
+            getattr(reply, "text", None) or getattr(reply, "caption", None) or "",
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).lower()
+    return None
 
 
 async def _resolve_owned_torrent_session(owner_id, requested_id):
@@ -1226,6 +1356,162 @@ async def _stop_torrent_session(session_doc):
 
 
 @Client.on_message(
+    filters.command(["skiptorrentsession", "skiptsession"])
+    & filters.chat(ALL_CHATS)
+)
+async def skip_torrent_session_cmd(client, message):
+    """Skip one torrent child part, clean it, and advance its chain."""
+    requested_id = _torrent_id_from_message(message)
+    session_doc = await _resolve_owned_torrent_session(
+        message.from_user.id, requested_id
+    )
+    if session_doc is None:
+        await message.reply_text(
+            "Session not found. Use "
+            "<code>/skiptorrentsession &lt;session or chain ID&gt;</code>, or "
+            "reply with <code>/skiptorrentsession</code> to a torrent-session "
+            "message."
+        )
+        return
+    if session_doc.get("state") == SESSION_COMPLETED:
+        label = (
+            "already skipped"
+            if session_doc.get("skipped_by_user")
+            else "already complete"
+        )
+        await message.reply_text(f"That torrent session is {label}.")
+        return
+
+    await _stop_torrent_session(session_doc)
+    session_id = session_doc["_id"]
+    chain_id = session_doc.get("chain_id") or session_id
+    lock = torrent_chain_locks.setdefault(chain_id, asyncio.Lock())
+    next_session = None
+    earlier_blocker = None
+    waiting_uploads = 0
+    skipped_count = 0
+    cleanup_error = None
+
+    async with lock:
+        session_doc = await torrent_session_store.get_session(
+            session_id, owner_id=message.from_user.id
+        )
+        if session_doc is None:
+            await message.reply_text("That torrent session no longer exists.")
+            return
+        if session_doc.get("state") == SESSION_COMPLETED:
+            await message.reply_text("That torrent session is already complete.")
+            return
+
+        file_docs = await torrent_session_store.list_files(session_id)
+        upload_is_live = session_id in torrent_pending_uploads
+        live_upload_ids = {
+            file_doc["_id"]
+            for file_doc in file_docs
+            if upload_is_live and file_doc.get("status") == FILE_DOWNLOADED
+        }
+        preserved_ids = live_upload_ids | {
+            file_doc["_id"]
+            for file_doc in file_docs
+            if file_doc.get("terminal_skip")
+        }
+        skipped_count = await torrent_session_store.skip_unfinished_files(
+            session_id,
+            "Torrent session skipped by user",
+            preserve_file_ids=preserved_ids,
+        )
+        waiting_uploads = len(live_upload_ids)
+
+        if waiting_uploads:
+            counts = await torrent_session_store.counts(session_id)
+            await torrent_session_store.set_state(
+                session_id,
+                SESSION_RUNNING,
+                skip_requested=True,
+                skipped_by_user=True,
+                skip_reason="Skipped by user",
+                skipped_files=counts.get(FILE_FAILED, 0),
+                gid=None,
+            )
+        else:
+            torrent_pending_uploads.discard(session_id)
+            try:
+                await _cleanup_torrent_session_directory(session_doc)
+            except OSError as error:
+                cleanup_error = str(error)
+                counts = await torrent_session_store.counts(session_id)
+                await torrent_session_store.set_state(
+                    session_id,
+                    SESSION_FAILED,
+                    skip_requested=True,
+                    skipped_by_user=True,
+                    skip_reason="Skipped by user",
+                    skipped_files=counts.get(FILE_FAILED, 0),
+                    cleanup_error=cleanup_error,
+                    gid=None,
+                )
+            else:
+                counts = await torrent_session_store.counts(session_id)
+                completed = await torrent_session_store.set_state(
+                    session_id,
+                    SESSION_COMPLETED,
+                    skip_requested=True,
+                    skipped_by_user=True,
+                    skip_reason="Skipped by user",
+                    skipped_files=counts.get(FILE_FAILED, 0),
+                    cleanup_error=None,
+                    gid=None,
+                )
+                chain = await torrent_session_store.list_chain(chain_id)
+                blockers = [
+                    item
+                    for item in chain
+                    if int(item.get("part_index") or 0)
+                    < int(completed.get("part_index") or 0)
+                    and item.get("state") != SESSION_COMPLETED
+                ]
+                earlier_blocker = blockers[0] if blockers else None
+                if earlier_blocker is None:
+                    next_session = await _advance_torrent_chain(
+                        client, message, completed
+                    )
+
+    part_index = int(session_doc.get("part_index") or 1)
+    if cleanup_error:
+        await message.reply_text(
+            f"Torrent session <code>{session_id}</code> was marked for skip, "
+            "but its local directory could not be cleared: "
+            f"{html.escape(cleanup_error)}. No later part was started. Retry "
+            f"with <code>/skiptorrentsession {session_id}</code>."
+        )
+    elif waiting_uploads:
+        await message.reply_text(
+            f"Skipping torrent session <code>{session_id}</code> (Part "
+            f"{part_index}). Downloads stopped and {skipped_count} unfinished "
+            f"file(s) were skipped. {waiting_uploads} queued Telegram upload(s) "
+            "will finish normally and clear the directory; the next eligible "
+            "part will start afterward."
+        )
+    elif earlier_blocker is not None:
+        await message.reply_text(
+            f"Skipped torrent session <code>{session_id}</code> (Part "
+            f"{part_index}) and cleared its local directory. The chain remains "
+            f"on earlier Part {earlier_blocker['part_index']}."
+        )
+    else:
+        suffix = (
+            f" Part {next_session['part_index']} started automatically."
+            if next_session is not None
+            else " No later unfinished part remains."
+        )
+        await message.reply_text(
+            f"Skipped torrent session <code>{session_id}</code> (Part "
+            f"{part_index}), marked {skipped_count} unfinished file(s) as "
+            f"skipped, and cleared its local directory.{suffix}"
+        )
+
+
+@Client.on_message(
     filters.command("deletetorrentchain") & filters.chat(ALL_CHATS)
 )
 async def delete_torrent_chain_cmd(client, message):
@@ -1281,6 +1567,7 @@ help_dict["torrent-chain"] = (
         "/torrentchains <i>[page]</i> - List persistent torrent chains\n"
         "/torrentchain <i>&lt;chain or session ID&gt;</i> - Inspect a chain\n"
         "/continuetorrent <i>&lt;chain or session ID&gt;</i> - Resume the next part\n"
+        "/skiptorrentsession <i>&lt;chain or session ID&gt;</i> - Skip and clean one part\n"
         "/deletetorrentchain <i>&lt;chain ID&gt;</i> - Delete one chain\n"
         "/deletealltorrentchains - Delete all your torrent chains"
     ),
