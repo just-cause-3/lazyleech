@@ -2347,6 +2347,7 @@ async def handle_leech(
     on_uploaded=None,
     suppress_upload_summary=False,
     suppress_download_errors=False,
+    parallel_uploads=1,
 ):
     torrent_info = await aria2_tell_status(session, gid)
     message_identifier = (reply.chat.id, reply.id)
@@ -2428,6 +2429,7 @@ async def handle_leech(
                 {
                     "on_uploaded": on_uploaded,
                     "suppress_summary": suppress_upload_summary,
+                    "parallel_files": max(1, int(parallel_uploads or 1)),
                 },
             )
         )

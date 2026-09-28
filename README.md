@@ -188,6 +188,10 @@ current part, marks every unfinished file as skipped in the final index,
 verifies its session directory was removed, and starts the next part. You may
 also reply to a torrent-session error with `/skiptorrentsession`. Files already
 queued for Telegram upload finish normally before cleanup and advancement.
+Torrent-chain parts upload up to three source files concurrently by default
+(`TORRENT_MAX_CONCURRENT_UPLOADS`). Numbered pieces share the same transfer
+limit, split preparation remains serial to preserve the calculated workspace
+peak, and successful files retain their links if a sibling upload fails.
 
 `/directdl BUNKR_URL 12GB` applies a persistent disk-workspace limit to a
 Bunkr album. The downloader probes each signed CDN file size and reserves its

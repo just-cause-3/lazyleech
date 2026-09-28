@@ -23,6 +23,103 @@ class ThumbnailValidationTests(unittest.TestCase):
 
 
 class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_torrent_job_runs_three_source_uploads_concurrently(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            source_paths = [str(Path(workdir) / f"file-{index}.bin") for index in range(4)]
+            torrent_info = {
+                "dir": workdir,
+                "files": [
+                    {"path": path, "selected": "true"} for path in source_paths
+                ],
+            }
+            message = SimpleNamespace(from_user=SimpleNamespace(id=123))
+            reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
+            three_started = asyncio.Event()
+            active = 0
+            maximum = 0
+            transfer_slots = set()
+            split_slots = set()
+
+            async def fake_upload_file(*args, **kwargs):
+                nonlocal active, maximum
+                active += 1
+                maximum = max(maximum, active)
+                transfer_slots.add(id(kwargs["transfer_semaphore"]))
+                split_slots.add(id(kwargs["split_semaphore"]))
+                if active == 3:
+                    three_started.set()
+                await three_started.wait()
+                await asyncio.sleep(0)
+                active -= 1
+                filename = args[3]
+                return upload_worker.UploadResult(
+                    [(filename, f"https://t.me/c/1/{args[7]}")], complete=True
+                )
+
+            with patch.object(
+                upload_worker, "_upload_file", side_effect=fake_upload_file
+            ):
+                result = await upload_worker._upload_worker(
+                    object(),
+                    message,
+                    reply,
+                    torrent_info,
+                    workdir,
+                    (),
+                    None,
+                    {"parallel_files": 3, "suppress_summary": True},
+                )
+
+        self.assertTrue(result.complete)
+        self.assertEqual(3, maximum)
+        self.assertEqual(1, len(transfer_slots))
+        self.assertEqual(1, len(split_slots))
+        self.assertEqual(4, len(result.source_results))
+
+    async def test_shared_transfer_limit_caps_split_parts_at_three(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tempdir:
+            parts = []
+            for index in range(4):
+                part = Path(tempdir) / f"archive.zip.{index + 1:04d}"
+                part.write_bytes(b"part")
+                parts.append((str(part), part.name))
+            active = 0
+            maximum = 0
+            three_started = asyncio.Event()
+
+            async def reply_document(_path, **_kwargs):
+                nonlocal active, maximum
+                active += 1
+                maximum = max(maximum, active)
+                if active == 3:
+                    three_started.set()
+                await three_started.wait()
+                await asyncio.sleep(0)
+                active -= 1
+                return SimpleNamespace(link=f"https://t.me/c/1/{maximum}")
+
+            message = SimpleNamespace(
+                chat=SimpleNamespace(id=-1001),
+                reply_document=reply_document,
+                reply_text=AsyncMock(),
+            )
+            with patch.object(
+                upload_worker, "update_upload_status_state", AsyncMock()
+            ):
+                result = await upload_worker._upload_split_parts(
+                    object(),
+                    message,
+                    (-1001, 55),
+                    123,
+                    parts,
+                    None,
+                    tempdir,
+                    transfer_semaphore=asyncio.Semaphore(3),
+                )
+
+        self.assertEqual(3, maximum)
+        self.assertEqual(4, len(result))
+
     async def test_parts_are_started_together_but_results_are_numerically_ordered(self):
         both_started = asyncio.Event()
         release_first = asyncio.Event()

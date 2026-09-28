@@ -62,6 +62,12 @@ except (TypeError, ValueError):
 TORRENT_WORKSPACE_RESERVE_BYTES = _workspace_reserve_mb * 1024**2
 TORRENT_CHAIN_PAGE_SIZE = 5
 TORRENT_PLAN_PAGE_SIZE = 10
+try:
+    TORRENT_MAX_CONCURRENT_UPLOADS = max(
+        1, int(os.environ.get("TORRENT_MAX_CONCURRENT_UPLOADS", "3"))
+    )
+except (TypeError, ValueError):
+    TORRENT_MAX_CONCURRENT_UPLOADS = 3
 
 torrent_session_tasks = {}
 torrent_chain_locks = {}
@@ -713,29 +719,8 @@ def _valid_telegram_link(value):
 def _map_torrent_uploads(file_docs, sent_files):
     source_results = list(getattr(sent_files, "source_results", None) or [])
     if source_results:
-        by_relative_path = {
-            str(item.get("relative_path") or item["filename"])
-            .replace("\\", "/")
-            .strip("/"): item
-            for item in file_docs
-        }
-        mapped = {}
-        for result in source_results:
-            relative_name = str(result.get("relative_name") or "")
-            relative_name = relative_name.replace("\\", "/").strip("/")
-            file_doc = by_relative_path.get(relative_name)
-            if file_doc is None or not result.get("complete"):
-                return None
-            uploads = [
-                {"name": str(name), "link": _valid_telegram_link(link)}
-                for name, link in result.get("uploads") or []
-            ]
-            if not uploads or any(not upload["link"] for upload in uploads):
-                return None
-            mapped[file_doc["_id"]] = uploads
-        if len(mapped) != len(file_docs):
-            return None
-        return mapped
+        mapped = _map_successful_torrent_uploads(file_docs, sent_files)
+        return mapped if len(mapped) == len(file_docs) else None
 
     links = [
         {"name": str(name), "link": _valid_telegram_link(link)}
@@ -756,6 +741,35 @@ def _map_torrent_uploads(file_docs, sent_files):
     if offset != len(links) or any(not value for value in mapped.values()):
         return None
     return mapped
+
+
+def _map_successful_torrent_uploads(file_docs, sent_files):
+    """Map every independently successful source, even if siblings failed."""
+    source_results = list(getattr(sent_files, "source_results", None) or [])
+    if source_results:
+        by_relative_path = {
+            str(item.get("relative_path") or item["filename"])
+            .replace("\\", "/")
+            .strip("/"): item
+            for item in file_docs
+        }
+        mapped = {}
+        for result in source_results:
+            relative_name = str(result.get("relative_name") or "")
+            relative_name = relative_name.replace("\\", "/").strip("/")
+            file_doc = by_relative_path.get(relative_name)
+            if file_doc is None or not result.get("complete"):
+                continue
+            uploads = [
+                {"name": str(name), "link": _valid_telegram_link(link)}
+                for name, link in result.get("uploads") or []
+            ]
+            if not uploads or any(not upload["link"] for upload in uploads):
+                continue
+            mapped[file_doc["_id"]] = uploads
+        return mapped
+    complete_mapping = _map_torrent_uploads(file_docs, sent_files)
+    return complete_mapping or {}
 
 
 async def _mark_torrent_files(file_docs, status, **fields):
@@ -803,6 +817,19 @@ async def _run_torrent_session(client, message, session_id):
         and not item.get("terminal_skip")
     ]
     if not unfinished:
+        try:
+            await _cleanup_torrent_session_directory(session_doc)
+        except OSError as error:
+            await torrent_session_store.set_state(
+                session_id, SESSION_FAILED, cleanup_error=str(error)
+            )
+            await message.reply_text(
+                f"Torrent session <code>{session_id}</code> uploaded its files "
+                "but local cleanup is incomplete: "
+                f"{html.escape(str(error))}. Retry with "
+                f"<code>/continuetorrent {session_id}</code>."
+            )
+            return
         await _complete_torrent_session(client, message, session_id)
         return
 
@@ -857,16 +884,32 @@ async def _run_torrent_session(client, message, session_id):
 
         async def on_uploaded(sent_files, upload_error):
             torrent_pending_uploads.discard(session_id)
-            mapped = _map_torrent_uploads(unfinished, sent_files)
+            mapped = _map_successful_torrent_uploads(unfinished, sent_files)
             complete = bool(getattr(sent_files, "complete", False))
-            if upload_error or not complete or mapped is None:
+            for file_doc in unfinished:
+                if file_doc["_id"] not in mapped:
+                    continue
+                await torrent_session_store.update_file(
+                    file_doc["_id"],
+                    FILE_UPLOADED,
+                    gid=None,
+                    error=None,
+                    telegram_files=mapped[file_doc["_id"]],
+                )
+            failed_files = [
+                file_doc
+                for file_doc in unfinished
+                if file_doc["_id"] not in mapped
+            ]
+            if upload_error or not complete or failed_files:
                 reason = upload_error or (
                     "Telegram upload did not return the expected links "
                     f"({len(sent_files)} result(s))"
                 )
-                await _mark_torrent_files(
-                    unfinished, FILE_FAILED, gid=None, error=str(reason)
-                )
+                if failed_files:
+                    await _mark_torrent_files(
+                        failed_files, FILE_FAILED, gid=None, error=str(reason)
+                    )
                 await torrent_session_store.set_state(
                     session_id, SESSION_FAILED, gid=None
                 )
@@ -876,14 +919,6 @@ async def _run_torrent_session(client, message, session_id):
                     f"<code>/continuetorrent {session_id}</code>."
                 )
                 return
-            for file_doc in unfinished:
-                await torrent_session_store.update_file(
-                    file_doc["_id"],
-                    FILE_UPLOADED,
-                    gid=None,
-                    error=None,
-                    telegram_files=mapped[file_doc["_id"]],
-                )
             await _complete_torrent_session(client, message, session_id)
 
         result = await handle_leech(
@@ -897,6 +932,7 @@ async def _run_torrent_session(client, message, session_id):
             on_downloaded=on_downloaded,
             on_uploaded=on_uploaded,
             suppress_upload_summary=True,
+            parallel_uploads=TORRENT_MAX_CONCURRENT_UPLOADS,
         )
         if result != "complete":
             await _mark_torrent_files(

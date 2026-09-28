@@ -197,6 +197,33 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
         self.assertEqual(3, len(mapped["s:1"]))
         self.assertEqual("https://t.me/c/1/4", mapped["s:2"][0]["link"])
 
+    def test_partial_parallel_upload_keeps_each_successful_source_mapping(self):
+        files = [
+            {"_id": "s:1", **torrent_file(1, "root/one.bin", 10)},
+            {"_id": "s:2", **torrent_file(2, "root/two.bin", 10)},
+        ]
+        sent = UploadResult(
+            [("one.bin", "https://t.me/c/1/1")],
+            complete=False,
+            source_results=[
+                {
+                    "relative_name": "root/one.bin",
+                    "complete": True,
+                    "uploads": [("one.bin", "https://t.me/c/1/1")],
+                },
+                {
+                    "relative_name": "root/two.bin",
+                    "complete": False,
+                    "uploads": [],
+                },
+            ],
+        )
+
+        mapped = torrent_chain._map_successful_torrent_uploads(files, sent)
+
+        self.assertEqual(["s:1"], list(mapped))
+        self.assertEqual("https://t.me/c/1/1", mapped["s:1"][0]["link"])
+
     def test_torrent_payload_validation_rejects_truncated_metadata(self):
         with self.assertRaisesRegex(ValueError, "Invalid or truncated"):
             torrent_chain._validate_torrent_payload(b"d4:infod4:name4:teste")
@@ -644,7 +671,7 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(torrent_chain, "aria2_unpause", AsyncMock()),
                     patch.object(
                         torrent_chain, "handle_leech", side_effect=finish_upload
-                    ),
+                    ) as handle_leech,
                 ):
                     await torrent_chain._run_torrent_session(
                         None, message, session_doc["_id"]
@@ -654,6 +681,9 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
             torrent_chain.torrent_session_store = original_store
 
         self.assertEqual([4, 9], add_torrent.await_args.kwargs["selected_files"])
+        self.assertEqual(
+            3, handle_leech.await_args.kwargs["parallel_uploads"]
+        )
         updated = await store.get_session(session_doc["_id"])
         self.assertEqual("completed", updated["state"])
         files = await store.list_files(session_doc["_id"])
@@ -663,6 +693,114 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(files[2]["terminal_skip"])
         self.assertEqual("https://t.me/c/1/1", files[0]["telegram_files"][0]["link"])
+
+    async def test_partial_parallel_upload_retries_only_failed_source(self):
+        store = TorrentSessionStore(db_url="")
+        session_doc = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=77,
+            source_url="telegram:example.torrent",
+            title="Example (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": "telegram:example.torrent",
+                    "filename": "one.bin",
+                    "relative_path": "Example/one.bin",
+                    "torrent_index": 1,
+                    "size_bytes": 10,
+                },
+                {
+                    "page_url": "telegram:example.torrent",
+                    "filename": "two.bin",
+                    "relative_path": "Example/two.bin",
+                    "torrent_index": 2,
+                    "size_bytes": 10,
+                },
+            ],
+            session_fields={
+                "chain_id": "partialchain",
+                "name": "Example",
+                "part_index": 1,
+                "total_parts": 1,
+                "workspace_bytes": GIB,
+                "peak_workspace_bytes": 20,
+            },
+        )
+        await store.create_chain(
+            chain_id="partialchain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=77,
+            source_url="telegram:example.torrent",
+            name="Example",
+            mode="normal",
+            total_parts=1,
+            total_files=2,
+            session_ids=[session_doc["_id"]],
+            chain_fields={"torrent_data": b"torrent"},
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+
+        async def partial_upload(*_args, **kwargs):
+            await kwargs["on_downloaded"]()
+            sent = UploadResult(
+                [("one.bin", "https://t.me/c/1/1")],
+                complete=False,
+                source_results=[
+                    {
+                        "relative_name": "Example/one.bin",
+                        "complete": True,
+                        "uploads": [("one.bin", "https://t.me/c/1/1")],
+                    },
+                    {
+                        "relative_name": "Example/two.bin",
+                        "complete": False,
+                        "uploads": [],
+                    },
+                ],
+            )
+            await kwargs["on_uploaded"](sent, None)
+            return "complete"
+
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        torrent_chain.torrent_chain_locks.clear()
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                with (
+                    patch.object(torrent_chain.os, "getcwd", return_value=workdir),
+                    patch.object(
+                        torrent_chain,
+                        "aria2_add_torrent",
+                        AsyncMock(return_value="gid"),
+                    ),
+                    patch.object(torrent_chain, "aria2_unpause", AsyncMock()),
+                    patch.object(
+                        torrent_chain, "handle_leech", side_effect=partial_upload
+                    ),
+                ):
+                    await torrent_chain._run_torrent_session(
+                        None, message, session_doc["_id"]
+                    )
+        finally:
+            torrent_chain.torrent_session_store = original_store
+
+        failed_session = await store.get_session(session_doc["_id"])
+        self.assertEqual(SESSION_FAILED, failed_session["state"])
+        files = await store.list_files(session_doc["_id"])
+        self.assertEqual([FILE_UPLOADED, FILE_FAILED], [item["status"] for item in files])
+        self.assertEqual("https://t.me/c/1/1", files[0]["telegram_files"][0]["link"])
+
+        await store.prepare_continue(session_doc["_id"], -1001, 88)
+        files = await store.list_files(session_doc["_id"])
+        self.assertEqual([FILE_UPLOADED, "pending"], [item["status"] for item in files])
 
     async def test_creation_persists_raw_torrent_and_queues_later_parts(self):
         store = TorrentSessionStore(db_url="")

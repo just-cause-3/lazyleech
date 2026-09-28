@@ -284,6 +284,12 @@ async def _upload_worker(
     sent_files = []
     source_results = []
     upload_complete = True
+    try:
+        parallel_files = max(
+            1, int((upload_options or {}).get("parallel_files") or 1)
+        )
+    except (TypeError, ValueError):
+        parallel_files = 1
 
     with tempfile.TemporaryDirectory(dir=str(user_id)) as zip_tempdir:
         if SendAsZipFlag in flags:
@@ -344,22 +350,58 @@ async def _upload_worker(
                         or filename
                     )
                 files[filepath] = filename
-        fcount = 0
-        for filepath in natsorted(files):
-            fcount += 1
-            remove_upload_status((reply.chat.id, reply.id))
-            uploaded = await _upload_file(
-                client,
-                message,
-                reply,
-                files[filepath],
-                filepath,
-                ForceDocumentFlag in flags,
-                newFile,
-                fcount,
-                cleanup_source=SendAsZipFlag not in flags,
-                download_root=torrent_info.get("dir"),
-            )
+        ordered_paths = natsorted(files)
+        if SendAsZipFlag in flags:
+            parallel_files = 1
+        file_slots = asyncio.Semaphore(parallel_files)
+        transfer_slots = (
+            asyncio.Semaphore(parallel_files) if parallel_files > 1 else None
+        )
+        # Telegram split staging can temporarily duplicate a large source.
+        # Keep preparation serial so the planner's source-total + largest-copy
+        # peak remains valid even while transfers themselves run in parallel.
+        split_slots = asyncio.Semaphore(1) if parallel_files > 1 else None
+
+        async def upload_source(source_index, filepath):
+            async with file_slots:
+                remove_upload_status((reply.chat.id, reply.id))
+                try:
+                    uploaded = await _upload_file(
+                        client,
+                        message,
+                        reply,
+                        files[filepath],
+                        filepath,
+                        ForceDocumentFlag in flags,
+                        newFile,
+                        source_index + 1,
+                        cleanup_source=SendAsZipFlag not in flags,
+                        download_root=torrent_info.get("dir"),
+                        transfer_semaphore=transfer_slots,
+                        split_semaphore=split_slots,
+                    )
+                except Exception:
+                    # One source must not cancel successful sibling uploads.
+                    # Its incomplete source result lets a persistent session
+                    # retry only this file while retaining sibling links.
+                    logging.exception("Source upload failed: %s", filepath)
+                    uploaded = UploadResult([], complete=False)
+                return source_index, filepath, uploaded
+
+        tasks = [
+            asyncio.create_task(upload_source(source_index, filepath))
+            for source_index, filepath in enumerate(ordered_paths)
+        ]
+        try:
+            source_uploads = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        for _source_index, filepath, uploaded in sorted(source_uploads):
             sent_files.extend(uploaded)
             source_results.append(
                 {
@@ -431,6 +473,8 @@ async def _upload_file(
     count,
     cleanup_source=False,
     download_root=None,
+    transfer_semaphore=None,
+    split_semaphore=None,
 ):
     if not os.path.getsize(filepath):
         return UploadResult([(os.path.basename(filename), None)], complete=False)
@@ -488,11 +532,26 @@ async def _upload_file(
             if file_has_big:
 
                 async def _split_files():
-                    splitted = await split_files(filepath, tempdir, force_document)
-                    for split in splitted:
-                        # Use the physical part name for the Telegram document,
-                        # caption, progress board, and final link summary.
-                        to_upload.append((split, os.path.basename(split)))
+                    async def prepare_parts():
+                        splitted = await split_files(
+                            filepath, tempdir, force_document
+                        )
+                        for split in splitted:
+                            # Use the physical part name for the Telegram document,
+                            # caption, progress board, and final link summary.
+                            to_upload.append((split, os.path.basename(split)))
+                        if to_upload and cleanup_source and download_root:
+                            await _remove_source_file(
+                                source_filepath,
+                                download_root,
+                                lifecycle="successfully split and queued",
+                            )
+
+                    if split_semaphore is None:
+                        await prepare_parts()
+                    else:
+                        async with split_semaphore:
+                            await prepare_parts()
 
                 split_task = asyncio.create_task(_split_files())
             else:
@@ -539,16 +598,9 @@ async def _upload_file(
             if upload_identifier in stop_uploads:
                 return UploadResult(sent_files, complete=False)
             if file_has_big:
-                # Every numbered part now exists and is ready to upload. Release
-                # the source before starting Telegram transfers so only the
-                # staged parts occupy workspace while they are queued/uploading.
-                # A failed split never reaches this point and retains its source.
-                if cleanup_source and download_root:
-                    await _remove_source_file(
-                        source_filepath,
-                        download_root,
-                        lifecycle="successfully split and queued",
-                    )
+                # Every numbered part now exists and the source was released
+                # inside the serialized preparation section. A failed split
+                # never reaches that cleanup and therefore retains its source.
                 # The placeholder represents the split operation. Each part
                 # gets its own status/cancel ID once all parts are ready.
                 remove_upload_status(upload_identifier)
@@ -557,17 +609,23 @@ async def _upload_file(
                 thumbnail = None
                 for candidate in (user_thumbnail, user_watermarked_thumbnail):
                     thumbnail = _usable_thumbnail(candidate) or thumbnail
-                sent_files.extend(
-                    await _upload_split_parts(
-                        client,
-                        message,
-                        worker_identifier,
-                        user_id,
-                        to_upload,
-                        thumbnail,
-                        tempdir,
-                    )
+                split_upload_args = (
+                    client,
+                    message,
+                    worker_identifier,
+                    user_id,
+                    to_upload,
+                    thumbnail,
+                    tempdir,
                 )
+                if transfer_semaphore is None:
+                    split_uploads = await _upload_split_parts(*split_upload_args)
+                else:
+                    split_uploads = await _upload_split_parts(
+                        *split_upload_args,
+                        transfer_semaphore=transfer_semaphore,
+                    )
+                sent_files.extend(split_uploads)
                 upload_complete = (
                     len(sent_files) == len(to_upload)
                     and all(link for _, link in sent_files)
@@ -636,27 +694,41 @@ async def _upload_file(
                             else:
                                 width = height = 0
                             thumbnail = _usable_thumbnail(thumbnail)
-                            resp = await message.reply_video(
-                                filepath,
-                                thumb=thumbnail,
-                                caption=filename,
-                                duration=duration,
-                                width=width,
-                                height=height,
-                                parse_mode=None,
-                                progress=progress_callback,
-                                progress_args=progress_args,
-                            )
+                            async def send_video():
+                                return await message.reply_video(
+                                    filepath,
+                                    thumb=thumbnail,
+                                    caption=filename,
+                                    duration=duration,
+                                    width=width,
+                                    height=height,
+                                    parse_mode=None,
+                                    progress=progress_callback,
+                                    progress_args=progress_args,
+                                )
+
+                            if transfer_semaphore is None:
+                                resp = await send_video()
+                            else:
+                                async with transfer_semaphore:
+                                    resp = await send_video()
                         else:
                             thumbnail = _usable_thumbnail(thumbnail)
-                            resp = await message.reply_document(
-                                filepath,
-                                thumb=thumbnail,
-                                caption=filename,
-                                parse_mode=None,
-                                progress=progress_callback,
-                                progress_args=progress_args,
-                            )
+                            async def send_document():
+                                return await message.reply_document(
+                                    filepath,
+                                    thumb=thumbnail,
+                                    caption=filename,
+                                    parse_mode=None,
+                                    progress=progress_callback,
+                                    progress_args=progress_args,
+                                )
+
+                            if transfer_semaphore is None:
+                                resp = await send_document()
+                            else:
+                                async with transfer_semaphore:
+                                    resp = await send_document()
                     except StopTransmission:
                         resp = None
                     except Exception:
@@ -726,6 +798,7 @@ async def _upload_split_part(
     filename,
     thumbnail,
     tempdir,
+    transfer_semaphore=None,
 ):
     """Upload one numbered part and free that part as soon as Telegram accepts it."""
     upload_identifier = _new_upload_identifier(message.chat.id)
@@ -743,20 +816,27 @@ async def _upload_split_part(
         if upload_identifier in stop_uploads:
             return None
         try:
-            response = await message.reply_document(
-                filepath,
-                thumb=_usable_thumbnail(thumbnail),
-                caption=filename,
-                parse_mode=None,
-                progress=progress_callback,
-                progress_args=(
-                    client,
-                    message,
-                    upload_identifier,
-                    filename,
-                    user_id,
-                ),
-            )
+            async def send_document():
+                return await message.reply_document(
+                    filepath,
+                    thumb=_usable_thumbnail(thumbnail),
+                    caption=filename,
+                    parse_mode=None,
+                    progress=progress_callback,
+                    progress_args=(
+                        client,
+                        message,
+                        upload_identifier,
+                        filename,
+                        user_id,
+                    ),
+                )
+
+            if transfer_semaphore is None:
+                response = await send_document()
+            else:
+                async with transfer_semaphore:
+                    response = await send_document()
         except StopTransmission:
             return None
         except Exception:
@@ -788,11 +868,12 @@ async def _upload_split_parts(
     to_upload,
     thumbnail,
     tempdir,
+    transfer_semaphore=None,
 ):
     """Make every split part eligible together and return links in part order."""
 
     async def upload_indexed(part_index, part_path, part_name):
-        result = await _upload_split_part(
+        args = (
             client,
             message,
             worker_identifier,
@@ -802,6 +883,12 @@ async def _upload_split_parts(
             thumbnail,
             tempdir,
         )
+        if transfer_semaphore is None:
+            result = await _upload_split_part(*args)
+        else:
+            result = await _upload_split_part(
+                *args, transfer_semaphore=transfer_semaphore
+            )
         return part_index, result
 
     results = await asyncio.gather(
