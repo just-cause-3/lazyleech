@@ -1355,6 +1355,35 @@ async def _stop_torrent_session(session_doc):
             pass
 
 
+async def _delete_owned_torrent_chain(chain_doc):
+    """Stop and clean every child before deleting persistent chain history."""
+    chain_id = str(chain_doc["_id"])
+    owner_id = int(chain_doc["owner_id"])
+    children = await torrent_session_store.list_chain(chain_id)
+    for child in children:
+        await _stop_torrent_session(child)
+
+    lock = torrent_chain_locks.setdefault(chain_id, asyncio.Lock())
+    cleanup_errors = []
+    result = None
+    async with lock:
+        for child in children:
+            torrent_pending_uploads.discard(child["_id"])
+            try:
+                await _cleanup_torrent_session_directory(child)
+            except OSError as error:
+                cleanup_errors.append(
+                    f"{child['_id']}: {str(error)}"
+                )
+        if not cleanup_errors:
+            result = await torrent_session_store.delete_chain_tree(
+                chain_id, owner_id
+            )
+    if not cleanup_errors:
+        torrent_chain_locks.pop(chain_id, None)
+    return result, cleanup_errors
+
+
 @Client.on_message(
     filters.command(["skiptorrentsession", "skiptsession"])
     & filters.chat(ALL_CHATS)
@@ -1530,11 +1559,15 @@ async def delete_torrent_chain_cmd(client, message):
     if not chain_doc:
         await message.reply_text("Torrent chain not found.")
         return
-    for child in await torrent_session_store.list_chain(chain_id):
-        await _stop_torrent_session(child)
-    result = await torrent_session_store.delete_chain_tree(
-        chain_id, message.from_user.id
-    )
+    result, cleanup_errors = await _delete_owned_torrent_chain(chain_doc)
+    if cleanup_errors:
+        await message.reply_text(
+            f"Could not delete torrent chain <code>{chain_id}</code> because "
+            "some local session data could not be cleared. Its MongoDB history "
+            "was retained so deletion can be retried.\n\n"
+            + html.escape("\n".join(cleanup_errors[:5]))
+        )
+        return
     await message.reply_text(
         f"Deleted torrent chain <code>{chain_id}</code> and "
         f"{result['deleted_sessions']} child session(s)."
@@ -1548,13 +1581,25 @@ async def delete_all_torrent_chains_cmd(client, message):
     chains = await torrent_session_store.list_chains(
         owner_id=message.from_user.id, limit=0
     )
+    deleted_chains = 0
+    deleted_sessions = 0
+    failed_chains = []
     for chain_doc in chains:
-        for child in await torrent_session_store.list_chain(chain_doc["_id"]):
-            await _stop_torrent_session(child)
-    result = await torrent_session_store.delete_all_for_owner(message.from_user.id)
+        result, cleanup_errors = await _delete_owned_torrent_chain(chain_doc)
+        if cleanup_errors or result is None:
+            failed_chains.append(chain_doc["_id"])
+            continue
+        deleted_chains += 1
+        deleted_sessions += int(result["deleted_sessions"])
+    failure_text = (
+        f" {len(failed_chains)} chain(s) were retained because local cleanup "
+        "failed: " + ", ".join(failed_chains[:5]) + "."
+        if failed_chains
+        else ""
+    )
     await message.reply_text(
-        f"Deleted {result['deleted_chains']} torrent chain(s) and "
-        f"{result['deleted_sessions']} child session(s)."
+        f"Deleted {deleted_chains} torrent chain(s) and "
+        f"{deleted_sessions} child session(s)." + failure_text
     )
 
 

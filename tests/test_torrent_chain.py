@@ -467,6 +467,76 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         callback.answer.assert_awaited_once_with()
 
+    async def test_delete_chain_cleans_every_child_before_database_history(self):
+        store = TorrentSessionStore(db_url="")
+        sessions = await self._two_part_chain(store)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            command=["deletetorrentchain", "abc123def456"],
+            reply_to_message=None,
+            reply_text=AsyncMock(),
+        )
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        torrent_chain.torrent_chain_locks.clear()
+        torrent_chain.torrent_pending_uploads.clear()
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                session_dirs = []
+                for session_doc in sessions:
+                    session_dir = (
+                        Path(workdir)
+                        / "123"
+                        / "torrent_sessions"
+                        / session_doc["_id"]
+                    )
+                    session_dir.mkdir(parents=True)
+                    (session_dir / "partial.bin").write_bytes(b"partial")
+                    session_dirs.append(session_dir)
+                with (
+                    patch.object(torrent_chain.os, "getcwd", return_value=workdir),
+                    patch.object(
+                        torrent_chain, "_stop_torrent_session", AsyncMock()
+                    ),
+                ):
+                    await torrent_chain.delete_torrent_chain_cmd(None, message)
+                self.assertTrue(all(not path.exists() for path in session_dirs))
+        finally:
+            torrent_chain.torrent_session_store = original_store
+            torrent_chain.torrent_pending_uploads.clear()
+
+        self.assertIsNone(await store.get_chain("abc123def456", owner_id=123))
+        self.assertIsNone(await store.get_session(sessions[0]["_id"]))
+        self.assertIn("Deleted torrent chain", message.reply_text.await_args.args[0])
+
+    async def test_delete_chain_retains_history_when_cleanup_fails(self):
+        store = TorrentSessionStore(db_url="")
+        await self._two_part_chain(store)
+        chain_doc = await store.get_chain("abc123def456", owner_id=123)
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        torrent_chain.torrent_chain_locks.clear()
+        try:
+            with (
+                patch.object(torrent_chain, "_stop_torrent_session", AsyncMock()),
+                patch.object(
+                    torrent_chain,
+                    "_cleanup_torrent_session_directory",
+                    AsyncMock(side_effect=OSError("busy")),
+                ),
+            ):
+                result, errors = await torrent_chain._delete_owned_torrent_chain(
+                    chain_doc
+                )
+        finally:
+            torrent_chain.torrent_session_store = original_store
+
+        self.assertIsNone(result)
+        self.assertTrue(errors)
+        self.assertIsNotNone(
+            await store.get_chain("abc123def456", owner_id=123)
+        )
+
     async def test_runner_selects_only_part_files_and_persists_upload_links(self):
         store = TorrentSessionStore(db_url="")
         session_doc = await store.create_session(
