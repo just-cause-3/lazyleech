@@ -1,5 +1,4 @@
 import importlib.util
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +9,7 @@ SPEC = importlib.util.spec_from_file_location("_test_file_cleanup", MODULE_PATH)
 FILE_CLEANUP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FILE_CLEANUP)
 remove_uploaded_source = FILE_CLEANUP.remove_uploaded_source
-clear_abandoned_download_directories = (
-    FILE_CLEANUP.clear_abandoned_download_directories
-)
+clear_abandoned_download_directories = FILE_CLEANUP.clear_abandoned_download_directories
 
 
 class UploadedSourceCleanupTests(unittest.TestCase):
@@ -54,6 +51,7 @@ class StartupDownloadCleanupTests(unittest.TestCase):
                 user_root / "1788426579.8072455",
                 user_root / "bunkr_sessions",
                 user_root / "terabox_sessions",
+                user_root / "torrent_sessions",
                 user_root / "tmpabcd1234",
             ]
             for directory in removable:
@@ -69,9 +67,7 @@ class StartupDownloadCleanupTests(unittest.TestCase):
 
             removed = clear_abandoned_download_directories(str(root))
 
-            self.assertEqual(
-                {str(path.resolve()) for path in removable}, set(removed)
-            )
+            self.assertEqual({str(path.resolve()) for path in removable}, set(removed))
             for directory in removable:
                 self.assertFalse(directory.exists())
             self.assertTrue(thumbnail.exists())

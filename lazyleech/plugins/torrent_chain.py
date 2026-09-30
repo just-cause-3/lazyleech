@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import logging
 import os
 import re
 import shutil
@@ -24,7 +25,9 @@ from .. import (
 from ..utils.aria2 import (
     Aria2Error,
     aria2_add_torrent,
+    aria2_pause,
     aria2_remove,
+    aria2_remove_result,
     aria2_tell_status,
     aria2_unpause,
 )
@@ -72,6 +75,14 @@ except (TypeError, ValueError):
 torrent_session_tasks = {}
 torrent_chain_locks = {}
 torrent_pending_uploads = set()
+TORRENT_PREFETCH_RELEASE_BYTES = 2 * 1024**3
+# Admission, cancellation and handoff share this lock. Reservations cover the
+# entire possible write, not just the bytes already downloaded.
+torrent_pipeline_lock = asyncio.Lock()
+torrent_workspace_reservations = {}
+torrent_prefetch_tasks = {}
+torrent_prefetch_disabled = set()
+torrent_prefetch_contexts = {}
 
 
 def _torrent_file_split_extra(size_bytes):
@@ -159,10 +170,13 @@ def _torrent_metadata_files(torrent_info):
 
 
 def _torrent_title(torrent_info):
-    return str(
-        ((torrent_info.get("bittorrent") or {}).get("info") or {}).get("name")
+    return (
+        str(
+            ((torrent_info.get("bittorrent") or {}).get("info") or {}).get("name")
+            or "Torrent"
+        ).strip()
         or "Torrent"
-    ).strip() or "Torrent"
+    )
 
 
 async def _remove_torrent_gid(gid, *, cleanup=False):
@@ -178,12 +192,16 @@ async def _remove_torrent_gid(gid, *, cleanup=False):
         await aria2_remove(session, gid)
     except Aria2Error:
         pass
+    try:
+        await aria2_remove_result(session, gid)
+    except Aria2Error:
+        pass
     if cleanup and directory and os.path.isdir(directory):
         await asyncio.to_thread(shutil.rmtree, directory, True)
 
 
 async def _inspect_torrent_bytes(owner_id, torrent_data):
-    owner_dir = os.path.join(os.getcwd(), str(int(owner_id)))
+    owner_dir = os.path.join(_torrent_workspace_root(), str(int(owner_id)))
     os.makedirs(owner_dir, exist_ok=True)
     metadata_dir = tempfile.mkdtemp(prefix="torrent-metadata-", dir=owner_dir)
     fd, torrent_path = tempfile.mkstemp(suffix=".torrent", dir=owner_dir)
@@ -198,6 +216,7 @@ async def _inspect_torrent_bytes(owner_id, torrent_data):
             LEECH_TIMEOUT,
             pause=True,
             download_dir=metadata_dir,
+            file_allocation="none",
         )
         torrent_info = await aria2_tell_status(session, gid)
         files = _torrent_metadata_files(torrent_info)
@@ -230,6 +249,7 @@ def _validate_torrent_payload(data):
         raise ValueError("The torrent file is empty")
     data = bytes(data)
     top_level_keys = set()
+    piece_length = 0
 
     def parse_bytes(position):
         colon = data.find(b":", position)
@@ -248,6 +268,7 @@ def _validate_torrent_payload(data):
         return end, data[colon + 1 : end]
 
     def parse_value(position, depth=0):
+        nonlocal piece_length
         if position >= len(data):
             raise ValueError("truncated value")
         marker = data[position]
@@ -286,6 +307,15 @@ def _validate_torrent_payload(data):
                 position, key = parse_bytes(position)
                 if depth == 0:
                     top_level_keys.add(key)
+                if (
+                    depth == 1
+                    and key == b"piece length"
+                    and data[position : position + 1] == b"i"
+                ):
+                    integer_end = data.find(b"e", position + 1)
+                    piece_length = max(
+                        piece_length, int(data[position + 1 : integer_end])
+                    )
                 position = parse_value(position, depth + 1)
             if position >= len(data):
                 raise ValueError("unterminated dictionary")
@@ -307,6 +337,7 @@ def _validate_torrent_payload(data):
                 "Torrent URL returned an HTML page instead of a .torrent file"
             ) from error
         raise ValueError(f"Invalid or truncated torrent metadata: {error}") from error
+    return piece_length
 
 
 async def _read_torrent_response(response):
@@ -465,9 +496,7 @@ async def _create_torrent_chain(message, torrent_data, source_url, workspace_byt
                         error=skipped["skip_reason"],
                         terminal_skip=True,
                         workspace_skip=True,
-                        required_workspace_bytes=skipped[
-                            "required_workspace_bytes"
-                        ],
+                        required_workspace_bytes=skipped["required_workspace_bytes"],
                     )
         await torrent_session_store.create_chain(
             chain_id=chain_id,
@@ -513,7 +542,7 @@ def _torrent_plan_page(chain_doc, sessions, requested_page=1):
         f"<b>Name:</b> {html.escape(title)}",
         f"<b>Workspace:</b> {format_bytes(workspace_bytes)}",
         f"<b>Files:</b> {total_files} | <b>Skipped:</b> {skipped_files}",
-        f"<b>Parts:</b> {len(sessions)} (automatic, sequential)",
+        f"<b>Parts:</b> {len(sessions)} (automatic; download/upload overlap)",
         f"<b>Page:</b> {page}/{total_pages}",
         "",
     ]
@@ -532,9 +561,9 @@ def _torrent_plan_page(chain_doc, sessions, requested_page=1):
             SESSION_COMPLETED: "completed",
             SESSION_FAILED: "stopped",
         }.get(item.get("state"), str(item.get("state") or "unknown"))
-        downloadable = int(
-            item.get("downloadable_files", item.get("total_files") or 0)
-        )
+        if item.get("prefetch_active") and item["_id"] in torrent_prefetch_tasks:
+            state = "prefetch: " + str(item.get("prefetch_phase") or "waiting")
+        downloadable = int(item.get("downloadable_files", item.get("total_files") or 0))
         skipped = int(item.get("skipped_files") or 0)
         file_summary = f"{downloadable} downloadable file(s)"
         if skipped:
@@ -573,9 +602,7 @@ def _torrent_plan_page(chain_doc, sessions, requested_page=1):
 
 
 async def _stored_torrent_plan_page(owner_id, chain_id, requested_page):
-    chain_doc = await torrent_session_store.get_chain(
-        chain_id, owner_id=owner_id
-    )
+    chain_doc = await torrent_session_store.get_chain(chain_id, owner_id=owner_id)
     if chain_doc is None:
         return None, None
     sessions = await torrent_session_store.list_chain(chain_id)
@@ -583,8 +610,7 @@ async def _stored_torrent_plan_page(owner_id, chain_id, requested_page):
 
 
 @Client.on_message(
-    filters.command(["splittorrent", "splitfiletorrent"])
-    & filters.chat(ALL_CHATS)
+    filters.command(["splittorrent", "splitfiletorrent"]) & filters.chat(ALL_CHATS)
 )
 async def split_torrent_cmd(client, message):
     try:
@@ -611,9 +637,7 @@ async def split_torrent_cmd(client, message):
     _start_torrent_session(client, message, sessions[0]["_id"])
 
 
-@Client.on_callback_query(
-    filters.regex(r"^torrentplan_page:\d+:[A-Za-z0-9_-]+:\d+$")
-)
+@Client.on_callback_query(filters.regex(r"^torrentplan_page:\d+:[A-Za-z0-9_-]+:\d+$"))
 async def torrent_chain_plan_page_callback(client, callback_query):
     _, owner_text, chain_id, page_text = callback_query.data.split(":", 3)
     owner_id = int(owner_text)
@@ -642,25 +666,46 @@ async def torrent_chain_plan_page_callback(client, callback_query):
     await callback_query.answer()
 
 
-def _torrent_download_dir(session_doc):
+def _torrent_workspace_root():
+    configured = str(os.environ.get("TORRENT_DOWNLOAD_ROOT") or "").strip()
+    return os.path.abspath(configured or os.path.join(os.getcwd(), "downloads"))
+
+
+def _torrent_owner_root(session_doc):
     return os.path.join(
-        os.getcwd(),
+        _torrent_workspace_root(),
         str(int(session_doc["owner_id"])),
         "torrent_sessions",
-        str(session_doc["_id"]),
     )
 
 
-async def _cleanup_torrent_session_directory(session_doc):
-    """Delete only this session's verified workspace directory."""
-    owner_root = os.path.abspath(
+def _legacy_torrent_owner_root(session_doc):
+    return os.path.abspath(
         os.path.join(
             os.getcwd(),
             str(int(session_doc["owner_id"])),
             "torrent_sessions",
         )
     )
-    target = os.path.abspath(_torrent_download_dir(session_doc))
+
+
+def _torrent_download_dir(session_doc):
+    return os.path.join(
+        _torrent_owner_root(session_doc),
+        str(session_doc["_id"]),
+    )
+
+
+def _legacy_torrent_download_dir(session_doc):
+    return os.path.join(
+        _legacy_torrent_owner_root(session_doc), str(session_doc["_id"])
+    )
+
+
+async def _cleanup_exact_torrent_directory(target, owner_root):
+    """Delete one verified session directory, never its owner/root."""
+    owner_root = os.path.abspath(owner_root)
+    target = os.path.abspath(target)
     try:
         inside_owner_root = os.path.commonpath([owner_root, target]) == owner_root
     except ValueError:
@@ -683,6 +728,27 @@ async def _cleanup_torrent_session_directory(session_doc):
     return target
 
 
+async def _cleanup_legacy_torrent_session_directory(session_doc):
+    """Remove an old overlay-backed workspace before using the bind mount."""
+    target = os.path.abspath(_legacy_torrent_download_dir(session_doc))
+    current = os.path.abspath(_torrent_download_dir(session_doc))
+    if target == current or not os.path.exists(target):
+        return False
+    await _cleanup_exact_torrent_directory(
+        target, _legacy_torrent_owner_root(session_doc)
+    )
+    return True
+
+
+async def _cleanup_torrent_session_directory(session_doc):
+    """Delete only this session's current and legacy workspace directories."""
+    await _cleanup_exact_torrent_directory(
+        _torrent_download_dir(session_doc), _torrent_owner_root(session_doc)
+    )
+    await _cleanup_legacy_torrent_session_directory(session_doc)
+    return os.path.abspath(_torrent_download_dir(session_doc))
+
+
 def _directory_allocated_bytes(path):
     total = 0
     if not os.path.isdir(path):
@@ -697,12 +763,326 @@ def _directory_allocated_bytes(path):
                 if os.path.islink(filepath):
                     continue
                 stat = os.stat(filepath)
-                total += int(getattr(stat, "st_blocks", 0) or 0) * 512
-                if not getattr(stat, "st_blocks", None):
-                    total += int(stat.st_size)
+                # A sparse file can have a huge logical size and zero blocks.
+                blocks = getattr(stat, "st_blocks", None)
+                total += int(stat.st_size) if blocks is None else int(blocks) * 512
             except OSError:
                 continue
     return total
+
+
+async def _reserve_torrent_workspace(session_doc, budget):
+    """Caller holds pipeline lock; protect other torrent jobs' unwritten bytes."""
+    path = _torrent_download_dir(session_doc)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    device = os.stat(os.path.dirname(path)).st_dev
+    allocated = await asyncio.to_thread(_directory_allocated_bytes, path)
+    budget = max(budget, allocated)
+    outstanding = 0
+    chain_reserved = 0
+    for key, entry in torrent_workspace_reservations.items():
+        if key == session_doc["_id"]:
+            continue
+        if entry["chain_id"] == session_doc["chain_id"]:
+            chain_reserved += entry["budget"]
+        if entry["device"] == device:
+            used = await asyncio.to_thread(_directory_allocated_bytes, entry["path"])
+            outstanding += max(0, entry["budget"] - used)
+    required = (
+        max(0, budget - allocated) + outstanding + TORRENT_WORKSPACE_RESERVE_BYTES
+    )
+    free = shutil.disk_usage(os.path.dirname(path)).free
+    limit = int(session_doc.get("workspace_bytes") or 0)
+    if (limit and chain_reserved + budget > limit) or free < required:
+        return False, required, free
+    torrent_workspace_reservations[session_doc["_id"]] = {
+        "path": path,
+        "device": device,
+        "budget": budget,
+        "chain_id": session_doc["chain_id"],
+    }
+    return True, required, free
+
+
+async def _stop_torrent_prefetch_locked(session_id, *, clear=False):
+    """Join the speculative writer before handoff or deleting its directory."""
+    task = torrent_prefetch_tasks.pop(session_id, None)
+    if task and not task.done():
+        task.cancel()
+    if task:
+        await asyncio.gather(task, return_exceptions=True)
+    doc = await torrent_session_store.get_session(session_id)
+    if doc:
+        if doc.get("prefetch_gid"):
+            await _remove_torrent_gid(doc["prefetch_gid"], cleanup=False)
+            try:
+                status = await aria2_tell_status(session, doc["prefetch_gid"])
+            except Aria2Error as error:
+                if error.error_code != 1:
+                    raise OSError(
+                        "Cannot confirm that the prefetch writer stopped"
+                    ) from error
+            else:
+                if status.get("status") in ("active", "waiting", "paused"):
+                    raise OSError(
+                        "Prefetch writer is still active; refusing workspace cleanup"
+                    )
+        if clear:
+            await _cleanup_torrent_session_directory(doc)
+        await torrent_session_store.set_state(
+            session_id,
+            doc["state"],
+            prefetch_gid=None,
+            prefetch_active=False,
+            prefetch_indexes=[],
+            prefetch_phase=None,
+        )
+    torrent_workspace_reservations.pop(session_id, None)
+
+
+async def _stop_chain_prefetch(chain_id, *, clear=False):
+    async with torrent_pipeline_lock:
+        torrent_prefetch_disabled.add(chain_id)
+        torrent_prefetch_contexts.pop(chain_id, None)
+        children = await torrent_session_store.list_chain(chain_id)
+        for child in children:
+            if child.get("prefetch_active") or child["_id"] in torrent_prefetch_tasks:
+                await _stop_torrent_prefetch_locked(child["_id"], clear=clear)
+
+
+async def _maybe_prefetch_torrent(client, message, current, remaining, released):
+    """Download at most one bounded batch of the next part while uploads drain."""
+    chain_id = current["chain_id"]
+    async with torrent_pipeline_lock:
+        entry = torrent_workspace_reservations.get(current["_id"])
+        if not entry:
+            return
+        torrent_prefetch_contexts[chain_id] = (
+            client,
+            message,
+            current,
+            remaining,
+            released,
+        )
+        used = await asyncio.to_thread(_directory_allocated_bytes, entry["path"])
+        entry["budget"] = max(
+            _torrent_part_peak(remaining) + int(current.get("_pipeline_margin") or 0),
+            used,
+        )
+        if (
+            released < TORRENT_PREFETCH_RELEASE_BYTES
+            or chain_id in torrent_prefetch_disabled
+        ):
+            return
+        live = await torrent_session_store.get_session(current["_id"])
+        if not live or live["state"] != SESSION_RUNNING or live.get("skip_requested"):
+            return
+        children = await torrent_session_store.list_chain(chain_id)
+        child = next(
+            (
+                doc
+                for doc in children
+                if int(doc.get("part_index") or 0) > int(current.get("part_index") or 0)
+                and doc["state"] != SESSION_COMPLETED
+            ),
+            None,
+        )
+        if not child or child["state"] != SESSION_PAUSED:
+            return
+        previous_task = torrent_prefetch_tasks.get(child["_id"])
+        if previous_task and not previous_task.done():
+            return
+        chain = await torrent_session_store.get_chain(chain_id)
+        try:
+            piece_length = _validate_torrent_payload(bytes(chain["torrent_data"]))
+        except (TypeError, ValueError):
+            return
+        if not piece_length:
+            return  # Unknown piece geometry: keep the ordinary sequential path.
+        candidates = [
+            item
+            for item in await torrent_session_store.list_files(child["_id"])
+            if item["status"] != FILE_UPLOADED and not item.get("terminal_skip")
+        ]
+        headroom = max(0, int(current.get("workspace_bytes") or 0) - entry["budget"])
+        selected = []
+        # Include unselected boundary pieces plus filesystem/control-file slack.
+        budget = TORRENT_FILE_MAX_BYTES + 1024**2
+        for item in candidates:
+            cost = int(item.get("size_bytes") or 0) + 2 * piece_length + 8192
+            if budget + cost > headroom:
+                break
+            accepted, _, _ = await _reserve_torrent_workspace(child, budget + cost)
+            if not accepted:
+                break
+            budget += cost
+            selected.append(item)
+        if not selected:
+            return
+        indexes = [int(item["torrent_index"]) for item in selected]
+        if previous_task and len(indexes) <= len(child.get("prefetch_indexes") or []):
+            return
+        try:
+            if live.get("gid"):
+                try:
+                    await aria2_remove_result(session, live["gid"])
+                except Aria2Error:
+                    pass
+            await torrent_session_store.set_state(
+                child["_id"],
+                SESSION_PAUSED,
+                prefetch_active=True,
+                prefetch_parent=current["_id"],
+                prefetch_gid=None,
+                prefetch_indexes=indexes,
+                prefetch_phase="downloading",
+            )
+            task = asyncio.create_task(
+                _prefetch_torrent_files(client, message, child, chain, selected)
+            )
+            torrent_prefetch_tasks[child["_id"]] = task
+            task.add_done_callback(
+                lambda done: asyncio.create_task(
+                    _prefetch_batch_finished(chain_id, child["_id"], done)
+                )
+            )
+        except BaseException:
+            torrent_workspace_reservations.pop(child["_id"], None)
+            raise
+
+
+async def _prefetch_batch_finished(chain_id, session_id, task):
+    try:
+        if task.cancelled():
+            return
+        task.result()
+        if (
+            chain_id in torrent_prefetch_disabled
+            or torrent_prefetch_tasks.get(session_id) is not task
+        ):
+            return
+        context = torrent_prefetch_contexts.get(chain_id)
+        if context:
+            await _maybe_prefetch_torrent(*context)
+    except Exception:
+        logging.exception("Could not schedule next torrent prefetch batch")
+
+
+async def _prefetch_torrent_files(client, message, child, chain, files):
+    """Speculative downloads never enqueue uploads or advance the chain."""
+    gid = None
+    torrent_path = None
+    try:
+        directory = _torrent_download_dir(child)
+        os.makedirs(directory, exist_ok=True)
+        fd, torrent_path = tempfile.mkstemp(suffix=".torrent", dir=directory)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(bytes(chain["torrent_data"]))
+        gid = await aria2_add_torrent(
+            session,
+            child["owner_id"],
+            torrent_path,
+            LEECH_TIMEOUT,
+            pause=True,
+            download_dir=directory,
+            selected_files=[int(item["torrent_index"]) for item in files],
+            file_allocation="none",
+            check_integrity=True,
+        )
+        await torrent_session_store.set_state(
+            child["_id"],
+            SESSION_PAUSED,
+            prefetch_gid=gid,
+        )
+        await aria2_unpause(session, gid)
+        paused_for_space = False
+        while True:
+            info = await aria2_tell_status(session, gid)
+            if info["status"] == "complete" or info.get("seeder") == "true":
+                break
+            if info["status"] in ("removed", "error"):
+                raise RuntimeError(info.get("errorMessage") or "prefetch stopped")
+            async with torrent_pipeline_lock:
+                reservation = torrent_workspace_reservations.get(child["_id"])
+                if not reservation:
+                    raise RuntimeError("Prefetch workspace reservation was released")
+                enough_space, _, _ = await _reserve_torrent_workspace(
+                    child, reservation["budget"]
+                )
+            if not enough_space and not paused_for_space:
+                await aria2_pause(session, gid)
+                paused_for_space = True
+                await torrent_session_store.set_state(
+                    child["_id"],
+                    SESSION_PAUSED,
+                    prefetch_phase="paused for disk space",
+                )
+            elif enough_space and paused_for_space:
+                await aria2_unpause(session, gid)
+                paused_for_space = False
+                await torrent_session_store.set_state(
+                    child["_id"],
+                    SESSION_PAUSED,
+                    prefetch_phase="downloading",
+                )
+            await asyncio.sleep(1)
+        for item in files:
+            await torrent_session_store.update_file(
+                item["_id"],
+                FILE_DOWNLOADED,
+                gid=None,
+                prefetched=True,
+            )
+        await torrent_session_store.set_state(
+            child["_id"],
+            SESSION_PAUSED,
+            prefetch_phase="waiting for workspace",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logging.warning("Torrent prefetch %s stopped: %s", child["_id"], error)
+        torrent_prefetch_disabled.add(child["chain_id"])
+        await torrent_session_store.set_state(
+            child["_id"],
+            SESSION_PAUSED,
+            prefetch_phase="stopped",
+            prefetch_error=str(error),
+        )
+        # Keep the normal queued part resumable; no uploaded/skip flags change.
+    finally:
+        if gid:
+            await _remove_torrent_gid(gid, cleanup=False)
+        if torrent_path and os.path.exists(torrent_path):
+            os.remove(torrent_path)
+
+
+def _is_torrent_storage_exhaustion(error_code, error_message):
+    message = str(error_message or "").lower()
+    return str(error_code or "") == "9" or any(
+        marker in message
+        for marker in (
+            "no space left on device",
+            "not enough disk space",
+            "fallocate failed",
+        )
+    )
+
+
+async def _torrent_download_failure(gid, fallback):
+    """Return Aria2's durable error details before its result is removed."""
+    error_code = None
+    error_message = str(fallback or "torrent download failed")
+    if gid:
+        try:
+            status = await aria2_tell_status(session, gid)
+            error_code = status.get("errorCode")
+            error_message = str(status.get("errorMessage") or error_message)
+        except Aria2Error:
+            pass
+    if error_code:
+        return error_code, f"Aria2 error {error_code}: {error_message}"
+    return error_code, error_message
 
 
 def _valid_telegram_link(value):
@@ -774,9 +1154,7 @@ def _map_successful_torrent_uploads(file_docs, sent_files):
 
 async def _mark_torrent_files(file_docs, status, **fields):
     for file_doc in file_docs:
-        await torrent_session_store.update_file(
-            file_doc["_id"], status, **fields
-        )
+        await torrent_session_store.update_file(file_doc["_id"], status, **fields)
 
 
 def _torrent_flags(mode):
@@ -802,6 +1180,19 @@ async def _run_torrent_session(client, message, session_id):
     session_doc = await torrent_session_store.get_session(session_id)
     if not session_doc or session_doc.get("state") != SESSION_RUNNING:
         return
+    async with torrent_pipeline_lock:
+        await _stop_torrent_prefetch_locked(session_id)
+        # A restart loses in-memory leases. Do not keep speculative sibling
+        # files outside the rebuilt budget when retrying an earlier part.
+        for child in await torrent_session_store.list_chain(session_doc["chain_id"]):
+            if (
+                int(child.get("part_index") or 0)
+                > int(session_doc.get("part_index") or 0)
+                and child["_id"] not in torrent_prefetch_tasks
+                and child.get("prefetch_active")
+            ):
+                await _stop_torrent_prefetch_locked(child["_id"], clear=True)
+        torrent_prefetch_disabled.discard(session_doc["chain_id"])
     chain_doc = await torrent_session_store.get_chain(session_doc["chain_id"])
     if not chain_doc or not chain_doc.get("torrent_data"):
         await torrent_session_store.set_state(session_id, SESSION_FAILED)
@@ -809,12 +1200,24 @@ async def _run_torrent_session(client, message, session_id):
             f"Torrent session <code>{session_id}</code> has no persisted metadata."
         )
         return
+    try:
+        # Releases stale preallocated files made by versions that stored torrent
+        # chains in Docker's writable overlay instead of /app/downloads.
+        await _cleanup_legacy_torrent_session_directory(session_doc)
+    except OSError as error:
+        await torrent_session_store.set_state(
+            session_id, SESSION_FAILED, cleanup_error=str(error)
+        )
+        await message.reply_text(
+            f"Torrent session <code>{session_id}</code> could not migrate its "
+            f"old workspace: {html.escape(str(error))}."
+        )
+        return
     file_docs = await torrent_session_store.list_files(session_id)
     unfinished = [
         item
         for item in file_docs
-        if item.get("status") != FILE_UPLOADED
-        and not item.get("terminal_skip")
+        if item.get("status") != FILE_UPLOADED and not item.get("terminal_skip")
     ]
     if not unfinished:
         try:
@@ -836,11 +1239,11 @@ async def _run_torrent_session(client, message, session_id):
     peak = int(session_doc.get("peak_workspace_bytes") or 0)
     download_dir = _torrent_download_dir(session_doc)
     os.makedirs(os.path.dirname(download_dir), exist_ok=True)
-    free = shutil.disk_usage(os.path.dirname(download_dir)).free
-    allocated = await asyncio.to_thread(_directory_allocated_bytes, download_dir)
-    additional = max(0, peak - allocated)
-    required_free = additional + TORRENT_WORKSPACE_RESERVE_BYTES
-    if free < required_free:
+    async with torrent_pipeline_lock:
+        accepted, required_free, free = await _reserve_torrent_workspace(
+            session_doc, peak
+        )
+    if not accepted:
         await torrent_session_store.set_state(session_id, SESSION_FAILED)
         await message.reply_text(
             f"Torrent session <code>{session_id}</code> needs about "
@@ -851,7 +1254,9 @@ async def _run_torrent_session(client, message, session_id):
         )
         return
 
-    owner_dir = os.path.join(os.getcwd(), str(int(session_doc["owner_id"])))
+    owner_dir = os.path.join(
+        _torrent_workspace_root(), str(int(session_doc["owner_id"]))
+    )
     os.makedirs(owner_dir, exist_ok=True)
     fd, torrent_path = tempfile.mkstemp(suffix=".torrent", dir=owner_dir)
     gid = None
@@ -867,20 +1272,57 @@ async def _run_torrent_session(client, message, session_id):
             pause=True,
             download_dir=download_dir,
             selected_files=selected,
+            file_allocation="none",
+            check_integrity=True,
         )
-        await torrent_session_store.set_state(
-            session_id, SESSION_RUNNING, gid=gid
-        )
-        await _mark_torrent_files(
-            unfinished, FILE_DOWNLOADING, gid=gid, error=None
-        )
+        await torrent_session_store.set_state(session_id, SESSION_RUNNING, gid=gid)
+        await _mark_torrent_files(unfinished, FILE_DOWNLOADING, gid=gid, error=None)
         await aria2_unpause(session, gid)
 
         async def on_downloaded():
-            await _mark_torrent_files(
-                unfinished, FILE_DOWNLOADED, gid=None, error=None
+            await _mark_torrent_files(unfinished, FILE_DOWNLOADED, gid=None, error=None)
+            actual = await asyncio.to_thread(_directory_allocated_bytes, download_dir)
+            sources = sum(int(item.get("size_bytes") or 0) for item in unfinished)
+            session_doc["_pipeline_margin"] = (
+                max(0, actual - sources) + 1024**2 + len(unfinished) * 8192
             )
             torrent_pending_uploads.add(session_id)
+
+        released_files = set()
+        released_bytes = 0
+
+        async def on_source_uploaded(source_result):
+            nonlocal released_bytes
+            if not source_result.get("complete"):
+                await _stop_chain_prefetch(session_doc["chain_id"], clear=True)
+                return
+            # Persist valid links immediately, independently of cleanup success.
+            from ..utils.upload_worker import UploadResult
+
+            result = UploadResult(source_results=[source_result])
+            mapped = _map_successful_torrent_uploads(unfinished, result)
+            for file_doc in unfinished:
+                if file_doc["_id"] not in mapped:
+                    continue
+                await torrent_session_store.update_file(
+                    file_doc["_id"],
+                    FILE_UPLOADED,
+                    gid=None,
+                    error=None,
+                    telegram_files=mapped[file_doc["_id"]],
+                )
+                if (
+                    source_result.get("source_removed")
+                    and file_doc["_id"] not in released_files
+                ):
+                    released_files.add(file_doc["_id"])
+                    released_bytes += int(file_doc.get("size_bytes") or 0)
+            remaining = [
+                item for item in unfinished if item["_id"] not in released_files
+            ]
+            await _maybe_prefetch_torrent(
+                client, message, session_doc, remaining, released_bytes
+            )
 
         async def on_uploaded(sent_files, upload_error):
             torrent_pending_uploads.discard(session_id)
@@ -897,11 +1339,11 @@ async def _run_torrent_session(client, message, session_id):
                     telegram_files=mapped[file_doc["_id"]],
                 )
             failed_files = [
-                file_doc
-                for file_doc in unfinished
-                if file_doc["_id"] not in mapped
+                file_doc for file_doc in unfinished if file_doc["_id"] not in mapped
             ]
             if upload_error or not complete or failed_files:
+                await _stop_chain_prefetch(session_doc["chain_id"], clear=True)
+                torrent_workspace_reservations.pop(session_id, None)
                 reason = upload_error or (
                     "Telegram upload did not return the expected links "
                     f"({len(sent_files)} result(s))"
@@ -931,38 +1373,101 @@ async def _run_torrent_session(client, message, session_id):
             None,
             on_downloaded=on_downloaded,
             on_uploaded=on_uploaded,
+            on_source_uploaded=on_source_uploaded,
+            workspace_temp_root=download_dir,
+            suppress_download_errors=True,
             suppress_upload_summary=True,
             parallel_uploads=TORRENT_MAX_CONCURRENT_UPLOADS,
         )
         if result != "complete":
+            error_code, failure_reason = await _torrent_download_failure(gid, result)
+            await _remove_torrent_gid(gid, cleanup=False)
+            cleanup_error = None
+            storage_exhausted = _is_torrent_storage_exhaustion(
+                error_code, failure_reason
+            )
+            if storage_exhausted:
+                try:
+                    await _cleanup_torrent_session_directory(session_doc)
+                except OSError as error:
+                    cleanup_error = str(error)
             await _mark_torrent_files(
                 unfinished,
                 FILE_FAILED if result != "removed" else FILE_CANCELLED,
                 gid=None,
-                error=str(result or "torrent download failed"),
+                error=failure_reason,
             )
             await torrent_session_store.set_state(
                 session_id,
                 SESSION_CANCELLED if result == "removed" else SESSION_FAILED,
                 gid=None,
+                allocation_cleanup_completed=(
+                    storage_exhausted and cleanup_error is None
+                ),
+                cleanup_error=cleanup_error,
             )
+            if storage_exhausted:
+                if cleanup_error:
+                    cleanup_note = (
+                        " Automatic cleanup failed: " f"{html.escape(cleanup_error)}."
+                    )
+                else:
+                    cleanup_note = (
+                        " Its partial/preallocated files were automatically " "cleared."
+                    )
+                await message.reply_text(
+                    f"Torrent session <code>{session_id}</code> ran out of "
+                    f"storage.{cleanup_note} Resume with "
+                    f"<code>/continuetorrent {session_id}</code>, or skip this "
+                    f"part with <code>/skiptorrentsession {session_id}</code>."
+                )
+            elif result != "removed":
+                await message.reply_text(
+                    f"Torrent session <code>{session_id}</code> stopped: "
+                    f"{html.escape(failure_reason)}. Resume with "
+                    f"<code>/continuetorrent {session_id}</code>."
+                )
     except asyncio.CancelledError:
         if gid:
             await _remove_torrent_gid(gid, cleanup=False)
         raise
     except Exception as error:
+        error_code = getattr(error, "error_code", None)
+        failure_reason = str(error)
+        storage_exhausted = _is_torrent_storage_exhaustion(error_code, failure_reason)
+        if gid:
+            await _remove_torrent_gid(gid, cleanup=False)
+        cleanup_error = None
+        if storage_exhausted:
+            try:
+                await _cleanup_torrent_session_directory(session_doc)
+            except OSError as cleanup_exception:
+                cleanup_error = str(cleanup_exception)
         await _mark_torrent_files(
-            unfinished, FILE_FAILED, gid=None, error=str(error)
+            unfinished, FILE_FAILED, gid=None, error=failure_reason
         )
         await torrent_session_store.set_state(
-            session_id, SESSION_FAILED, gid=None
+            session_id,
+            SESSION_FAILED,
+            gid=None,
+            allocation_cleanup_completed=(storage_exhausted and cleanup_error is None),
+            cleanup_error=cleanup_error,
         )
+        cleanup_note = ""
+        if storage_exhausted and cleanup_error:
+            cleanup_note = (
+                " Automatic cleanup failed: " f"{html.escape(cleanup_error)}."
+            )
+        elif storage_exhausted:
+            cleanup_note = " Its partial/preallocated files were automatically cleared."
         await message.reply_text(
             f"Torrent session <code>{session_id}</code> stopped: "
-            f"{html.escape(str(error))}. Resume with "
+            f"{html.escape(failure_reason)}.{cleanup_note} Resume with "
             f"<code>/continuetorrent {session_id}</code>."
         )
     finally:
+        if session_id not in torrent_pending_uploads:
+            torrent_workspace_reservations.pop(session_id, None)
         if os.path.exists(torrent_path):
             os.remove(torrent_path)
 
@@ -978,12 +1483,12 @@ async def _complete_torrent_session(client, message, session_id):
         if not session_doc or session_doc.get("state") != SESSION_RUNNING:
             return False
         file_docs = await torrent_session_store.list_files(session_id)
-        uploaded = sum(
-            item.get("status") == FILE_UPLOADED for item in file_docs
-        )
+        uploaded = sum(item.get("status") == FILE_UPLOADED for item in file_docs)
         skipped = sum(bool(item.get("terminal_skip")) for item in file_docs)
         if uploaded + skipped != session_doc["total_files"]:
             return False
+        await _stop_chain_prefetch(chain_id)
+        torrent_workspace_reservations.pop(session_id, None)
         completed = await torrent_session_store.set_state(
             session_id,
             SESSION_COMPLETED,
@@ -1009,6 +1514,8 @@ async def _advance_torrent_chain(client, message, completed):
     chain_id = completed.get("chain_id") or completed["_id"]
     chain = await torrent_session_store.list_chain(chain_id)
     if chain and all(item.get("state") == SESSION_COMPLETED for item in chain):
+        torrent_prefetch_disabled.discard(chain_id)
+        torrent_prefetch_contexts.pop(chain_id, None)
         last = chain[-1]
         if not last.get("index_sent"):
             await _send_torrent_chain_index(message, chain)
@@ -1046,9 +1553,9 @@ def _torrent_index_lines(chain, files_by_session):
     for file_doc in all_files:
         parts = [
             part
-            for part in str(
-                file_doc.get("relative_path") or file_doc["filename"]
-            ).replace("\\", "/").split("/")
+            for part in str(file_doc.get("relative_path") or file_doc["filename"])
+            .replace("\\", "/")
+            .split("/")
             if part
         ]
         if len(parts) > 1 and parts[0] == title:
@@ -1078,14 +1585,16 @@ def _torrent_index_lines(chain, files_by_session):
             number += 1
             uploads = value.get("telegram_files") or []
             if len(uploads) > 1:
-                lines.append(f"{prefix}{branch} 📦 {number}. <b>{html.escape(name)}</b>")
+                lines.append(
+                    f"{prefix}{branch} 📦 {number}. <b>{html.escape(name)}</b>"
+                )
                 for part_index, upload in enumerate(uploads, 1):
                     part_last = part_index == len(uploads)
                     part_branch = "└──" if part_last else "├──"
                     link = html.escape(str(upload["link"]), quote=True)
                     upload_name = html.escape(str(upload["name"]))
                     lines.append(
-                        f'{prefix}{continuation}{part_branch} '
+                        f"{prefix}{continuation}{part_branch} "
                         f'<a href="{link}">{number}.{part_index} {upload_name}</a>'
                     )
             elif uploads:
@@ -1234,9 +1743,7 @@ async def _torrent_chains_page(owner_id, requested_page):
     lines = [f"<b>Your torrent chains — Page {page}/{pages}</b>", ""]
     for chain_doc in chains:
         children = await torrent_session_store.list_chain(chain_doc["_id"])
-        completed = sum(
-            item.get("state") == SESSION_COMPLETED for item in children
-        )
+        completed = sum(item.get("state") == SESSION_COMPLETED for item in children)
         lines.extend(
             [
                 f"📁 <b>{html.escape(str(chain_doc.get('name') or 'Torrent'))}</b>",
@@ -1245,6 +1752,11 @@ async def _torrent_chains_page(owner_id, requested_page):
             ]
         )
         for child in children[:8]:
+            if child.get("prefetch_active") and child["_id"] in torrent_prefetch_tasks:
+                child = dict(
+                    child,
+                    state="prefetch: " + str(child.get("prefetch_phase") or "waiting"),
+                )
             skipped = int(child.get("skipped_files") or 0)
             skip_text = f" · {skipped} skipped" if skipped else ""
             lines.append(
@@ -1327,6 +1839,11 @@ async def _torrent_chain_detail_page(owner_id, requested_id, requested_page):
         "",
     ]
     for child in visible:
+        if child.get("prefetch_active") and child["_id"] in torrent_prefetch_tasks:
+            child = dict(
+                child,
+                state="prefetch: " + str(child.get("prefetch_phase") or "waiting"),
+            )
         counts = await torrent_session_store.counts(child["_id"])
         child_files = await torrent_session_store.list_files(child["_id"])
         skipped = sum(bool(item.get("terminal_skip")) for item in child_files)
@@ -1364,22 +1881,19 @@ async def _torrent_chain_detail_page(owner_id, requested_id, requested_page):
     return "\n".join(lines), markup
 
 
-@Client.on_callback_query(
-    filters.regex(r"^torrentchain_page:\d+:[0-9a-f]+:\d+$")
-)
+@Client.on_callback_query(filters.regex(r"^torrentchain_page:\d+:[0-9a-f]+:\d+$"))
 async def torrent_chain_page_callback(client, callback):
     _, owner_id, chain_id, page = callback.data.split(":")
     if callback.from_user.id != int(owner_id):
         await callback.answer("Only the owner can change this page.", show_alert=True)
         return
-    text, markup = await _torrent_chain_detail_page(
-        int(owner_id), chain_id, int(page)
-    )
+    text, markup = await _torrent_chain_detail_page(int(owner_id), chain_id, int(page))
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 
 async def _stop_torrent_session(session_doc):
+    await _stop_chain_prefetch(session_doc["chain_id"], clear=True)
     task = torrent_session_tasks.get(session_doc["_id"])
     if session_doc.get("gid"):
         await _remove_torrent_gid(session_doc["gid"], cleanup=False)
@@ -1389,6 +1903,8 @@ async def _stop_torrent_session(session_doc):
             await task
         except asyncio.CancelledError:
             pass
+    if session_doc["_id"] not in torrent_pending_uploads:
+        torrent_workspace_reservations.pop(session_doc["_id"], None)
 
 
 async def _delete_owned_torrent_chain(chain_doc):
@@ -1396,6 +1912,11 @@ async def _delete_owned_torrent_chain(chain_doc):
     chain_id = str(chain_doc["_id"])
     owner_id = int(chain_doc["owner_id"])
     children = await torrent_session_store.list_chain(chain_id)
+    if any(child["_id"] in torrent_pending_uploads for child in children):
+        await _stop_chain_prefetch(chain_id, clear=True)
+        return None, [
+            "Telegram uploads are still running; retry deletion after they finish."
+        ]
     for child in children:
         await _stop_torrent_session(child)
 
@@ -1408,21 +1929,17 @@ async def _delete_owned_torrent_chain(chain_doc):
             try:
                 await _cleanup_torrent_session_directory(child)
             except OSError as error:
-                cleanup_errors.append(
-                    f"{child['_id']}: {str(error)}"
-                )
+                cleanup_errors.append(f"{child['_id']}: {str(error)}")
         if not cleanup_errors:
-            result = await torrent_session_store.delete_chain_tree(
-                chain_id, owner_id
-            )
+            result = await torrent_session_store.delete_chain_tree(chain_id, owner_id)
     if not cleanup_errors:
         torrent_chain_locks.pop(chain_id, None)
+        torrent_prefetch_disabled.discard(chain_id)
     return result, cleanup_errors
 
 
 @Client.on_message(
-    filters.command(["skiptorrentsession", "skiptsession"])
-    & filters.chat(ALL_CHATS)
+    filters.command(["skiptorrentsession", "skiptsession"]) & filters.chat(ALL_CHATS)
 )
 async def skip_torrent_session_cmd(client, message):
     """Skip one torrent child part, clean it, and advance its chain."""
@@ -1476,9 +1993,7 @@ async def skip_torrent_session_cmd(client, message):
             if upload_is_live and file_doc.get("status") == FILE_DOWNLOADED
         }
         preserved_ids = live_upload_ids | {
-            file_doc["_id"]
-            for file_doc in file_docs
-            if file_doc.get("terminal_skip")
+            file_doc["_id"] for file_doc in file_docs if file_doc.get("terminal_skip")
         }
         skipped_count = await torrent_session_store.skip_unfinished_files(
             session_id,
@@ -1576,9 +2091,7 @@ async def skip_torrent_session_cmd(client, message):
         )
 
 
-@Client.on_message(
-    filters.command("deletetorrentchain") & filters.chat(ALL_CHATS)
-)
+@Client.on_message(filters.command("deletetorrentchain") & filters.chat(ALL_CHATS))
 async def delete_torrent_chain_cmd(client, message):
     requested_id = _torrent_id_from_message(message)
     session_doc = await _resolve_owned_torrent_session(
@@ -1586,9 +2099,7 @@ async def delete_torrent_chain_cmd(client, message):
     )
     chain_id = session_doc.get("chain_id") if session_doc else requested_id
     chain_doc = (
-        await torrent_session_store.get_chain(
-            chain_id, owner_id=message.from_user.id
-        )
+        await torrent_session_store.get_chain(chain_id, owner_id=message.from_user.id)
         if chain_id
         else None
     )
@@ -1610,9 +2121,7 @@ async def delete_torrent_chain_cmd(client, message):
     )
 
 
-@Client.on_message(
-    filters.command("deletealltorrentchains") & filters.chat(ALL_CHATS)
-)
+@Client.on_message(filters.command("deletealltorrentchains") & filters.chat(ALL_CHATS))
 async def delete_all_torrent_chains_cmd(client, message):
     chains = await torrent_session_store.list_chains(
         owner_id=message.from_user.id, limit=0

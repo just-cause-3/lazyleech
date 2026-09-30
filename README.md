@@ -174,8 +174,18 @@ Aria2's `select-file` option to download only its assigned files. Planning
 accounts for all selected sources plus the largest temporary Telegram split
 copy, so the requested workspace is a peak limit rather than only a source-size
 limit. A 512 MiB physical-disk reserve is added by default
-(`TORRENT_WORKSPACE_RESERVE_MB`). After every Telegram upload succeeds, the
-download directory is verified deleted before the next child starts. An
+(`TORRENT_WORKSPACE_RESERVE_MB`). After successful uploads release at least
+2 GiB, the next child can download bounded batches while the current child
+continues uploading. Both share the original workspace limit, including split
+copies and torrent boundary pieces. Fast downloads wait at the batch boundary
+until cleanup frees enough space for more whole files; a large file waits until
+it fits. Only one child downloads ahead, and its uploads wait for the previous
+child's uploads and verified cleanup. Prefetched files are hash-checked at
+handoff. Failed uploads stop look-ahead downloads; skipping/deleting stops their
+writers before cleanup. Existing MongoDB chains gain this behavior on
+`/continuetorrent` after updating, without recreating the chain or losing links.
+Runtime reservations are rebuilt on resume; the configured startup download
+cleanup still applies to local partial data. An
 individual file whose source-plus-split peak exceeds the requested workspace is
 persisted as a terminal skip and omitted from Aria2 selection, while the rest of
 the chain continues. The final folder-style index contains the Telegram links

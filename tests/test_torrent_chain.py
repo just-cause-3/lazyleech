@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiohttp
 
 from lazyleech.plugins import torrent_chain
-from lazyleech.utils.aria2 import Aria2Error, aria2_request
+from lazyleech.utils.aria2 import Aria2Error, aria2_add_torrent, aria2_request
 from lazyleech.utils.bunkr_sessions import (
     FILE_DOWNLOADED,
     FILE_DOWNLOADING,
@@ -54,9 +54,10 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
             torrent_file(3, "three.bin", 1 * GIB),
         ]
         groups, skipped = torrent_chain._partition_torrent_files(files, 6 * GIB)
-        self.assertEqual([[1], [2], [3]], [
-            [item["torrent_index"] for item in group] for group in groups
-        ])
+        self.assertEqual(
+            [[1], [2], [3]],
+            [[item["torrent_index"] for item in group] for group in groups],
+        )
         self.assertEqual([], skipped)
 
     def test_single_file_that_cannot_fit_is_terminally_skipped(self):
@@ -121,12 +122,8 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
             for part in range(1, 22)
         ]
 
-        first_text, first_markup = torrent_chain._torrent_plan_page(
-            chain, sessions, 1
-        )
-        last_text, last_markup = torrent_chain._torrent_plan_page(
-            chain, sessions, 3
-        )
+        first_text, first_markup = torrent_chain._torrent_plan_page(chain, sessions, 1)
+        last_text, last_markup = torrent_chain._torrent_plan_page(chain, sessions, 3)
 
         self.assertIn("Page:</b> 1/3", first_text)
         self.assertIn("Part 1/21", first_text)
@@ -234,6 +231,35 @@ class TorrentWorkspacePlannerTests(unittest.TestCase):
 
 
 class TorrentFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_torrent_add_can_disable_preallocation_per_download(self):
+        with tempfile.NamedTemporaryFile(suffix=".torrent", delete=False) as item:
+            item.write(b"torrent")
+            torrent_path = item.name
+        try:
+            with (
+                patch(
+                    "lazyleech.utils.aria2.generate_gid",
+                    AsyncMock(return_value="gid"),
+                ),
+                patch(
+                    "lazyleech.utils.aria2.aria2_request",
+                    AsyncMock(return_value={"result": "gid"}),
+                ) as request,
+            ):
+                result = await aria2_add_torrent(
+                    SimpleNamespace(),
+                    123,
+                    torrent_path,
+                    download_dir="/downloads/session",
+                    file_allocation="none",
+                )
+        finally:
+            Path(torrent_path).unlink(missing_ok=True)
+
+        self.assertEqual("gid", result)
+        options = request.await_args.args[2][2]
+        self.assertEqual("none", options["file-allocation"])
+
     async def test_aria2_broken_pipe_becomes_reportable_aria2_error(self):
         class BrokenRequest:
             async def __aenter__(self):
@@ -302,7 +328,9 @@ class TorrentFetchTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(get=Mock(return_value=Response())),
         ):
             with self.assertRaisesRegex(ValueError, "exceeds the 4 MiB"):
-                await torrent_chain._fetch_torrent_bytes("https://example.test/a.torrent")
+                await torrent_chain._fetch_torrent_bytes(
+                    "https://example.test/a.torrent"
+                )
 
 
 class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -338,9 +366,7 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )
             sessions.append(session_doc)
             if part == 1 and first_state != SESSION_RUNNING:
-                session_doc = await store.set_state(
-                    session_doc["_id"], first_state
-                )
+                session_doc = await store.set_state(session_doc["_id"], first_state)
                 sessions[-1] = session_doc
         await store.create_chain(
             chain_id=chain_id,
@@ -380,18 +406,13 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         try:
             with tempfile.TemporaryDirectory() as workdir:
                 session_dir = (
-                    Path(workdir)
-                    / "123"
-                    / "torrent_sessions"
-                    / sessions[0]["_id"]
+                    Path(workdir) / "123" / "torrent_sessions" / sessions[0]["_id"]
                 )
                 session_dir.mkdir(parents=True)
                 (session_dir / "partial.bin").write_bytes(b"partial")
                 with (
                     patch.object(torrent_chain.os, "getcwd", return_value=workdir),
-                    patch.object(
-                        torrent_chain, "_stop_torrent_session", AsyncMock()
-                    ),
+                    patch.object(torrent_chain, "_stop_torrent_session", AsyncMock()),
                     patch.object(torrent_chain, "_start_torrent_session") as start,
                 ):
                     await torrent_chain.skip_torrent_session_cmd(None, message)
@@ -442,18 +463,13 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         try:
             with tempfile.TemporaryDirectory() as workdir:
                 session_dir = (
-                    Path(workdir)
-                    / "123"
-                    / "torrent_sessions"
-                    / sessions[0]["_id"]
+                    Path(workdir) / "123" / "torrent_sessions" / sessions[0]["_id"]
                 )
                 session_dir.mkdir(parents=True)
                 (session_dir / "ready.bin").write_bytes(b"ready")
                 with (
                     patch.object(torrent_chain.os, "getcwd", return_value=workdir),
-                    patch.object(
-                        torrent_chain, "_stop_torrent_session", AsyncMock()
-                    ),
+                    patch.object(torrent_chain, "_stop_torrent_session", AsyncMock()),
                     patch.object(torrent_chain, "_start_torrent_session") as start,
                 ):
                     await torrent_chain.skip_torrent_session_cmd(None, message)
@@ -512,19 +528,14 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 session_dirs = []
                 for session_doc in sessions:
                     session_dir = (
-                        Path(workdir)
-                        / "123"
-                        / "torrent_sessions"
-                        / session_doc["_id"]
+                        Path(workdir) / "123" / "torrent_sessions" / session_doc["_id"]
                     )
                     session_dir.mkdir(parents=True)
                     (session_dir / "partial.bin").write_bytes(b"partial")
                     session_dirs.append(session_dir)
                 with (
                     patch.object(torrent_chain.os, "getcwd", return_value=workdir),
-                    patch.object(
-                        torrent_chain, "_stop_torrent_session", AsyncMock()
-                    ),
+                    patch.object(torrent_chain, "_stop_torrent_session", AsyncMock()),
                 ):
                     await torrent_chain.delete_torrent_chain_cmd(None, message)
                 self.assertTrue(all(not path.exists() for path in session_dirs))
@@ -560,9 +571,7 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
         self.assertTrue(errors)
-        self.assertIsNotNone(
-            await store.get_chain("abc123def456", owner_id=123)
-        )
+        self.assertIsNotNone(await store.get_chain("abc123def456", owner_id=123))
 
     async def test_runner_selects_only_part_files_and_persists_upload_links(self):
         store = TorrentSessionStore(db_url="")
@@ -676,14 +685,13 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     await torrent_chain._run_torrent_session(
                         None, message, session_doc["_id"]
                     )
-                    self.assertTrue(Path(workdir, "123").exists())
+                    self.assertTrue(Path(workdir, "downloads", "123").exists())
         finally:
             torrent_chain.torrent_session_store = original_store
 
         self.assertEqual([4, 9], add_torrent.await_args.kwargs["selected_files"])
-        self.assertEqual(
-            3, handle_leech.await_args.kwargs["parallel_uploads"]
-        )
+        self.assertEqual("none", add_torrent.await_args.kwargs["file_allocation"])
+        self.assertEqual(3, handle_leech.await_args.kwargs["parallel_uploads"])
         updated = await store.get_session(session_doc["_id"])
         self.assertEqual("completed", updated["state"])
         files = await store.list_files(session_doc["_id"])
@@ -693,6 +701,132 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(files[2]["terminal_skip"])
         self.assertEqual("https://t.me/c/1/1", files[0]["telegram_files"][0]["link"])
+
+    async def test_disk_exhaustion_clears_only_failed_session_workspace(self):
+        store = TorrentSessionStore(db_url="")
+        session_doc = await store.create_session(
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=77,
+            source_url="telegram:example.torrent",
+            title="Example (part 1/1)",
+            mode="normal",
+            custom_filename=None,
+            files=[
+                {
+                    "page_url": "telegram:example.torrent",
+                    "filename": "one.bin",
+                    "relative_path": "Example/one.bin",
+                    "torrent_index": 1,
+                    "size_bytes": 10,
+                }
+            ],
+            session_fields={
+                "chain_id": "diskfullchain",
+                "name": "Example",
+                "part_index": 1,
+                "total_parts": 1,
+                "workspace_bytes": GIB,
+                "peak_workspace_bytes": 10,
+            },
+        )
+        await store.create_chain(
+            chain_id="diskfullchain",
+            owner_id=123,
+            chat_id=-1001,
+            source_message_id=77,
+            source_url="telegram:example.torrent",
+            name="Example",
+            mode="normal",
+            total_parts=1,
+            total_files=1,
+            session_ids=[session_doc["_id"]],
+            chain_fields={"torrent_data": b"torrent"},
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=-1001),
+            reply_text=AsyncMock(),
+        )
+        original_store = torrent_chain.torrent_session_store
+        torrent_chain.torrent_session_store = store
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                session_dir = (
+                    Path(workdir)
+                    / "downloads"
+                    / "123"
+                    / "torrent_sessions"
+                    / session_doc["_id"]
+                )
+
+                async def fail_after_allocating(*_args, **_kwargs):
+                    session_dir.mkdir(parents=True, exist_ok=True)
+                    (session_dir / "preallocated.bin").write_bytes(b"stale")
+                    return "error"
+
+                with (
+                    patch.object(torrent_chain.os, "getcwd", return_value=workdir),
+                    patch.object(
+                        torrent_chain,
+                        "aria2_add_torrent",
+                        AsyncMock(return_value="gid"),
+                    ),
+                    patch.object(torrent_chain, "aria2_unpause", AsyncMock()),
+                    patch.object(
+                        torrent_chain,
+                        "aria2_tell_status",
+                        AsyncMock(
+                            return_value={
+                                "errorCode": "9",
+                                "errorMessage": "fallocate failed: No space left on device",
+                            }
+                        ),
+                    ),
+                    patch.object(
+                        torrent_chain, "_remove_torrent_gid", AsyncMock()
+                    ) as remove_gid,
+                    patch.object(
+                        torrent_chain,
+                        "handle_leech",
+                        side_effect=fail_after_allocating,
+                    ),
+                ):
+                    await torrent_chain._run_torrent_session(
+                        None, message, session_doc["_id"]
+                    )
+
+                self.assertFalse(session_dir.exists())
+        finally:
+            torrent_chain.torrent_session_store = original_store
+
+        remove_gid.assert_awaited_once_with("gid", cleanup=False)
+        failed = await store.get_session(session_doc["_id"])
+        self.assertEqual(SESSION_FAILED, failed["state"])
+        self.assertTrue(failed["allocation_cleanup_completed"])
+        file_doc = (await store.list_files(session_doc["_id"]))[0]
+        self.assertIn("No space left on device", file_doc["error"])
+        self.assertIn("automatically cleared", message.reply_text.await_args.args[0])
+
+    async def test_legacy_overlay_workspace_is_removed_during_migration(self):
+        session_doc = {"_id": "legacy123", "owner_id": 123}
+        with tempfile.TemporaryDirectory() as workdir:
+            legacy = Path(workdir) / "123" / "torrent_sessions" / "legacy123"
+            current = (
+                Path(workdir) / "downloads" / "123" / "torrent_sessions" / "legacy123"
+            )
+            legacy.mkdir(parents=True)
+            (legacy / "allocated.bin").write_bytes(b"old")
+            current.mkdir(parents=True)
+            (current / "partial.bin").write_bytes(b"keep")
+            with patch.object(torrent_chain.os, "getcwd", return_value=workdir):
+                removed = await torrent_chain._cleanup_legacy_torrent_session_directory(
+                    session_doc
+                )
+
+            self.assertTrue(removed)
+            self.assertFalse(legacy.exists())
+            self.assertTrue(current.exists())
 
     async def test_partial_parallel_upload_retries_only_failed_source(self):
         store = TorrentSessionStore(db_url="")
@@ -795,7 +929,9 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
         failed_session = await store.get_session(session_doc["_id"])
         self.assertEqual(SESSION_FAILED, failed_session["state"])
         files = await store.list_files(session_doc["_id"])
-        self.assertEqual([FILE_UPLOADED, FILE_FAILED], [item["status"] for item in files])
+        self.assertEqual(
+            [FILE_UPLOADED, FILE_FAILED], [item["status"] for item in files]
+        )
         self.assertEqual("https://t.me/c/1/1", files[0]["telegram_files"][0]["link"])
 
         await store.prepare_continue(session_doc["_id"], -1001, 88)
@@ -822,13 +958,16 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 "_inspect_torrent_bytes",
                 AsyncMock(return_value=("Example", files)),
             ):
-                chain_id, title, _files, sessions = (
-                    await torrent_chain._create_torrent_chain(
-                        message,
-                        b"torrent-metadata",
-                        "telegram:example.torrent",
-                        6 * GIB,
-                    )
+                (
+                    chain_id,
+                    title,
+                    _files,
+                    sessions,
+                ) = await torrent_chain._create_torrent_chain(
+                    message,
+                    b"torrent-metadata",
+                    "telegram:example.torrent",
+                    6 * GIB,
                 )
         finally:
             torrent_chain.torrent_session_store = original_store
@@ -864,13 +1003,16 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 "_inspect_torrent_bytes",
                 AsyncMock(return_value=("Example", files)),
             ):
-                chain_id, _title, _files, sessions = (
-                    await torrent_chain._create_torrent_chain(
-                        message,
-                        b"torrent-metadata",
-                        "telegram:example.torrent",
-                        25 * GIB,
-                    )
+                (
+                    chain_id,
+                    _title,
+                    _files,
+                    sessions,
+                ) = await torrent_chain._create_torrent_chain(
+                    message,
+                    b"torrent-metadata",
+                    "telegram:example.torrent",
+                    25 * GIB,
                 )
         finally:
             torrent_chain.torrent_session_store = original_store
@@ -908,13 +1050,16 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ),
             ):
-                _chain_id, _title, _files, sessions = (
-                    await torrent_chain._create_torrent_chain(
-                        message,
-                        b"torrent-metadata",
-                        "telegram:example.torrent",
-                        25 * GIB,
-                    )
+                (
+                    _chain_id,
+                    _title,
+                    _files,
+                    sessions,
+                ) = await torrent_chain._create_torrent_chain(
+                    message,
+                    b"torrent-metadata",
+                    "telegram:example.torrent",
+                    25 * GIB,
                 )
             with (
                 patch.object(
@@ -981,9 +1126,7 @@ class TorrentChainPersistenceTests(unittest.IsolatedAsyncioTestCase):
             chain_fields={"torrent_data": b"torrent"},
         )
         first_file = (await store.list_files(sessions[0]["_id"]))[0]
-        await store.update_file(
-            first_file["_id"], FILE_UPLOADED, telegram_files=[]
-        )
+        await store.update_file(first_file["_id"], FILE_UPLOADED, telegram_files=[])
         message = SimpleNamespace(reply_text=AsyncMock())
 
         original_store = torrent_chain.torrent_session_store

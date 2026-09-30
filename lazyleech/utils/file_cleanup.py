@@ -7,7 +7,9 @@ import shutil
 
 _USER_DIRECTORY_RE = re.compile(r"^\d+$")
 _TIMESTAMP_JOB_DIRECTORY_RE = re.compile(r"^\d+(?:\.\d+)?$")
-_SESSION_JOB_DIRECTORIES = frozenset({"bunkr_sessions", "terabox_sessions"})
+_SESSION_JOB_DIRECTORIES = frozenset(
+    {"bunkr_sessions", "terabox_sessions", "torrent_sessions"}
+)
 
 
 def _is_abandoned_job_directory(name):

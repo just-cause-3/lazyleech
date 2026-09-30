@@ -23,14 +23,67 @@ class ThumbnailValidationTests(unittest.TestCase):
 
 
 class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_per_source_callback_precedes_sibling_completion_and_receives_cleanup(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
+            first = Path(workdir) / "a.bin"
+            second = Path(workdir) / "b.bin"
+            first.write_bytes(b"a")
+            second.write_bytes(b"b")
+            first_reported = asyncio.Event()
+            reports = []
+
+            async def transfer(*args, **kwargs):
+                path = Path(args[4])
+                self.assertEqual(workdir, kwargs["workspace_temp_root"])
+                if path == second:
+                    await asyncio.wait_for(first_reported.wait(), timeout=2)
+                path.unlink()
+                return upload_worker.UploadResult(
+                    [(path.name, "https://t.me/c/1/1")],
+                    complete=True,
+                    source_removed=True,
+                )
+
+            async def report(result):
+                reports.append(result)
+                if result["relative_name"] == "a.bin":
+                    self.assertFalse(first.exists())
+                    self.assertTrue(second.exists())
+                    first_reported.set()
+
+            with patch.object(upload_worker, "_upload_file", side_effect=transfer):
+                result = await upload_worker._upload_worker(
+                    object(),
+                    SimpleNamespace(from_user=SimpleNamespace(id=123)),
+                    SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55),
+                    {
+                        "dir": workdir,
+                        "files": [{"path": str(first)}, {"path": str(second)}],
+                    },
+                    workdir,
+                    (),
+                    None,
+                    {
+                        "parallel_files": 3,
+                        "suppress_summary": True,
+                        "workspace_temp_root": workdir,
+                        "on_source_uploaded": report,
+                    },
+                )
+            self.assertTrue(result.complete)
+            self.assertEqual(2, len(reports))
+            self.assertTrue(all(item["source_removed"] for item in reports))
+
     async def test_torrent_job_runs_three_source_uploads_concurrently(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as workdir:
-            source_paths = [str(Path(workdir) / f"file-{index}.bin") for index in range(4)]
+            source_paths = [
+                str(Path(workdir) / f"file-{index}.bin") for index in range(4)
+            ]
             torrent_info = {
                 "dir": workdir,
-                "files": [
-                    {"path": path, "selected": "true"} for path in source_paths
-                ],
+                "files": [{"path": path, "selected": "true"} for path in source_paths],
             }
             message = SimpleNamespace(from_user=SimpleNamespace(id=123))
             reply = SimpleNamespace(chat=SimpleNamespace(id=-1001), id=55)
@@ -103,9 +156,7 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
                 reply_document=reply_document,
                 reply_text=AsyncMock(),
             )
-            with patch.object(
-                upload_worker, "update_upload_status_state", AsyncMock()
-            ):
+            with patch.object(upload_worker, "update_upload_status_state", AsyncMock()):
                 result = await upload_worker._upload_split_parts(
                     object(),
                     message,
@@ -165,9 +216,7 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
                 "temp",
             )
 
-        self.assertCountEqual(
-            ["archive.zip.0001", "archive.zip.0002"], started
-        )
+        self.assertCountEqual(["archive.zip.0001", "archive.zip.0002"], started)
         self.assertEqual("archive.zip.0002", finished[0])
         self.assertEqual(
             ["archive.zip.0001", "archive.zip.0002"],
@@ -186,9 +235,7 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
                 reply_text=AsyncMock(),
             )
 
-            with patch.object(
-                upload_worker, "update_upload_status_state", AsyncMock()
-            ):
+            with patch.object(upload_worker, "update_upload_status_state", AsyncMock()):
                 result = await upload_worker._upload_split_part(
                     object(),
                     message,
@@ -200,9 +247,7 @@ class ParallelSplitUploadTests(unittest.IsolatedAsyncioTestCase):
                     tempdir,
                 )
 
-            self.assertEqual(
-                ("archive.zip.0002", "https://t.me/c/1/26112"), result
-            )
+            self.assertEqual(("archive.zip.0002", "https://t.me/c/1/26112"), result)
             self.assertFalse(part.exists())
 
     async def test_incomplete_upload_does_not_delete_download_directory(self):

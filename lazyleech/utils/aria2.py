@@ -75,9 +75,7 @@ async def aria2_request(session, method, params=None):
 
 
 async def aria2_tell_active(session):
-    aria_downloads = _raise_or_return(
-        await aria2_request(session, "aria2.tellActive")
-    )
+    aria_downloads = _raise_or_return(await aria2_request(session, "aria2.tellActive"))
     return aria_downloads + await segmented_tell_active()
 
 
@@ -115,6 +113,13 @@ async def aria2_remove(session, gid):
     return _raise_or_return(await aria2_request(session, "aria2.remove", [gid]))
 
 
+async def aria2_remove_result(session, gid):
+    """Remove a stopped/error result without purging unrelated downloads."""
+    return _raise_or_return(
+        await aria2_request(session, "aria2.removeDownloadResult", [gid])
+    )
+
+
 async def aria2_unpause(session, gid):
     return _raise_or_return(await aria2_request(session, "aria2.unpause", [gid]))
 
@@ -143,7 +148,7 @@ def is_gid_owner(user_id, gid):
     prefix = str(user_id)
     if not gid.startswith(prefix):
         return False
-    rest = gid[len(prefix):]
+    rest = gid[len(prefix) :]
     return bool(rest) and rest[0] in HEX_CHARACTERS
 
 
@@ -155,6 +160,8 @@ async def aria2_add_torrent(
     pause=False,
     download_dir=None,
     selected_files=None,
+    file_allocation=None,
+    check_integrity=False,
 ):
     if os.path.isfile(link):
         with open(link, "rb") as file:
@@ -178,9 +185,11 @@ async def aria2_add_torrent(
     if pause:
         options["pause"] = "true"
     if selected_files:
-        options["select-file"] = ",".join(
-            str(int(index)) for index in selected_files
-        )
+        options["select-file"] = ",".join(str(int(index)) for index in selected_files)
+    if file_allocation is not None:
+        options["file-allocation"] = str(file_allocation)
+    if check_integrity:
+        options["check-integrity"] = "true"
 
     return _raise_or_return(
         await aria2_request(
@@ -269,8 +278,7 @@ async def aria2_add_directdl(
     if headers:
         header_list = headers if isinstance(headers, list) else [headers]
         if not any(
-            str(header).lower().startswith("user-agent:")
-            for header in header_list
+            str(header).lower().startswith("user-agent:") for header in header_list
         ):
             header_list = [default_ua] + header_list
         options["header"] = header_list

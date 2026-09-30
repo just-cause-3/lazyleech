@@ -73,6 +73,7 @@ aria2c \
     -x16 \
     -s16 \
     --continue=true \
+    --file-allocation=none \
     --max-connection-per-server=16 \
     --min-split-size=10M \
     --split=16 \

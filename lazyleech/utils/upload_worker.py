@@ -81,10 +81,13 @@ def _new_upload_identifier(chat_id):
 class UploadResult(list):
     """Uploaded file links plus whether the complete job succeeded."""
 
-    def __init__(self, values=(), *, complete=False, source_results=None):
+    def __init__(
+        self, values=(), *, complete=False, source_results=None, source_removed=False
+    ):
         super().__init__(values)
         self.complete = bool(complete)
         self.source_results = list(source_results or [])
+        self.source_removed = bool(source_removed)
 
 
 def _usable_thumbnail(path):
@@ -291,7 +294,9 @@ async def _upload_worker(
     except (TypeError, ValueError):
         parallel_files = 1
 
-    with tempfile.TemporaryDirectory(dir=str(user_id)) as zip_tempdir:
+    temp_root = (upload_options or {}).get("workspace_temp_root") or str(user_id)
+    os.makedirs(temp_root, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_root) as zip_tempdir:
         if SendAsZipFlag in flags:
             if torrent_info.get("bittorrent"):
                 filename = torrent_info["bittorrent"]["info"]["name"]
@@ -379,6 +384,9 @@ async def _upload_worker(
                         download_root=torrent_info.get("dir"),
                         transfer_semaphore=transfer_slots,
                         split_semaphore=split_slots,
+                        workspace_temp_root=(upload_options or {}).get(
+                            "workspace_temp_root"
+                        ),
                     )
                 except Exception:
                     # One source must not cancel successful sibling uploads.
@@ -386,6 +394,21 @@ async def _upload_worker(
                     # retry only this file while retaining sibling links.
                     logging.exception("Source upload failed: %s", filepath)
                     uploaded = UploadResult([], complete=False)
+                on_source_uploaded = (upload_options or {}).get("on_source_uploaded")
+                if on_source_uploaded is not None:
+                    try:
+                        await on_source_uploaded(
+                            {
+                                "relative_name": files[filepath],
+                                "uploads": list(uploaded),
+                                "complete": bool(uploaded.complete),
+                                "source_removed": bool(uploaded.source_removed),
+                            }
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Source completion callback failed: %s", filepath
+                        )
                 return source_index, filepath, uploaded
 
         tasks = [
@@ -475,6 +498,7 @@ async def _upload_file(
     download_root=None,
     transfer_semaphore=None,
     split_semaphore=None,
+    workspace_temp_root=None,
 ):
     if not os.path.getsize(filepath):
         return UploadResult([(os.path.basename(filename), None)], complete=False)
@@ -528,7 +552,9 @@ async def _upload_file(
             os.rename(filepath, newFileName)
             filepath = newFileName
         source_filepath = filepath
-        with tempfile.TemporaryDirectory(dir=str(user_id)) as tempdir:
+        with tempfile.TemporaryDirectory(
+            dir=workspace_temp_root or str(user_id)
+        ) as tempdir:
             if file_has_big:
 
                 async def _split_files():
@@ -630,7 +656,14 @@ async def _upload_file(
                     len(sent_files) == len(to_upload)
                     and all(link for _, link in sent_files)
                 )
-                return UploadResult(sent_files, complete=upload_complete)
+                return UploadResult(
+                    sent_files,
+                    complete=upload_complete,
+                    source_removed=(
+                        upload_complete and cleanup_source and not TESTMODE
+                        and not os.path.exists(source_filepath)
+                    ),
+                )
             for a, (filepath, filename) in enumerate(to_upload):
                 while True:
                     if a:
@@ -770,7 +803,14 @@ async def _upload_file(
                 download_root,
                 lifecycle="successfully uploaded",
             )
-        return UploadResult(sent_files, complete=upload_complete)
+        return UploadResult(
+            sent_files,
+            complete=upload_complete,
+            source_removed=(
+                upload_complete and cleanup_source and not TESTMODE
+                and not os.path.exists(source_filepath)
+            ),
+        )
     finally:
         remove_upload_status(upload_identifier)
         stop_uploads.discard(upload_identifier)

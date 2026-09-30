@@ -53,6 +53,7 @@ from ..utils.aria2 import (
     aria2_force_pause_all,
     aria2_pause,
     aria2_remove,
+    aria2_remove_result,
     aria2_tell_active,
     aria2_tell_status,
     aria2_tell_waiting,
@@ -2348,6 +2349,8 @@ async def handle_leech(
     suppress_upload_summary=False,
     suppress_download_errors=False,
     parallel_uploads=1,
+    on_source_uploaded=None,
+    workspace_temp_root=None,
 ):
     torrent_info = await aria2_tell_status(session, gid)
     message_identifier = (reply.chat.id, reply.id)
@@ -2415,6 +2418,20 @@ async def handle_leech(
 
         await update_upload_status_state(reply.chat.id, reply.id, tor_name, "Waiting")
 
+        # A look-ahead job uses the same torrent info hash. Unregister this
+        # completed download before upload callbacks may start that next job.
+        if on_source_uploaded is not None:
+            try:
+                await aria2_remove(session, gid)
+            except Aria2Error:
+                pass
+            try:
+                await aria2_remove_result(session, gid)
+            except Aria2Error:
+                # Removal of a just-finished seeder can still be settling.
+                # The look-ahead scheduler retries before adding the same hash.
+                pass
+
         if on_uploaded is not None and on_downloaded is not None:
             await on_downloaded()
         upload_queue.put_nowait(
@@ -2430,13 +2447,16 @@ async def handle_leech(
                     "on_uploaded": on_uploaded,
                     "suppress_summary": suppress_upload_summary,
                     "parallel_files": max(1, int(parallel_uploads or 1)),
+                    "on_source_uploaded": on_source_uploaded,
+                    "workspace_temp_root": workspace_temp_root,
                 },
             )
         )
         if on_uploaded is None and on_downloaded is not None:
             await on_downloaded()
         try:
-            await aria2_remove(session, gid)
+            if on_source_uploaded is None:
+                await aria2_remove(session, gid)
         except Aria2Error as ex:
             if not (
                 ex.error_code == 1
