@@ -1,7 +1,7 @@
 # LazyLeech 
 
 <p align="center">
-“	Heroku Supported Telegram Torrent Leeching Bot by Some Weebs ” 
+“	Telegram Torrent Leeching Bot by Some Weebs ” 
 </p>
 
 
