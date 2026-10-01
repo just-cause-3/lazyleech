@@ -16,3 +16,5 @@ ujson
 https://github.com/ytdl-org/youtube-dl/archive/refs/heads/master.zip
 html-telegraph-poster>=0.2.31
 lxml_html_clean
+curl_cffi>=0.16.0
+yt-dlp>=2026.07.00
